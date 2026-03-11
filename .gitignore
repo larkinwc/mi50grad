@@ -1,2 +1,20 @@
 notes/
 claude.md
+
+# Build artifacts
+build/
+*.o
+*.hsaco
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Tuning DB
+*.db
+
+# Editor
+.vscode/
+.idea/
