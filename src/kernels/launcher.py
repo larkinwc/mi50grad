@@ -37,7 +37,7 @@ def build_hsaco(asm_path: str, hsaco_path: Optional[str] = None, mcpu: str = MCP
 
     # Assemble
     result = subprocess.run(
-        [LLVM_MC, f"--arch=amdgcn", f"--mcpu={mcpu}", "--filetype=obj",
+        [LLVM_MC, "--triple=amdgcn-amd-amdhsa", f"--mcpu={mcpu}", "--filetype=obj",
          str(asm_path), "-o", str(obj_path)],
         capture_output=True, text=True
     )
