@@ -1,0 +1,9 @@
+commands:
+  build_asm: "ssh -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'cd /root/mi50grad && export ROCM_PATH=/opt/rocm && make kernels'"
+  build_hip: "ssh -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'cd /root/mi50grad && /opt/rocm/bin/hipcc -O3 --offload-arch=gfx906 -std=c++17 -shared -fPIC'"
+  deploy: "rsync -avz --exclude='.git' --exclude='build' --exclude='__pycache__' --exclude='.factory' -e 'ssh -J root@wittymantis.netbird.selfhosted' /Users/larkinwc/personal/ml/mi50grad/ root@192.168.1.189:/root/mi50grad/"
+  test: "ssh -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'cd /root/mi50grad && PYTHONPATH=/root/mi50grad python3'"
+  build_all: "ssh -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'cd /root/mi50grad && export ROCM_PATH=/opt/rocm && make kernels && for f in src/kernels/*.hip; do /opt/rocm/bin/hipcc -O3 --offload-arch=gfx906 -std=c++17 -shared -fPIC -o build/kernels/$(basename $f .hip).so $f 2>&1; done'"
+  remote_shell: "ssh -J root@wittymantis.netbird.selfhosted root@192.168.1.189"
+
+services: {}
