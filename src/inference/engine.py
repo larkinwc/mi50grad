@@ -318,6 +318,7 @@ class InferenceEngine:
         self._init_rope_tables(max_seq_len)
         self._alloc_scratch()
         self._init_deltanet_gpu()
+        self._init_qknorm_rope()
         self._init_gemv_v2()
         self._init_gemm_prefill()
 
@@ -364,6 +365,28 @@ class InferenceEngine:
         self._deltanet_v2 = True
         self._deltanet_v3 = True
         print(f"DeltaNet v3 GPU kernel loaded (v_heads={self.local_linear_num_v_heads})")
+
+    def _init_qknorm_rope(self):
+        """Load the fused QK-norm + RoPE kernel.
+
+        The fused kernel replaces 4 separate launches:
+          batched_rmsnorm(Q) + batched_rmsnorm(K) + rope(Q) + rope(K)
+        with 2 launches (one for Q heads, one for K heads), each performing
+        per-head RMSNorm and partial RoPE in a single pass.
+
+        Raises RuntimeError if the kernel cannot be loaded — no silent fallback.
+        """
+        self._qknorm_rope_fused = False
+        hip_path = HIP_DIR / "qknorm_rope.hip"
+        if not hip_path.exists():
+            raise RuntimeError(
+                f"Fused QK-norm+RoPE kernel source not found at {hip_path}. "
+                "This kernel is required — no silent fallback."
+            )
+        # Raises RuntimeError on compilation failure — no silent fallback
+        self.kernels.get_hip("qknorm_rope_fused", "qknorm_rope")
+        self._qknorm_rope_fused = True
+        print("Fused QK-norm+RoPE kernel loaded")
 
     def _init_gemv_v2(self):
         """Try to compile optimized GEMV kernels (coalesced INT4, vectorized FP16)."""
@@ -858,17 +881,12 @@ class InferenceEngine:
         self._launch_gemv_fp16(self.d_kv_fused, self.d_normed, lw.kv_fused_weight,
                                 h, 2 * self.kv_dim)
 
-        # Q/K RMSNorm (per-head, applied to each head independently)
-        self._launch_qk_norm(self.d_q, lw.q_norm, self.local_num_attention_heads,
-                              cfg.head_dim)
-        self._launch_qk_norm(self.d_k, lw.k_norm, self.local_num_kv_heads,
-                              cfg.head_dim)
-
-        # Partial RoPE (only first rotary_dim dims of each head)
-        self._launch_rope(self.d_q, position, self.local_num_attention_heads,
-                          cfg.head_dim)
-        self._launch_rope(self.d_k, position, self.local_num_kv_heads,
-                          cfg.head_dim)
+        # Fused QK-norm + RoPE (per-head RMSNorm + partial RoPE in one launch each)
+        # Replaces 4 separate launches: qk_norm(Q) + qk_norm(K) + rope(Q) + rope(K)
+        self._launch_qknorm_rope(self.d_q, lw.q_norm, position,
+                                  self.local_num_attention_heads, cfg.head_dim)
+        self._launch_qknorm_rope(self.d_k, lw.k_norm, position,
+                                  self.local_num_kv_heads, cfg.head_dim)
 
         # Update KV cache (GPU-to-GPU copy, no host roundtrip)
         self.kv_cache.append_kv_gpu(layer_idx, self.d_k, self.d_v)
@@ -1135,33 +1153,50 @@ class InferenceEngine:
         self.device.launch(func, (1, 1, 1), (256, 1, 1), params)
 
     def _launch_qk_norm(self, x_ptr, norm_weight, num_heads, head_dim):
-        """Apply RMSNorm per-head to Q or K vector using GPU kernel.
+        """Apply RMSNorm per-head to Q or K vector using batched GPU kernel.
 
-        Uses batched kernel (1 launch for all heads) if available,
-        falls back to per-head launches otherwise.
+        Always uses the batched kernel (1 launch for all heads).
+        The silent try/except fallback to per-head launches has been removed
+        to ensure batched path is always taken (VAL-DLR-010).
         """
         eps_bits = struct.unpack('<I', struct.pack('<f', self.config.rms_norm_eps))[0]
-        try:
-            func = self.kernels.get_hip("batched_rmsnorm_fp16", "batched_rmsnorm")
-            params = [
-                ctypes.c_uint64(x_ptr),
-                ctypes.c_uint64(norm_weight),
-                ctypes.c_uint32(head_dim),
-                ctypes.c_uint32(eps_bits),
-            ]
-            self.device.launch(func, (num_heads, 1, 1), (256, 1, 1), params)
-        except Exception:
-            func = self.kernels.get("rmsnorm_fp16", "rmsnorm")
-            for h in range(num_heads):
-                offset = h * head_dim * 2
-                params = [
-                    ctypes.c_uint64(x_ptr + offset),
-                    ctypes.c_uint64(norm_weight),
-                    ctypes.c_uint64(x_ptr + offset),
-                    ctypes.c_uint32(head_dim),
-                    ctypes.c_uint32(eps_bits),
-                ]
-                self.device.launch(func, (1, 1, 1), (256, 1, 1), params, shared_mem=1024)
+        func = self.kernels.get_hip("batched_rmsnorm_fp16", "batched_rmsnorm")
+        params = [
+            ctypes.c_uint64(x_ptr),
+            ctypes.c_uint64(norm_weight),
+            ctypes.c_uint32(head_dim),
+            ctypes.c_uint32(eps_bits),
+        ]
+        self.device.launch(func, (num_heads, 1, 1), (256, 1, 1), params)
+
+    def _launch_qknorm_rope(self, x_ptr, norm_weight, position, num_heads, head_dim):
+        """Fused per-head RMSNorm + partial RoPE in a single kernel launch.
+
+        Replaces two separate calls: _launch_qk_norm + _launch_rope.
+        The fused kernel computes RMSNorm then applies partial RoPE to the
+        first rotary_dim elements of each head in one pass.
+
+        Args:
+            x_ptr:       GPU pointer to [num_heads, head_dim] FP16 (modified in-place)
+            norm_weight: GPU pointer to [head_dim] FP16 norm weights
+            position:    Sequence position (for RoPE cos/sin table lookup)
+            num_heads:   Number of heads (Q or K)
+            head_dim:    Dimension per head (e.g. 256)
+        """
+        func = self.kernels.get_hip("qknorm_rope_fused", "qknorm_rope")
+        half_rotary = self.rotary_dim // 2
+        cos_offset = position * half_rotary * 2  # byte offset into cos/sin tables
+        params = [
+            ctypes.c_uint64(x_ptr),
+            ctypes.c_uint64(norm_weight),
+            ctypes.c_uint64(self.d_cos + cos_offset),
+            ctypes.c_uint64(self.d_sin + cos_offset),
+            ctypes.c_uint32(head_dim),
+            ctypes.c_uint32(half_rotary),
+            ctypes.c_float(self.config.rms_norm_eps),
+        ]
+        # One block per head; 256 threads per block
+        self.device.launch(func, (num_heads, 1, 1), (256, 1, 1), params)
 
     def _launch_gemv_fp16(self, dst, src, weight, K, N):
         """FP16 GEMV: dst[N] = weight[N, K] * src[K]."""
@@ -1471,19 +1506,13 @@ class InferenceEngine:
                 self._launch_gemv_fp16(self.d_pf_v + t_kv, self.d_normed,
                                         lw.v_weight, h, kv_dim)
 
-        # Batched QK norm: treat [seq_len, num_heads, head_dim] as
-        # (seq_len * num_heads) independent vectors
-        self._launch_qk_norm(self.d_pf_q, lw.q_norm,
-                              seq_len * cfg.num_attention_heads, cfg.head_dim)
-        self._launch_qk_norm(self.d_pf_k, lw.k_norm,
-                              seq_len * cfg.num_key_value_heads, cfg.head_dim)
-
-        # Per-token RoPE (each token at its own position)
+        # Per-token fused QK-norm + RoPE: RMSNorm + RoPE in one launch per token per Q/K
+        # Treat each token×head as one unit; _launch_qknorm_rope handles the RoPE table lookup
         for t in range(seq_len):
-            self._launch_rope(self.d_pf_q + t * q_dim * 2, t,
-                              cfg.num_attention_heads, cfg.head_dim)
-            self._launch_rope(self.d_pf_k + t * kv_dim * 2, t,
-                              cfg.num_key_value_heads, cfg.head_dim)
+            self._launch_qknorm_rope(self.d_pf_q + t * q_dim * 2, lw.q_norm, t,
+                                      cfg.num_attention_heads, cfg.head_dim)
+            self._launch_qknorm_rope(self.d_pf_k + t * kv_dim * 2, lw.k_norm, t,
+                                      cfg.num_key_value_heads, cfg.head_dim)
 
         # Bulk write K/V to cache (contiguous D2D copy)
         kv_layer_k = self.kv_cache.layer_k_ptr(layer_idx)
