@@ -383,20 +383,24 @@ class InferenceEngine:
                 # Persistent done-counter buffer (uint32, zeroed once at init, reset by kernel)
                 self.d_gemv_done = self.device.malloc(max_n * 4)
                 self.device.memset(self.d_gemv_done, 0, max_n * 4)
-                # Second pair for dual (gate+up) path (these are still 3-launch via dual kernel)
+                # Second FP32 accumulator for dual (gate+up) path
+                # Also uses d_gemv_done for the done-counter; both persistent + init-zeroed
                 self.d_gemv_fp32_2 = self.device.malloc(max_n * 4)
                 self.device.memset(self.d_gemv_fp32_2, 0, max_n * 4)
                 print("GEMV INT4 v2 (coalesced + fused split-K) loaded")
         except Exception as e:
             print(f"GEMV INT4 v2 failed: {e}")
         self._gemv_int4_dual = False
+        self._gemv_int4_dual_fused = False
         try:
             hip_path = HIP_DIR / "gemv_int4_dual.hip"
             if hip_path.exists() and self._gemv_int4_v2:
                 self.kernels.get_hip("gemv_int4_dual_splitk", "gemv_int4_dual")
                 self.kernels.get_hip("dual_fp32_to_silu_fp16", "gemv_int4_dual")
+                self.kernels.get_hip("gemv_int4_dual_fused", "gemv_int4_dual")
                 self._gemv_int4_dual = True
-                print("GEMV INT4 dual (fused gate+up+silu) loaded")
+                self._gemv_int4_dual_fused = True
+                print("GEMV INT4 dual (fused gate+up+silu, no-memset) loaded")
         except Exception as e:
             print(f"GEMV INT4 dual failed: {e}")
         try:
@@ -1258,42 +1262,72 @@ class InferenceEngine:
     def _launch_ffn_gate_up_silu(self, dst, src, lw, K, N):
         """Fused gate+up INT4 GEMV + SiLU: dst = silu(gate(x)) * up(x).
 
-        Saves 1 memset + 1 splitk launch + 1 convert + 1 silu vs separate calls.
+        Uses the fully fused kernel (gemv_int4_dual_fused) when available:
+        no separate memset or fp32_to_fp16 calls needed. The kernel initializes
+        both FP32 accumulator buffers internally on the first-completing split tile,
+        and writes FP16 output with SiLU in the last-completing split tile.
+
+        Saves 2 memset launches + 1 convert+silu launch vs the 3-kernel path.
         """
         grid_x = (N + 255) // 256
         k_splits = self._gemv_int4_k_splits
 
-        # Zero both FP32 accumulators
-        self.device.memset(self.d_gemv_fp32, 0, N * 4)
-        self.device.memset(self.d_gemv_fp32_2, 0, N * 4)
+        if self._gemv_int4_dual_fused:
+            # Fully fused path: single launch, no memset needed.
+            # Persistent buffers d_gemv_fp32, d_gemv_fp32_2, d_gemv_done are
+            # zeroed once at init and reset by the kernel after each call.
+            func = self.kernels.get_hip("gemv_int4_dual_fused", "gemv_int4_dual")
+            params = [
+                ctypes.c_uint64(src),
+                ctypes.c_uint64(lw.gate_qweight),
+                ctypes.c_uint64(lw.gate_scales),
+                ctypes.c_uint64(lw.gate_zeros),
+                ctypes.c_uint64(lw.up_qweight),
+                ctypes.c_uint64(lw.up_scales),
+                ctypes.c_uint64(lw.up_zeros),
+                ctypes.c_uint64(self.d_gemv_fp32),
+                ctypes.c_uint64(self.d_gemv_fp32_2),
+                ctypes.c_uint64(self.d_gemv_done),
+                ctypes.c_uint64(dst),
+                ctypes.c_uint32(K),
+                ctypes.c_uint32(N),
+                ctypes.c_uint32(self.config.group_size),
+                ctypes.c_uint32(k_splits),
+            ]
+            self.device.launch(func, (grid_x, k_splits, 1), (256, 1, 1), params)
+        else:
+            # Fallback 3-launch path: memset + splitk + convert+silu
+            # Zero both FP32 accumulators
+            self.device.memset(self.d_gemv_fp32, 0, N * 4)
+            self.device.memset(self.d_gemv_fp32_2, 0, N * 4)
 
-        # Fused gate+up split-K
-        func = self.kernels.get_hip("gemv_int4_dual_splitk", "gemv_int4_dual")
-        params = [
-            ctypes.c_uint64(src),
-            ctypes.c_uint64(lw.gate_qweight),
-            ctypes.c_uint64(lw.gate_scales),
-            ctypes.c_uint64(lw.gate_zeros),
-            ctypes.c_uint64(lw.up_qweight),
-            ctypes.c_uint64(lw.up_scales),
-            ctypes.c_uint64(lw.up_zeros),
-            ctypes.c_uint64(self.d_gemv_fp32),
-            ctypes.c_uint64(self.d_gemv_fp32_2),
-            ctypes.c_uint32(K),
-            ctypes.c_uint32(N),
-            ctypes.c_uint32(self.config.group_size),
-        ]
-        self.device.launch(func, (grid_x, k_splits, 1), (256, 1, 1), params)
+            # Fused gate+up split-K
+            func = self.kernels.get_hip("gemv_int4_dual_splitk", "gemv_int4_dual")
+            params = [
+                ctypes.c_uint64(src),
+                ctypes.c_uint64(lw.gate_qweight),
+                ctypes.c_uint64(lw.gate_scales),
+                ctypes.c_uint64(lw.gate_zeros),
+                ctypes.c_uint64(lw.up_qweight),
+                ctypes.c_uint64(lw.up_scales),
+                ctypes.c_uint64(lw.up_zeros),
+                ctypes.c_uint64(self.d_gemv_fp32),
+                ctypes.c_uint64(self.d_gemv_fp32_2),
+                ctypes.c_uint32(K),
+                ctypes.c_uint32(N),
+                ctypes.c_uint32(self.config.group_size),
+            ]
+            self.device.launch(func, (grid_x, k_splits, 1), (256, 1, 1), params)
 
-        # Convert FP32 → FP16 with fused SiLU
-        func2 = self.kernels.get_hip("dual_fp32_to_silu_fp16", "gemv_int4_dual")
-        params2 = [
-            ctypes.c_uint64(self.d_gemv_fp32),
-            ctypes.c_uint64(self.d_gemv_fp32_2),
-            ctypes.c_uint64(dst),
-            ctypes.c_uint32(N),
-        ]
-        self.device.launch(func2, (grid_x, 1, 1), (256, 1, 1), params2)
+            # Convert FP32 → FP16 with fused SiLU
+            func2 = self.kernels.get_hip("dual_fp32_to_silu_fp16", "gemv_int4_dual")
+            params2 = [
+                ctypes.c_uint64(self.d_gemv_fp32),
+                ctypes.c_uint64(self.d_gemv_fp32_2),
+                ctypes.c_uint64(dst),
+                ctypes.c_uint32(N),
+            ]
+            self.device.launch(func2, (grid_x, 1, 1), (256, 1, 1), params2)
 
     def _launch_rope(self, x_ptr, position, num_heads, head_dim):
         """Apply partial RoPE (only first rotary_dim dims of each head)."""
