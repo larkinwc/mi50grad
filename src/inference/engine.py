@@ -321,6 +321,13 @@ class InferenceEngine:
         self._init_qknorm_rope()
         self._init_gemv_v2()
         self._init_gemm_prefill()
+        self._init_streams()
+
+        # Launch counting infrastructure: tracks kernel launches per layer.
+        # Call reset_launch_counters() before a decode step, then read
+        # self._layer_launch_counts[layer_idx] for per-layer counts.
+        self._layer_launch_counts: dict = {}  # layer_idx -> int
+        self._count_launches: bool = False    # enable via count_launches ctx mgr
 
     def register_tp_peers(self, peers: list, tp_group):
         """Register peer engines and TP group for allreduce coordination.
@@ -455,6 +462,46 @@ class InferenceEngine:
                 print("GEMM INT4 prefill kernel loaded")
         except Exception as e:
             print(f"GEMM INT4 prefill failed: {e}, using per-token GEMV fallback")
+
+    def _init_streams(self):
+        """Create two HIP streams for concurrent Q+Qgate and K+V GEMV projections.
+
+        Stream 1 (_stream_q):  Q+Qgate fused GEMV (independent of K/V)
+        Stream 2 (_stream_kv): K+V fused GEMV (independent of Q/Qgate)
+
+        Both read d_normed which is read-only during these GEMVs — no race.
+        Both are synchronized before the downstream QK-norm (which reads d_q, d_k).
+        """
+        try:
+            self._stream_q = self.device.create_stream()
+            self._stream_kv = self.device.create_stream()
+            self._streams_ready = True
+            print("HIP streams created for Q/KV concurrency")
+        except Exception as e:
+            print(f"Stream creation failed: {e}, using default stream")
+            self._stream_q = 0
+            self._stream_kv = 0
+            self._streams_ready = False
+
+    def reset_launch_counters(self):
+        """Reset per-layer kernel launch counters.
+
+        Call before a decode step to measure launches per layer.
+        Enable counting with: self._count_launches = True
+        """
+        self._layer_launch_counts = {}
+        self._current_count_layer = -1
+
+    def _record_launch(self, layer_idx: int):
+        """Increment launch count for a layer (only when counting is active)."""
+        if self._count_launches:
+            if layer_idx not in self._layer_launch_counts:
+                self._layer_launch_counts[layer_idx] = 0
+            self._layer_launch_counts[layer_idx] += 1
+
+    def get_layer_launch_count(self, layer_idx: int) -> int:
+        """Return total kernel launches recorded for a given layer."""
+        return self._layer_launch_counts.get(layer_idx, 0)
 
     def _init_rope_tables(self, max_seq_len: int):
         """Precompute RoPE cos/sin tables.
@@ -810,9 +857,11 @@ class InferenceEngine:
         cfg = self.config
 
         self.device.upload(self.d_hidden, token_embedding.tobytes())
+        self._active_layer_idx = -1  # Track current layer for launch counting
 
         for layer_idx in range(cfg.num_hidden_layers):
             lw = self.layers[layer_idx]
+            self._active_layer_idx = layer_idx
 
             # Pre-attention RMSNorm
             self._launch_rmsnorm(self.d_normed, self.d_hidden, lw.attn_norm, h)
@@ -888,13 +937,21 @@ class InferenceEngine:
         cfg = self.config
         h = cfg.hidden_size
 
-        # Fused Q+Q_gate projection: normed_hidden → [Q, Q_gate] [2*q_dim]
+        # Concurrent Q+Qgate and K+V projections on independent streams.
+        # Both GEMVs read d_normed (read-only) — no race condition.
+        # Stream 1: Q+Qgate fused GEMV → d_q_fused ([Q, Q_gate])
+        # Stream 2: K+V fused GEMV   → d_kv_fused ([K, V])
         self._launch_gemv_fp16(self.d_q_fused, self.d_normed, lw.q_fused_weight,
-                                h, 2 * self.q_dim)
+                                h, 2 * self.q_dim, stream=self._stream_q)
 
         # Fused K+V projection: normed_hidden → [K, V] [2*kv_dim]
         self._launch_gemv_fp16(self.d_kv_fused, self.d_normed, lw.kv_fused_weight,
-                                h, 2 * self.kv_dim)
+                                h, 2 * self.kv_dim, stream=self._stream_kv)
+
+        # Synchronize both streams before QK-norm (which reads d_q and d_k).
+        if self._streams_ready:
+            self.device.hip.stream_synchronize(self._stream_q)
+            self.device.hip.stream_synchronize(self._stream_kv)
 
         # Fused QK-norm + RoPE (per-head RMSNorm + partial RoPE in one launch each)
         # Replaces 4 separate launches: qk_norm(Q) + qk_norm(K) + rope(Q) + rope(K)
@@ -1170,6 +1227,7 @@ class InferenceEngine:
             ctypes.c_float(self.config.rms_norm_eps),
         ]
         self.device.launch(func, (1, 1, 1), (256, 1, 1), params)
+        self._record_launch(getattr(self, '_active_layer_idx', -1))
 
     def _launch_skip_rmsnorm(self, dst, hidden, residual, weight, dim):
         """Fused: hidden += residual; dst = rmsnorm(hidden) * weight."""
@@ -1183,6 +1241,7 @@ class InferenceEngine:
             ctypes.c_float(self.config.rms_norm_eps),
         ]
         self.device.launch(func, (1, 1, 1), (256, 1, 1), params)
+        self._record_launch(getattr(self, '_active_layer_idx', -1))
 
     def _launch_qk_norm(self, x_ptr, norm_weight, num_heads, head_dim):
         """Apply RMSNorm per-head to Q or K vector using batched GPU kernel.
@@ -1229,13 +1288,16 @@ class InferenceEngine:
         ]
         # One block per head; 256 threads per block
         self.device.launch(func, (num_heads, 1, 1), (256, 1, 1), params)
+        self._record_launch(getattr(self, '_active_layer_idx', -1))
 
-    def _launch_gemv_fp16(self, dst, src, weight, K, N, residual=0):
+    def _launch_gemv_fp16(self, dst, src, weight, K, N, residual=0, stream=0):
         """FP16 GEMV: dst[N] = weight[N, K] * src[K].
 
         Optional residual epilogue: if residual != 0, dst[i] += residual[i]
         This fuses the residual-add into the GEMV kernel, eliminating a
         separate residual_add launch (used for out_proj with residual=d_hidden).
+
+        Optional stream: if non-zero, launch on that HIP stream (for concurrency).
         """
         if self._gemv_fp16_v2:
             func = self.kernels.get_hip("gemv_fp16_v2", "gemv_fp16_v2")
@@ -1249,7 +1311,7 @@ class InferenceEngine:
             ]
             # 4 rows per WG (one per wavefront)
             grid_x = (N + 3) // 4
-            self.device.launch(func, (grid_x, 1, 1), (256, 1, 1), params)
+            self.device.launch(func, (grid_x, 1, 1), (256, 1, 1), params, stream=stream)
         else:
             func = self.kernels.get("gemv_fp16", "gemv_fp16")
             params = [
@@ -1263,6 +1325,7 @@ class InferenceEngine:
             # Fallback: apply residual separately if requested
             if residual:
                 self._launch_residual_add(dst, residual, N)
+        self._record_launch(getattr(self, '_active_layer_idx', -1))
 
     def _launch_gemm_fp16(self, dst, src, weight, M, N, K):
         """FP16 GEMM: dst[M, N] = src[M, K] @ weight[N, K]^T.
@@ -1339,6 +1402,7 @@ class InferenceEngine:
             # Fallback: apply residual separately if requested
             if residual:
                 self._launch_residual_add(dst, residual, N)
+        self._record_launch(getattr(self, '_active_layer_idx', -1))
 
     def _launch_ffn_gate_up_silu(self, dst, src, lw, K, N):
         """Fused gate+up INT4 GEMV + SiLU: dst = silu(gate(x)) * up(x).
@@ -1399,6 +1463,7 @@ class InferenceEngine:
                 ctypes.c_uint32(self.config.group_size),
             ]
             self.device.launch(func, (grid_x, k_splits, 1), (256, 1, 1), params)
+            self._record_launch(getattr(self, '_active_layer_idx', -1))  # splitk launch
 
             # Convert FP32 → FP16 with fused SiLU
             func2 = self.kernels.get_hip("dual_fp32_to_silu_fp16", "gemv_int4_dual")
@@ -1409,6 +1474,10 @@ class InferenceEngine:
                 ctypes.c_uint32(N),
             ]
             self.device.launch(func2, (grid_x, 1, 1), (256, 1, 1), params2)
+            self._record_launch(getattr(self, '_active_layer_idx', -1))  # convert+silu
+            return  # fallback path: 2 launches recorded (splitk + convert)
+
+        self._record_launch(getattr(self, '_active_layer_idx', -1))  # fused single launch
 
     def _launch_rope(self, x_ptr, position, num_heads, head_dim):
         """Apply partial RoPE (only first rotary_dim dims of each head)."""
@@ -1444,6 +1513,7 @@ class InferenceEngine:
         ]
         self.device.launch(func, (self.local_num_attention_heads, 1, 1),
                            (256, 1, 1), params)
+        self._record_launch(getattr(self, '_active_layer_idx', -1))
 
 
     def _launch_sigmoid_mul(self, attn_out, gate, n):
@@ -1456,6 +1526,7 @@ class InferenceEngine:
         ]
         grid_x = (n + 255) // 256
         self.device.launch(func, (grid_x, 1, 1), (256, 1, 1), params)
+        self._record_launch(getattr(self, '_active_layer_idx', -1))
 
     def _launch_silu_fused(self, gate, up, out, n):
         func = self.kernels.get_hip("silu_fused_v2", "elementwise_v2")
@@ -1731,4 +1802,11 @@ class InferenceEngine:
 
     def cleanup(self):
         self.kv_cache.cleanup()
+        # Destroy streams if they were created
+        if getattr(self, '_streams_ready', False):
+            try:
+                self.device.hip.stream_destroy(self._stream_q)
+                self.device.hip.stream_destroy(self._stream_kv)
+            except Exception:
+                pass
         self.device.cleanup()
