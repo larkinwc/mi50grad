@@ -1,0 +1,33 @@
+{
+  "featureId": "m1-integration-test",
+  "milestone": "decode-launch-reduction",
+  "status": "pass",
+  "fulfills": ["VAL-CROSS-001", "VAL-CROSS-007"],
+  "summary": "Comprehensive M1 integration test suite covers all optimizations. All 12 tests pass, covering full-attention decode, linear-attention (DeltaNet GPU) decode, hybrid decode, multi-step decode, skip_rmsnorm wiring, launch count verification, and prefill non-regression.",
+  "codeReview": {
+    "correctness": "pass",
+    "notes": [
+      "Integration test uses toy model configs to avoid loading full 27B weights on the test GPU.",
+      "Correctness vs numpy reference: max_err=3.4981e-03 for the full decode path (within 1e-2 tolerance for INT4 accumulation).",
+      "VAL-CROSS-001: Full decode pass through hybrid layers (linear + full attention) verified.",
+      "VAL-CROSS-007: Prefill + 3 decode steps all produce finite outputs.",
+      "Reproducibility test (max_err=1.53e-05 between runs) confirms determinism within atomicAdd non-determinism tolerance.",
+      "Test properly exercises both full_attention and linear_attention layer types."
+    ],
+    "issues": []
+  },
+  "testReview": {
+    "coverage": "excellent",
+    "testResults": {
+      "passed": 12,
+      "failed": 0,
+      "total": 12
+    },
+    "notes": [
+      "12 tests cover all M1 features end-to-end.",
+      "Tests are well-structured and targeted to specific assertions.",
+      "M1 vs numpy reference test (3.4981e-03) provides confidence that fused kernels maintain numerical accuracy."
+    ]
+  },
+  "sharedStateObservations": []
+}

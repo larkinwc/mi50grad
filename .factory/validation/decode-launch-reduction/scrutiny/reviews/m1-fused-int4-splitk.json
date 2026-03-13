@@ -1,0 +1,33 @@
+{
+  "featureId": "m1-fused-int4-splitk",
+  "milestone": "decode-launch-reduction",
+  "status": "pass",
+  "fulfills": ["VAL-DLR-003"],
+  "summary": "INT4 split-K GEMV is correctly fused into a single kernel launch. The gemv_int4_v2_fused kernel uses persistent FP32 buffers (zeroed once at init) and an atomic counter to identify the last completing tile, which then writes FP16 output and resets the buffers. No separate memset or fp32_to_fp16 calls needed.",
+  "codeReview": {
+    "correctness": "pass",
+    "notes": [
+      "Fused kernel design is sound: atomic counter (done[]) tracks which tile is last; last tile writes output and resets both C_fp32 and done[] to zero.",
+      "__threadfence() between atomicAdd(C_fp32) and atomicAdd(done) ensures global memory ordering — this is critical for correctness.",
+      "Persistent buffers are zeroed once at engine init (correct protocol documented in comments).",
+      "Residual epilogue is optional (null pointer check): if residual != nullptr, adds residual to output.",
+      "Engine _launch_gemv_int4 uses gemv_int4_v2_fused, no separate memset or fp32_to_fp16 calls.",
+      "Performance: 1.42x speedup for N=4096,K=4096 and 1.16x for N=11008,K=4096."
+    ],
+    "issues": []
+  },
+  "testReview": {
+    "coverage": "good",
+    "testResults": {
+      "passed": 5,
+      "failed": 0,
+      "total": 5
+    },
+    "notes": [
+      "Tests cover N=4096/11008/5120 with default and non-default k_splits.",
+      "Engine wiring test verifies no separate memset/convert in _launch_gemv_int4.",
+      "Max abs error 0.000244 well within 1e-2 tolerance."
+    ]
+  },
+  "sharedStateObservations": []
+}

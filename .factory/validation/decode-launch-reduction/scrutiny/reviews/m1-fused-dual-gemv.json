@@ -1,0 +1,33 @@
+{
+  "featureId": "m1-fused-dual-gemv",
+  "milestone": "decode-launch-reduction",
+  "status": "pass",
+  "fulfills": ["VAL-DLR-004", "VAL-DLR-011"],
+  "summary": "Dual gate+up INT4 GEMV is correctly fused. The gemv_int4_dual_fused kernel eliminates 2 separate device.memset calls by using persistent FP32 accumulator buffers similar to the single GEMV fused kernel. Engine uses the fused dual kernel exclusively.",
+  "codeReview": {
+    "correctness": "pass",
+    "notes": [
+      "gemv_int4_dual.hip contains gemv_int4_dual_fused kernel using same persistent-buffer pattern as gemv_int4_v2_fused.",
+      "Engine _launch_ffn_gate_up_silu uses the fused dual kernel — no separate memset calls.",
+      "VAL-DLR-011: _gemv_int4_dual flag is True when kernel loads successfully; engine always uses dual path in decode_step when available.",
+      "Both gate and up projections read the same input x[K] in a single pass, saving 1 extra x[K] read from HBM.",
+      "SiLU activation is fused into the same kernel for further savings.",
+      "Performance: 1.21x speedup for N=11008, 1.08x for N=14336."
+    ],
+    "issues": []
+  },
+  "testReview": {
+    "coverage": "good",
+    "testResults": {
+      "passed": 4,
+      "failed": 0,
+      "total": 4
+    },
+    "notes": [
+      "Tests cover FFN dims N=4096/11008/14336 (Qwen 3.5 27B FFN) with max_err < 1e-4 in all cases.",
+      "Engine wiring test confirms no memset calls.",
+      "buffers_clean=True confirms persistent buffer reset works correctly."
+    ]
+  },
+  "sharedStateObservations": []
+}

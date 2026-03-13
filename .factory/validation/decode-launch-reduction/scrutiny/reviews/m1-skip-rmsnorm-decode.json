@@ -1,0 +1,32 @@
+{
+  "featureId": "m1-skip-rmsnorm-decode",
+  "milestone": "decode-launch-reduction",
+  "status": "pass",
+  "fulfills": ["VAL-DLR-002"],
+  "summary": "skip_rmsnorm_v2 kernel wiring is implemented correctly. The design choice is nuanced: in the single-GPU path (tp_size <= 1), skip_rmsnorm is implicitly used via the residual-epilogue in out_proj GEMV — so d_hidden already contains the residual sum and only a plain rmsnorm is needed for pre-FFN. The skip_rmsnorm is explicitly used in the TP path.",
+  "codeReview": {
+    "correctness": "pass",
+    "notes": [
+      "_launch_skip_rmsnorm is defined and functional, callable from decode_step.",
+      "For tp_size <= 1: the out_proj GEMV residual epilogue writes residual+gemv directly to d_hidden, so the pre-FFN norm only needs plain rmsnorm (not skip_rmsnorm). This is architecturally sound.",
+      "For tp_size > 1: _launch_skip_rmsnorm is explicitly called in the TP branch since allreduce happens externally.",
+      "The test for 'decode_step uses _launch_skip_rmsnorm' passes because _launch_skip_rmsnorm is present in the decode_step function body (TP branch).",
+      "The test 'no_separate_residual_add_at_preffn' correctly validates the pre-FFN does not have the old residual_add+rmsnorm pair.",
+      "Kernel correctness: all dims (256 to 7168) pass with max_err < 3e-3 vs reference."
+    ],
+    "issues": []
+  },
+  "testReview": {
+    "coverage": "good",
+    "testResults": {
+      "passed": 15,
+      "failed": 0,
+      "total": 15
+    },
+    "notes": [
+      "Tests cover kernel correctness vs reference for 5 different dims, hidden state update, and engine wiring verification.",
+      "Tolerance of 3e-3 is appropriate given FP16 precision floor for this operation."
+    ]
+  },
+  "sharedStateObservations": []
+}

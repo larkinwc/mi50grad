@@ -1,0 +1,34 @@
+{
+  "featureId": "m1-residual-epilogues",
+  "milestone": "decode-launch-reduction",
+  "status": "pass",
+  "fulfills": ["VAL-DLR-006", "VAL-DLR-007"],
+  "summary": "Residual-add epilogues are correctly added to both gemv_fp16_v2 (out_proj) and gemv_int4_v2_fused (down_proj). The epilogues are optional (null pointer disables), and the engine passes d_hidden as residual for single-GPU out_proj and down_proj, eliminating 2 separate residual_add launches per layer.",
+  "codeReview": {
+    "correctness": "pass",
+    "notes": [
+      "gemv_fp16_v2.hip: residual parameter added; if non-null, out[i] = gemv_result + residual[i] at lane=0 epilogue.",
+      "gemv_int4_v2_fused: residual parameter added in the 'last tile' epilogue path.",
+      "Engine decode_step: _launch_gemv_fp16 for out_proj passes residual=self.d_hidden; _launch_gemv_int4 for down_proj passes residual=self.d_hidden.",
+      "Saves 2 kernel launches per decode layer (1 for out_proj, 1 for down_proj).",
+      "decode_step has 0 _launch_residual_add calls for single-GPU path (confirmed by test).",
+      "The prefill path still uses _launch_residual_add in various places — this is appropriate since the batch residual-add path is different.",
+      "Test signatures for affected test files were updated to pass ctypes.c_uint64(0) for null residual pointer."
+    ],
+    "issues": []
+  },
+  "testReview": {
+    "coverage": "good",
+    "testResults": {
+      "passed": 5,
+      "failed": 0,
+      "total": 5
+    },
+    "notes": [
+      "Tests cover FP16 (3 dims) and INT4 (2 dims) with residual epilogue correctness.",
+      "All errors within 2.44e-4 (FP16) and 1.22e-4 (INT4), well within tolerances.",
+      "Engine wiring test confirms 0 residual_add calls in single-GPU decode path."
+    ]
+  },
+  "sharedStateObservations": []
+}

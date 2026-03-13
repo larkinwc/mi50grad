@@ -31,6 +31,10 @@ Environment variables, external dependencies, and setup notes.
 - ld.lld: `/opt/rocm/lib/llvm/bin/ld.lld`
 - rocm-smi: `/opt/rocm/bin/rocm-smi`
 
+## SSH Auth on macOS
+- SSH_AUTH_SOCK must be set to `/private/tmp/com.apple.launchd.*/Listeners` for key auth to work through ProxyJump
+- If SSH key auth fails, check: `export SSH_AUTH_SOCK=$(ls /private/tmp/com.apple.launchd.*/Listeners 2>/dev/null | head -1)`
+
 ## Known Quirks
 - ROCm 7.2.0 dropped official MI50/MI60 support but gfx906 still works
 - The `which ld.lld` doesn't resolve on LXC but the full path works

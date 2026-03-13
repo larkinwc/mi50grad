@@ -1,0 +1,31 @@
+{
+  "featureId": "m1-deltanet-gpu-always",
+  "milestone": "decode-launch-reduction",
+  "status": "pass",
+  "fulfills": ["VAL-DLR-001"],
+  "summary": "DeltaNet v3 GPU path is properly enforced. The CPU fallback has been completely removed from the decode path. Engine init raises RuntimeError if kernel source is missing or fails to compile.",
+  "codeReview": {
+    "correctness": "pass",
+    "notes": [
+      "_init_deltanet_gpu() raises RuntimeError explicitly if deltanet_v3.hip is missing or compilation fails — no silent fallback.",
+      "_deltanet_gpu and _deltanet_v3 flags are set to True unconditionally after successful kernel load.",
+      "decode_step calls _decode_linear_attention_gpu() directly — the old CPU path is only reachable via the legacy _decode_linear_attention() method which is never called.",
+      "prefill_step also uses _decode_linear_attention_gpu (with comment 'Always use GPU path').",
+      "The CPU fallback state (self.states/self.conv_states numpy arrays) remains allocated in DeltaNetState but is never used during decode — it's dead code that could be cleaned up but is not a correctness issue."
+    ],
+    "issues": []
+  },
+  "testReview": {
+    "coverage": "good",
+    "testResults": {
+      "passed": 5,
+      "failed": 0,
+      "total": 5
+    },
+    "notes": [
+      "Tests verify _deltanet_gpu=True after init, no CPU fallback sentinel triggered, no D2H/H2D in linear attention, hard error on missing kernel, hard error on compile failure.",
+      "D2H/H2D transfer check is robust — directly monitors the GPUDevice transfer tracking."
+    ]
+  },
+  "sharedStateObservations": []
+}

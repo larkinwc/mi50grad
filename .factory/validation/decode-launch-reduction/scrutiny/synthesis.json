@@ -1,0 +1,98 @@
+{
+  "milestone": "decode-launch-reduction",
+  "round": 1,
+  "status": "pass",
+  "validatorsRun": {
+    "test": {
+      "passed": true,
+      "command": "ssh -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'cd /root/mi50grad && PYTHONPATH=/root/mi50grad python3 tests/test_<feature>.py'",
+      "exitCode": 0,
+      "notes": "All M1 feature tests and integration tests passed: test_deltanet_gpu_always.py (5/5), test_skip_rmsnorm_decode.py (15/15), test_fused_int4_gemv.py (all pass), test_fused_dual_gemv.py (all pass), test_qknorm_rope.py (5/5), test_residual_epilogues.py (5/5), test_stream_concurrency.py (5/5), test_m1_integration.py (12/12)"
+    },
+    "typecheck": {
+      "passed": true,
+      "command": "N/A",
+      "exitCode": 0,
+      "notes": "No typecheck configuration in project (no pyproject.toml, mypy.ini, or ruff.toml). Project is a GPU kernel project without Python typecheck infrastructure."
+    },
+    "lint": {
+      "passed": true,
+      "command": "N/A",
+      "exitCode": 0,
+      "notes": "No lint configuration in project. No flake8, ruff, or pylint configured."
+    }
+  },
+  "reviewsSummary": {
+    "total": 8,
+    "passed": 8,
+    "failed": 0,
+    "failedFeatures": []
+  },
+  "blockingIssues": [],
+  "appliedUpdates": [],
+  "suggestedGuidanceUpdates": [
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add note that test subagents (scrutiny-feature-reviewer) fail with 'Invalid model: custom:CCS=sonnet' error. The scrutiny validator needs to perform code reviews directly rather than via Task tool when the custom model identifier fails.",
+      "evidence": "All 8 Task tool calls to scrutiny-feature-reviewer failed with model resolution error. Reviewer conducted code reviews directly instead.",
+      "isSystemic": true
+    }
+  ],
+  "rejectedObservations": [],
+  "previousRound": null,
+  "featureReviews": {
+    "m1-deltanet-gpu-always": {
+      "status": "pass",
+      "fulfills": ["VAL-DLR-001"],
+      "testsPassed": "5/5",
+      "keyFindings": "DeltaNet v3 GPU path always taken, hard error on missing kernel, no D2H/H2D in linear attention"
+    },
+    "m1-skip-rmsnorm-decode": {
+      "status": "pass",
+      "fulfills": ["VAL-DLR-002"],
+      "testsPassed": "15/15",
+      "keyFindings": "skip_rmsnorm wired; for tp_size<=1 residual-epilogue in out_proj eliminates need for skip_rmsnorm at pre-FFN"
+    },
+    "m1-fused-int4-splitk": {
+      "status": "pass",
+      "fulfills": ["VAL-DLR-003"],
+      "testsPassed": "all pass",
+      "keyFindings": "1 launch replaces 3 (memset+splitk+convert), 1.42x speedup, max_err=2.44e-4"
+    },
+    "m1-fused-dual-gemv": {
+      "status": "pass",
+      "fulfills": ["VAL-DLR-004", "VAL-DLR-011"],
+      "testsPassed": "4/4",
+      "keyFindings": "Dual gate+up fused, no separate memsets, 1.21x speedup"
+    },
+    "m1-fused-qknorm-rope": {
+      "status": "pass",
+      "fulfills": ["VAL-DLR-005", "VAL-DLR-010"],
+      "testsPassed": "5/5",
+      "keyFindings": "4 launches -> 2, no try/except fallback, max_err=1.5e-5"
+    },
+    "m1-residual-epilogues": {
+      "status": "pass",
+      "fulfills": ["VAL-DLR-006", "VAL-DLR-007"],
+      "testsPassed": "5/5",
+      "keyFindings": "0 separate residual_add calls in decode path, 2 launches saved per layer"
+    },
+    "m1-stream-concurrency": {
+      "status": "pass",
+      "fulfills": ["VAL-DLR-008", "VAL-DLR-009"],
+      "testsPassed": "5/5",
+      "keyFindings": "11 launches per full-attention layer (vs 16-19 baseline), stream sync before QK-norm"
+    },
+    "m1-integration-test": {
+      "status": "pass",
+      "fulfills": ["VAL-CROSS-001", "VAL-CROSS-007"],
+      "testsPassed": "12/12",
+      "keyFindings": "All M1 optimizations active simultaneously, max_err=3.5e-3 vs numpy reference"
+    }
+  },
+  "validationContractCoverage": {
+    "covered": ["VAL-DLR-001", "VAL-DLR-002", "VAL-DLR-003", "VAL-DLR-004", "VAL-DLR-005", "VAL-DLR-006", "VAL-DLR-007", "VAL-DLR-008", "VAL-DLR-009", "VAL-DLR-010", "VAL-DLR-011", "VAL-CROSS-001", "VAL-CROSS-007"],
+    "notCovered": [],
+    "notes": "All VAL-DLR-* assertions fully covered by M1 feature tests. VAL-CROSS-001 and VAL-CROSS-007 covered by integration test."
+  }
+}
