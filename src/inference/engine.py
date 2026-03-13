@@ -791,8 +791,11 @@ class InferenceEngine:
                 # _init_deltanet_gpu() raises RuntimeError at init if kernel unavailable.
                 self._decode_linear_attention_gpu(layer_idx, lw, position)
 
-            # FFN block
-            self._launch_rmsnorm(self.d_normed, self.d_hidden, lw.ffn_norm, h)
+            # FFN block: fused residual-add + RMSNorm at pre-FFN position.
+            # skip_rmsnorm_v2 does: hidden += proj_out; normed = rmsnorm(hidden, ffn_norm)
+            # This saves 1 kernel launch per layer vs separate residual_add + rmsnorm.
+            self._launch_skip_rmsnorm(self.d_normed, self.d_hidden, self.d_proj_out,
+                                       lw.ffn_norm, h)
 
             # Gate + up INT4 GEMV projections (column-parallel: local N)
             if self._gemv_int4_dual:
@@ -874,10 +877,9 @@ class InferenceEngine:
         self._launch_gemv_fp16(self.d_proj_out, self.d_attn_out, lw.o_weight,
                                 self.q_dim, h)
 
-        # Note: with TP, allreduce of d_proj_out is done by TPInferenceEngine
-        # before the residual add. For single-GPU (tp_size=1), proj_out is complete.
-        if self.tp_size <= 1:
-            self._launch_residual_add(self.d_hidden, self.d_proj_out, h)
+        # Note: residual add is deferred to decode_step() via _launch_skip_rmsnorm,
+        # which fuses the residual add with the pre-FFN RMSNorm into one kernel launch.
+        # For TP (tp_size > 1): TPInferenceEngine handles allreduce + residual + norm.
 
     def _decode_linear_attention(self, layer_idx: int, lw: LayerWeights,
                                   position: int):
@@ -1092,9 +1094,9 @@ class InferenceEngine:
         self._launch_gemv_fp16(self.d_proj_out, self.d_la_out, lw.la_out_proj,
                                 self.la_z_dim, h)
 
-        # Note: with TP, allreduce of d_proj_out is done by TPInferenceEngine
-        if self.tp_size <= 1:
-            self._launch_residual_add(self.d_hidden, self.d_proj_out, h)
+        # Note: residual add is deferred to decode_step() via _launch_skip_rmsnorm,
+        # which fuses the residual add with the pre-FFN RMSNorm into one kernel launch.
+        # For TP (tp_size > 1): TPInferenceEngine handles allreduce + residual + norm.
 
     # --- Kernel launchers ---
 
