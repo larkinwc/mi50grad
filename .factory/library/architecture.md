@@ -42,6 +42,24 @@ All verified on real hardware:
 - Scalar HBM reads: ~631 GB/s (vectorization matters!)
 - LDS bank conflicts are severe — XOR swizzling nearly recovers sequential perf
 
+## FP16 GEMM Prefill (gemm_fp16_prefill.hip v2 — m2-prefill-gemm-dot2)
+Optimized from 0.97 TFLOPS to **18.60 TFLOPS** (69.4% of 26.8 TFLOPS FP16 peak), beating the assembly kernel (13.27 TFLOPS).
+
+Key design decisions:
+1. **`__builtin_amdgcn_fdot2` (v_dot2_f32_f16)**: Packs A/B tile elements as half2, processes 2 FMAs per instruction.
+2. **XOR-swizzled LDS layout**: phys_group = logical_group ^ (row & 1). At float4-group (8-half) granularity with NGRP=2. LDS stride-18 (36 bytes/row) provides additional bank separation. Eliminates LDS bank conflicts for 4-wavefront access pattern.
+3. **Register preloading**: For each kk pair, all 4 A rows and 4 B cols loaded into registers before computing the 4×4 outer product. Enables compiler pipelining.
+4. **`__attribute__((amdgpu_flat_work_group_size(256, 256)))`**: Critical hint that significantly improves occupancy and instruction scheduling on gfx906. Went from 10.44 → 18.60 TFLOPS with this attribute.
+5. **Separate A/B loading wavefronts**: Threads 0-127 load A tile, 128-255 load B tile. Each loads 1 float4.
+6. **TILE_K=16, TILE_M=TILE_N=64, THREAD_M=THREAD_N=4**: 4×4 = 16 outputs per thread, 8 k-pairs per tile.
+7. **Grid**: (ceil(N/64), ceil(M/64), 1), Block: (256, 1, 1).
+
+Anti-patterns learned (what didn't work):
+- TILE_K=32/64 without the flat_work_group hint: much worse (1-4 TFLOPS)
+- 128×128 tile with 8×8 per thread: too much register pressure, 0.8 TFLOPS
+- XOR swizzle at byte level (not group level): correctness failures
+- SWIZZLE_GROUP(g, row) with runtime row in inner loop without precomputation: ~4 TFLOPS overhead
+
 ## INT4 GEMV Pattern (current v2)
 memset(fp32_buf) → gemv_int4_v2_splitk(fp32_buf) → fp32_to_fp16(output)
 Three launches per GEMV. Target: fuse into one.
