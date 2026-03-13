@@ -21,7 +21,8 @@ Architectural decisions, patterns discovered, and kernel design notes.
 ## Key HIP Kernels (Primary Path)
 - `elementwise_v2.hip`: residual_add_v2, silu_fused_v2, rmsnorm_v2, skip_rmsnorm_v2
 - `gemv_fp16_v2.hip`: Uses `__builtin_amdgcn_fdot2` (v_dot2_f32_f16). 4 rows/WG, DPP reduction.
-- `gemv_int4_v2.hip`: Split-K with atomicAdd, factored zero subtraction. 
+- `gemv_int4_v2.hip`: fused split-K (v2_fused) — for GEMV WITH residual (down_proj). Uses ubfe+pow2 optimizations.
+- `gemv_int4_v3.hip`: cooperative reduction (v3_t16) — DEFAULT for GEMV WITHOUT residual. 1.29x faster than v2 for N=4096.
 - `gemv_int4_dual.hip`: Fused gate+up with SiLU. Saves 1 launch + 1 memset + 1 read of x[K].
 - `flash_attn_256.hip`: head_dim=256, online softmax, GQA-aware.
 - `deltanet_v3.hip`: Full DeltaNet recurrence in one kernel, parallel kq_dot.
@@ -60,9 +61,47 @@ Anti-patterns learned (what didn't work):
 - XOR swizzle at byte level (not group level): correctness failures
 - SWIZZLE_GROUP(g, row) with runtime row in inner loop without precomputation: ~4 TFLOPS overhead
 
+## HIP Compiler Hints for gfx906 GEMM Performance
+- `__attribute__((amdgpu_flat_work_group_size(256,256)))` is CRITICAL for GEMM performance
+- Without it: ~10 TFLOPS; with it: ~18 TFLOPS (difference is occupancy management)
+- The HIP GEMM with fdot2 + swizzled LDS now beats the hand-tuned assembly GEMM
+
 ## INT4 GEMV Pattern (current v2)
 memset(fp32_buf) → gemv_int4_v2_splitk(fp32_buf) → fp32_to_fp16(output)
 Three launches per GEMV. Target: fuse into one.
+(m1-fused-int4-splitk: achieved with gemv_int4_v2_fused — single launch, no memset)
+
+## INT4 GEMV Optimization (m2-int4-gemv-optimize) — BENCHMARK RESULTS
+**v3_t16 is the default for non-residual GEMV; v2_fused remains for residual GEMV (down_proj).**
+
+Benchmarks on MI60 gfx906:
+- N=4096, K=4096: v3_t16 = 29.5 us, v2_fused = 38.2 us → **v3 1.29x faster**
+- N=11008, K=4096: v3_t16 = 63.7 us, v2_fused = 64.4 us → essentially tied
+
+Optimization techniques applied:
+1. **`__builtin_amdgcn_ubfe` (v_bfe_u32)**: Bitfield extract for nibble extraction.
+   Replaces `(packed >> offset) & 0xF` (2 instrs) with single `v_bfe_u32` instruction.
+   Applied to all INT4 nibble extraction in both gemv_int4_v2.hip and gemv_int4_v3.hip.
+2. **Power-of-2 shift for group scale lookup**: `kg >> log2(groups_per_scale)` instead of
+   integer division `kg / groups_per_scale`. For group_size=128: groups_per_scale=16, log2=4.
+   Use `31 - __builtin_clz(groups_per_scale)` to compute log2 once per kernel.
+3. **v3 cooperative reduction with LDS (shared memory)**: 16 threads/col (t16 variant),
+   256/16=16 cols per WG. Single launch, no atomicAdd, no persistent FP32 buffer.
+   Thread layout: col_in_wg = tid % 16, k_split = tid / 16. LDS reduction (256 floats).
+4. **DPP wave reduction explored (v3_dpp)**: 64 threads/col = 1 warp, pure `__shfl_xor`
+   butterfly intra-warp + LDS for cross-warp. SLOWER than t16 (68-131 us vs 30-64 us)
+   due to too many WGs (grid ~N/4 = 1024 WGs for N=4096). Not recommended.
+
+Engine wiring (post-m2):
+- Non-residual GEMV (gate, up, etc.): **v3_t16** (faster)
+- Residual GEMV (down_proj fuses residual-add): **v2_fused** (only option with residual)
+- Dual gate+up+silu: **gemv_int4_dual_fused** (unchanged)
+
+DPP warp reduction lesson:
+- `__shfl_xor` is intra-warp only (warpSize=64 on gfx906)
+- For 64 threads/col → columns are in different warps → still need LDS for cross-warp
+- Pure DPP reduction only helps when ALL cooperating threads are in the SAME warp
+- For GEMV: the extra grid overhead (N/4 WGs) dominates any DPP benefit for large N
 
 ## Residual-Add Epilogue Pattern (m1-residual-epilogues)
 Both `gemv_fp16_v2` and `gemv_int4_v2_fused` now support an optional residual pointer:

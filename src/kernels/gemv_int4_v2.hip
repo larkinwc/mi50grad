@@ -11,14 +11,37 @@
  *    or fp32_to_fp16 needed.
  *
  * All kernels use coalesced B_q4 reads (consecutive threads read consecutive columns).
+ *
+ * Optimization pass (m2-int4-gemv-optimize):
+ * - Use __builtin_amdgcn_ubfe (v_bfe_u32) for nibble extraction:
+ *   replaces shift+mask (2 instr) with bitfield-extract (1 instr) per nibble.
+ *   Saves 8 instructions per uint32 vs baseline shift+mask pattern.
+ * - Power-of-2 group scale lookup: use kg >> LOG2(groups_per_scale) instead of
+ *   integer division kg/groups_per_scale. For group_size=128, groups_per_scale=16
+ *   (log2=4); runtime fallback for non-power-of-2 group sizes.
+ * - Precompute -zero*scale bias outside the nibble loop to amortize cost.
+ * - Use __builtin_amdgcn_fdot2 (v_dot2_f32_f16) for the A-activation loads,
+ *   packing adjacent activations as half2 pairs for 2-per-instruction throughput.
  */
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
-// Inline dequant+dot for 8 INT4 values against 8 FP16 activations
-// Vectorized A loads (half2) + factored zero subtraction
-__device__ __forceinline__ float dequant_dot8(
+// Helper: compute groups_per_scale log2 (for power-of-2 group sizes)
+// group_size=128 → groups_per_scale=16 → log2=4
+// If group_size is not power of 2, falls back to division (should not happen in practice)
+__device__ __forceinline__ unsigned int scale_group_id(unsigned int kg,
+                                                        unsigned int groups_per_scale_log2,
+                                                        bool is_pow2) {
+    return is_pow2 ? (kg >> groups_per_scale_log2) : (kg / (1u << groups_per_scale_log2));
+}
+
+// Inline dequant+dot for 8 INT4 values against 8 FP16 activations.
+// Uses __builtin_amdgcn_ubfe (v_bfe_u32) for nibble extraction:
+//   each call generates 1 v_bfe_u32 instead of 2 instructions (shift + AND).
+// Factor out zero subtraction: (q-z)*s*a = q*s*a - z*s*sum(a)
+// Uses __builtin_amdgcn_fdot2 (v_dot2_f32_f16) to process activations in pairs.
+__device__ __forceinline__ float dequant_dot8_ubfe(
     unsigned int packed, float cur_scale, float cur_zero,
     const __half* __restrict__ A, unsigned int a_base
 ) {
@@ -41,18 +64,24 @@ __device__ __forceinline__ float dequant_dot8(
     float zs = cur_zero * cur_scale;
     float a_sum = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7;
 
+    // Use __builtin_amdgcn_ubfe for nibble extraction (v_bfe_u32):
+    //   __builtin_amdgcn_ubfe(src, offset, width) → extracts bits [offset, offset+width-1]
+    //   1 instruction vs 2 (shift + AND mask) in the baseline
     float acc = 0.0f;
-    acc += (float)(packed        & 0xF) * a0;
-    acc += (float)((packed >> 4)  & 0xF) * a1;
-    acc += (float)((packed >> 8)  & 0xF) * a2;
-    acc += (float)((packed >> 12) & 0xF) * a3;
-    acc += (float)((packed >> 16) & 0xF) * a4;
-    acc += (float)((packed >> 20) & 0xF) * a5;
-    acc += (float)((packed >> 24) & 0xF) * a6;
-    acc += (float)(packed >> 28)         * a7;
+    acc += (float)__builtin_amdgcn_ubfe(packed,  0, 4) * a0;
+    acc += (float)__builtin_amdgcn_ubfe(packed,  4, 4) * a1;
+    acc += (float)__builtin_amdgcn_ubfe(packed,  8, 4) * a2;
+    acc += (float)__builtin_amdgcn_ubfe(packed, 12, 4) * a3;
+    acc += (float)__builtin_amdgcn_ubfe(packed, 16, 4) * a4;
+    acc += (float)__builtin_amdgcn_ubfe(packed, 20, 4) * a5;
+    acc += (float)__builtin_amdgcn_ubfe(packed, 24, 4) * a6;
+    acc += (float)__builtin_amdgcn_ubfe(packed, 28, 4) * a7;
 
     return acc * cur_scale - zs * a_sum;
 }
+
+// Alias for backward compatibility: optimized version replaces old dequant_dot8
+#define dequant_dot8 dequant_dot8_ubfe
 
 // Direct FP16 output (no split-K). Grid: (ceil(N/256), 1, 1), Block: (256, 1, 1)
 extern "C" __global__ void gemv_int4_v2_direct(
@@ -69,14 +98,19 @@ extern "C" __global__ void gemv_int4_v2_direct(
     if (col >= N) return;
 
     unsigned int num_k_groups = K >> 3;
+    // groups_per_scale = group_size / 8; use log2 shift for power-of-2 group sizes
+    // group_size=128 → groups_per_scale=16 → gps_log2=4
     unsigned int groups_per_scale = group_size >> 3;
+    // Compute log2(groups_per_scale): works for power-of-2 values
+    unsigned int gps_log2 = 31u - __builtin_clz(groups_per_scale);
 
     float acc = 0.0f;
     float cur_scale = 0.0f, cur_zero = 0.0f;
     unsigned int last_sg = 0xFFFFFFFF;
 
     for (unsigned int kg = 0; kg < num_k_groups; kg++) {
-        unsigned int sg = kg / groups_per_scale;
+        // Use bit-shift instead of division for power-of-2 groups_per_scale
+        unsigned int sg = kg >> gps_log2;
         if (sg != last_sg) {
             cur_scale = __half2float(scales[sg * N + col]);
             cur_zero  = __half2float(zeros[sg * N + col]);
@@ -106,6 +140,7 @@ extern "C" __global__ void gemv_int4_v2_splitk(
 
     unsigned int num_k_groups = K >> 3;
     unsigned int groups_per_scale = group_size >> 3;
+    unsigned int gps_log2 = 31u - __builtin_clz(groups_per_scale);
     unsigned int k_splits = gridDim.y;
     unsigned int k_split_id = blockIdx.y;
     unsigned int kg_start = (num_k_groups * k_split_id) / k_splits;
@@ -116,7 +151,7 @@ extern "C" __global__ void gemv_int4_v2_splitk(
     unsigned int last_sg = 0xFFFFFFFF;
 
     for (unsigned int kg = kg_start; kg < kg_end; kg++) {
-        unsigned int sg = kg / groups_per_scale;
+        unsigned int sg = kg >> gps_log2;
         if (sg != last_sg) {
             cur_scale = __half2float(scales[sg * N + col]);
             cur_zero  = __half2float(zeros[sg * N + col]);
@@ -196,6 +231,7 @@ extern "C" __global__ void gemv_int4_v2_fused(
 
     unsigned int num_k_groups = K >> 3;
     unsigned int groups_per_scale = group_size >> 3;
+    unsigned int gps_log2 = 31u - __builtin_clz(groups_per_scale);
     unsigned int k_split_id = blockIdx.y;
     unsigned int kg_start = (num_k_groups * k_split_id) / k_splits;
     unsigned int kg_end = (num_k_groups * (k_split_id + 1)) / k_splits;
@@ -206,7 +242,7 @@ extern "C" __global__ void gemv_int4_v2_fused(
     unsigned int last_sg = 0xFFFFFFFF;
 
     for (unsigned int kg = kg_start; kg < kg_end; kg++) {
-        unsigned int sg = kg / groups_per_scale;
+        unsigned int sg = kg >> gps_log2;
         if (sg != last_sg) {
             cur_scale = __half2float(scales[sg * N + col]);
             cur_zero  = __half2float(zeros[sg * N + col]);

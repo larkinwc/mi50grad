@@ -398,6 +398,7 @@ class InferenceEngine:
     def _init_gemv_v2(self):
         """Try to compile optimized GEMV kernels (coalesced INT4, vectorized FP16)."""
         self._gemv_int4_v2 = False
+        self._gemv_int4_v3 = False  # v3 cooperative reduction (faster for large N)
         self._gemv_fp16_v2 = False
         self._gemv_int4_k_splits = 16  # Split K for more parallelism
         try:
@@ -420,6 +421,18 @@ class InferenceEngine:
                 print("GEMV INT4 v2 (coalesced + fused split-K) loaded")
         except Exception as e:
             print(f"GEMV INT4 v2 failed: {e}")
+        # Try to load v3 cooperative-reduction kernel (16 threads/col = t16 variant).
+        # v3_t16 is 16% faster than v2_fused for N=4096 and same speed for N=11008.
+        # Used for GEMV WITHOUT residual epilogue. v2_fused remains for residual GEMV
+        # (down_proj with residual fused in). This is benchmarked result from m2-int4-gemv-optimize.
+        try:
+            hip_path = HIP_DIR / "gemv_int4_v3.hip"
+            if hip_path.exists() and self._gemv_int4_v2:
+                self.kernels.get_hip("gemv_int4_v3_t16", "gemv_int4_v3")
+                self._gemv_int4_v3 = True
+                print("GEMV INT4 v3 (cooperative reduction t16) loaded as default for non-residual GEMV")
+        except Exception as e:
+            print(f"GEMV INT4 v3 failed (falling back to v2): {e}")
         self._gemv_int4_dual = False
         self._gemv_int4_dual_fused = False
         try:
@@ -1366,27 +1379,47 @@ class InferenceEngine:
 
     def _launch_gemv_int4(self, dst, src, qweight, scales, zeros, K, N, residual=0):
         if self._gemv_int4_v2:
-            grid_x = (N + 255) // 256
-            k_splits = self._gemv_int4_k_splits
-            # Single fused launch: no separate memset or fp32_to_fp16 needed.
-            # The kernel initializes C_fp32 internally and writes FP16 output directly.
-            # Optional residual epilogue: if residual != 0, dst[i] += residual[i]
-            func = self.kernels.get_hip("gemv_int4_v2_fused", "gemv_int4_v2")
-            params = [
-                ctypes.c_uint64(src),
-                ctypes.c_uint64(qweight),
-                ctypes.c_uint64(scales),
-                ctypes.c_uint64(zeros),
-                ctypes.c_uint64(self.d_gemv_fp32),
-                ctypes.c_uint64(self.d_gemv_done),
-                ctypes.c_uint64(dst),
-                ctypes.c_uint32(K),
-                ctypes.c_uint32(N),
-                ctypes.c_uint32(self.config.group_size),
-                ctypes.c_uint32(k_splits),
-                ctypes.c_uint64(residual),  # optional residual ptr (0 = null = no residual)
-            ]
-            self.device.launch(func, (grid_x, k_splits, 1), (256, 1, 1), params)
+            # For GEMV without residual epilogue, use v3_t16 if available (faster).
+            # v3_t16: 16 threads/col, cooperative K-reduction, single launch, no atomics,
+            # no persistent buffers, ~16% faster than v2_fused for N=4096.
+            if self._gemv_int4_v3 and not residual:
+                # v3_t16: 16 cols per WG (256/16=16), grid=(ceil(N/16), 1, 1)
+                func = self.kernels.get_hip("gemv_int4_v3_t16", "gemv_int4_v3")
+                cols_per_wg = 16  # 256 threads / 16 threads_per_col
+                grid_x = (N + cols_per_wg - 1) // cols_per_wg
+                params = [
+                    ctypes.c_uint64(src),
+                    ctypes.c_uint64(qweight),
+                    ctypes.c_uint64(scales),
+                    ctypes.c_uint64(zeros),
+                    ctypes.c_uint64(dst),
+                    ctypes.c_uint32(K),
+                    ctypes.c_uint32(N),
+                    ctypes.c_uint32(self.config.group_size),
+                ]
+                self.device.launch(func, (grid_x, 1, 1), (256, 1, 1), params)
+            else:
+                # v2_fused: used for residual GEMV (down_proj) or v3 unavailable.
+                # Single fused launch: no separate memset or fp32_to_fp16 needed.
+                # Optional residual epilogue: if residual != 0, dst[i] += residual[i]
+                grid_x = (N + 255) // 256
+                k_splits = self._gemv_int4_k_splits
+                func = self.kernels.get_hip("gemv_int4_v2_fused", "gemv_int4_v2")
+                params = [
+                    ctypes.c_uint64(src),
+                    ctypes.c_uint64(qweight),
+                    ctypes.c_uint64(scales),
+                    ctypes.c_uint64(zeros),
+                    ctypes.c_uint64(self.d_gemv_fp32),
+                    ctypes.c_uint64(self.d_gemv_done),
+                    ctypes.c_uint64(dst),
+                    ctypes.c_uint32(K),
+                    ctypes.c_uint32(N),
+                    ctypes.c_uint32(self.config.group_size),
+                    ctypes.c_uint32(k_splits),
+                    ctypes.c_uint64(residual),  # optional residual ptr (0 = null = no residual)
+                ]
+                self.device.launch(func, (grid_x, k_splits, 1), (256, 1, 1), params)
         else:
             func = self.kernels.get("gemv_int4_fp16", "gemm_int4")
             params = [
