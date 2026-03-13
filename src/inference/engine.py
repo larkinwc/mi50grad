@@ -319,6 +319,7 @@ class InferenceEngine:
         self._alloc_scratch()
         self._init_deltanet_gpu()
         self._init_qknorm_rope()
+        self._init_rope_hip()
         self._init_gemv_v2()
         self._init_gemm_prefill()
         self._init_streams()
@@ -394,6 +395,25 @@ class InferenceEngine:
         self.kernels.get_hip("qknorm_rope_fused", "qknorm_rope")
         self._qknorm_rope_fused = True
         print("Fused QK-norm+RoPE kernel loaded")
+
+    def _init_rope_hip(self):
+        """Load the HIP RoPE kernel (rope_v2.hip), replacing assembly rope.s.
+
+        The HIP kernel uses vectorized half2 loads and FP32 rotation,
+        supporting head_dim=128 and head_dim=256.
+        Falls back to assembly rope.s if HIP kernel cannot be loaded.
+        """
+        self._rope_hip = False
+        hip_path = HIP_DIR / "rope_v2.hip"
+        if not hip_path.exists():
+            print("HIP RoPE kernel (rope_v2.hip) not found, will use assembly fallback")
+            return
+        try:
+            self.kernels.get_hip("rope_fp16_v2", "rope_v2")
+            self._rope_hip = True
+            print("HIP RoPE kernel (rope_v2.hip) loaded — replaces assembly rope.s")
+        except Exception as e:
+            print(f"HIP RoPE kernel failed to load: {e}, will use assembly fallback")
 
     def _init_gemv_v2(self):
         """Try to compile optimized GEMV kernels (coalesced INT4, vectorized FP16)."""
@@ -1514,18 +1534,36 @@ class InferenceEngine:
         self._record_launch(getattr(self, '_active_layer_idx', -1))  # fused single launch
 
     def _launch_rope(self, x_ptr, position, num_heads, head_dim):
-        """Apply partial RoPE (only first rotary_dim dims of each head)."""
-        func = self.kernels.get("rope_fp16", "rope")
+        """Apply partial RoPE (only first rotary_dim dims of each head).
+
+        Uses HIP rope_v2 kernel if available (vectorized half2 loads),
+        otherwise falls back to assembly rope.s.
+        """
         half_rotary = self.rotary_dim // 2
-        cos_offset = position * half_rotary * 2
-        params = [
-            ctypes.c_uint64(x_ptr),
-            ctypes.c_uint64(self.d_cos + cos_offset),
-            ctypes.c_uint64(self.d_sin + cos_offset),
-            ctypes.c_uint32(head_dim),
-            ctypes.c_uint32(num_heads),
-        ]
-        self.device.launch(func, (1, num_heads, 1), (half_rotary, 1, 1), params)
+        cos_offset = position * half_rotary * 2  # byte offset into cos/sin tables
+
+        if self._rope_hip:
+            func = self.kernels.get_hip("rope_fp16_v2", "rope_v2")
+            params = [
+                ctypes.c_uint64(x_ptr),
+                ctypes.c_uint64(self.d_cos + cos_offset),
+                ctypes.c_uint64(self.d_sin + cos_offset),
+                ctypes.c_uint32(head_dim),
+                ctypes.c_uint32(num_heads),
+            ]
+            # Grid: (1, num_heads, 1) — note: token index 0 (single token decode)
+            # Block: (half_rotary, 1, 1) — one thread per rotation pair
+            self.device.launch(func, (1, num_heads, 1), (half_rotary, 1, 1), params)
+        else:
+            func = self.kernels.get("rope_fp16", "rope")
+            params = [
+                ctypes.c_uint64(x_ptr),
+                ctypes.c_uint64(self.d_cos + cos_offset),
+                ctypes.c_uint64(self.d_sin + cos_offset),
+                ctypes.c_uint32(head_dim),
+                ctypes.c_uint32(num_heads),
+            ]
+            self.device.launch(func, (1, num_heads, 1), (half_rotary, 1, 1), params)
 
     def _launch_decode_attn_256(self, out, q, k_cache, v_cache, seq_len):
         """Launch head_dim=256 decode attention using flash attention kernel.

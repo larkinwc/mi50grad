@@ -13,8 +13,8 @@ Architectural decisions, patterns discovered, and kernel design notes.
 4. Kernels (HIP C++ or GCN ASM) — the actual GPU code
 
 ## Two Kernel Paths
-- **Assembly (.s)**: Compiled via `llvm-mc → ld.lld → .hsaco`. Max control. Used for: RoPE (only ASM), fallback for GEMM/GEMV.
-- **HIP C++ (.hip)**: Compiled via `hipcc → .so`. Easier iteration. Used for: elementwise ops, GEMV FP16/INT4, GEMM prefill, FlashAttention, DeltaNet, batched RMSNorm, sigmoid_mul.
+- **Assembly (.s)**: Compiled via `llvm-mc → ld.lld → .hsaco`. Max control. Used for: RoPE (fallback, replaced by HIP v2), fallback for GEMM/GEMV.
+- **HIP C++ (.hip)**: Compiled via `hipcc → .so`. Easier iteration. Used for: elementwise ops, GEMV FP16/INT4, GEMM prefill, FlashAttention, DeltaNet, batched RMSNorm, sigmoid_mul, **RoPE v2**.
 
 **The engine prefers HIP kernels over assembly.** Assembly kernels are fallback.
 
@@ -27,6 +27,8 @@ Architectural decisions, patterns discovered, and kernel design notes.
 - `flash_attn_256.hip`: head_dim=256, online softmax, GQA-aware.
 - `deltanet_v3.hip`: Full DeltaNet recurrence in one kernel, parallel kq_dot.
 - `batched_rmsnorm.hip`: Per-head Q/K normalization.
+- `rope_v2.hip`: **HIP RoPE** — replaces assembly rope.s. Vectorized half2 loads, FP32 rotation. Same interface as rope.s.
+- `qknorm_rope.hip`: Fused per-head RMSNorm + partial RoPE (used in decode path for Q and K).
 
 ## gfx906 Confirmed Instructions
 All verified on real hardware:
@@ -116,6 +118,26 @@ Both `gemv_fp16_v2` and `gemv_int4_v2_fused` now support an optional residual po
 **Test files updated for new kernel signature:**
 - Must pass `ctypes.c_uint64(0)` as last param for null residual
 - test_fused_int4_gemv.py, test_gemm_fp16_prefill.py, test_int4_direct_vs_splitk.py, test_tp_single_layer.py
+
+## HIP RoPE Kernel (m2-hip-rope)
+`rope_v2.hip` replaces the assembly-only `rope.s` for standalone RoPE operations.
+
+Key facts:
+- Vectorized half2 loads for both x[2i:2i+2] pairs and separate cos/sin reads
+- FP32 rotation (x0*c - x1*s, x0*s + x1*c), then pack back to half2 (FP16)
+- Interface: same as rope.s — (x, cos_tab, sin_tab, head_dim, num_heads)
+  Grid: (num_tokens, num_heads, 1), Block: (half_rotary, 1, 1)
+- **cos/sin table stride = head_dim/2** (not half_rotary!)
+  For single-token decode, token_idx=0 so stride doesn't matter.
+  For multi-token, cos_tab must be padded to [num_tokens, head_dim/2] columns.
+- Performance on MI60: ~20-27 us (comparable to assembly, kernel is memory-bound)
+- Assembly rope.s was BROKEN for multi-token (outputs zeros for token_idx>0)
+
+Engine wiring:
+- `_init_rope_hip()` loads rope_v2.hip (falls back to assembly if unavailable)
+- `_launch_rope()` uses HIP kernel when `self._rope_hip=True`
+- **Note**: `_launch_rope` is rarely called directly — decode path uses `_launch_qknorm_rope`
+  (fused QKnorm+RoPE). `_launch_rope` is the fallback for non-QKnorm-RoPE code paths.
 
 ## Qwen 3.5 27B Architecture
 - Hybrid attention: some layers use full GQA (head_dim=256), others use DeltaNet linear attention
