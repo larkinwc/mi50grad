@@ -46,6 +46,20 @@ All verified on real hardware:
 memset(fp32_buf) → gemv_int4_v2_splitk(fp32_buf) → fp32_to_fp16(output)
 Three launches per GEMV. Target: fuse into one.
 
+## Residual-Add Epilogue Pattern (m1-residual-epilogues)
+Both `gemv_fp16_v2` and `gemv_int4_v2_fused` now support an optional residual pointer:
+- If non-null: `out[i] = gemv_result + residual[i]`
+- If null (0): normal GEMV output
+
+**Engine decode path (tp_size=1):**
+- **out_proj**: `_launch_gemv_fp16(d_hidden, attn_out, o_weight, residual=d_hidden)` → d_hidden updated in-place, then `_launch_rmsnorm` (not skip_rmsnorm)
+- **down_proj**: `_launch_gemv_int4(d_hidden, ffn_gate, ..., residual=d_hidden)` → d_hidden updated in-place, no separate `_launch_residual_add`
+- **TP path** (tp_size>1): still writes to d_proj_out/d_ffn_out without residual; TPInferenceEngine handles allreduce+residual
+
+**Test files updated for new kernel signature:**
+- Must pass `ctypes.c_uint64(0)` as last param for null residual
+- test_fused_int4_gemv.py, test_gemm_fp16_prefill.py, test_int4_direct_vs_splitk.py, test_tp_single_layer.py
+
 ## Qwen 3.5 27B Architecture
 - Hybrid attention: some layers use full GQA (head_dim=256), others use DeltaNet linear attention
 - hidden_size=5120, num_heads=48, num_kv_heads=8
