@@ -1331,6 +1331,7 @@ class InferenceEngine:
         """FP16 GEMM: dst[M, N] = src[M, K] @ weight[N, K]^T.
 
         Used for batched projections during prefill.
+        v2: 64×64 tile with XOR-swizzled LDS and v_dot2_f32_f16.
         """
         func = self.kernels.get_hip("gemm_fp16_prefill", "gemm_fp16_prefill")
         params = [
