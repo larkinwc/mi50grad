@@ -169,6 +169,7 @@ def run_fused_splitk_test(K, N, group_size, k_splits, dev, description):
         ctypes.c_uint32(N),
         ctypes.c_uint32(group_size),
         ctypes.c_uint32(k_splits),
+        ctypes.c_uint64(0),          # residual=null (no residual epilogue)
     ]
     dev.launch(func_fused, (grid_x, k_splits, 1), (256, 1, 1), params)
     dev.synchronize()
@@ -275,6 +276,7 @@ def run_perf_comparison(K, N, group_size, k_splits, dev, description):
         ctypes.c_uint64(d_fp32_fused), ctypes.c_uint64(d_done),
         ctypes.c_uint64(d_C_new), ctypes.c_uint32(K), ctypes.c_uint32(N),
         ctypes.c_uint32(group_size), ctypes.c_uint32(k_splits),
+        ctypes.c_uint64(0),  # residual=null (no residual epilogue)
     ]
 
     # Warmup

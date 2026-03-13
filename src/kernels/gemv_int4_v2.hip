@@ -151,6 +151,7 @@ extern "C" __global__ void fp32_to_fp16(
  *     is the LAST tile for that column — it:
  *       (a) reads C_fp32[col] (which now holds the complete sum)
  *       (b) writes __float2half(C_fp32[col]) to C_fp16[col]
+ *          (optionally adding residual[col] if residual != nullptr)
  *       (c) resets C_fp32[col] = 0.0f and done[col] = 0 for the next call
  *
  * This means C_fp32 and done[] need to be zero-initialized ONLY ONCE at
@@ -169,6 +170,9 @@ extern "C" __global__ void fp32_to_fp16(
  *   C_fp16   - FP16 output buffer [N] half
  *   K, N, group_size - GEMV dimensions
  *   k_splits - number of K-dimension splits (== gridDim.y)
+ *   residual - optional: if non-null, C_fp16[col] += residual[col]
+ *              This fuses the residual-add into the GEMV, eliminating a
+ *              separate residual_add launch (saves 1 launch for down_proj).
  *
  * Grid:  (ceil(N/256), k_splits, 1)
  * Block: (256, 1, 1)
@@ -184,7 +188,8 @@ extern "C" __global__ void gemv_int4_v2_fused(
     unsigned int K,
     unsigned int N,
     unsigned int group_size,
-    unsigned int k_splits
+    unsigned int k_splits,
+    const __half* __restrict__ residual  // optional: if non-null, add residual[col]
 ) {
     unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (col >= N) return;
@@ -223,7 +228,13 @@ extern "C" __global__ void gemv_int4_v2_fused(
         // We are the last tile to complete for this column.
         // C_fp32[col] now holds the complete accumulated sum.
         float total = C_fp32[col];
-        C_fp16[col] = __float2half(total);
+
+        // Optional residual epilogue: add residual[col] if pointer is non-null
+        if (residual != nullptr) {
+            C_fp16[col] = __float2half(total + __half2float(residual[col]));
+        } else {
+            C_fp16[col] = __float2half(total);
+        }
 
         // Reset buffers for the next kernel call (so no per-call memset is needed)
         C_fp32[col] = 0.0f;

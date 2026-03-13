@@ -825,10 +825,19 @@ class InferenceEngine:
                 self._decode_linear_attention_gpu(layer_idx, lw, position)
 
             # FFN block: fused residual-add + RMSNorm at pre-FFN position.
-            # skip_rmsnorm_v2 does: hidden += proj_out; normed = rmsnorm(hidden, ffn_norm)
-            # This saves 1 kernel launch per layer vs separate residual_add + rmsnorm.
-            self._launch_skip_rmsnorm(self.d_normed, self.d_hidden, self.d_proj_out,
-                                       lw.ffn_norm, h)
+            # With residual-epilogue in out_proj GEMV (single-GPU path):
+            #   - out_proj already added proj_out + hidden → d_hidden is up-to-date
+            #   - Just run plain RMSNorm for the pre-FFN norm
+            # With TP (tp_size > 1):
+            #   - TPInferenceEngine allreduces d_proj_out first, then residual+norm
+            #   - Fallback: skip_rmsnorm handles residual+norm together
+            if self.tp_size <= 1:
+                self._launch_rmsnorm(self.d_normed, self.d_hidden, lw.ffn_norm, h)
+            else:
+                # TP path: residual add + norm is handled by TPInferenceEngine
+                # but decode_step single-call is not used for tp_size > 1
+                self._launch_skip_rmsnorm(self.d_normed, self.d_hidden, self.d_proj_out,
+                                           lw.ffn_norm, h)
 
             # Gate + up INT4 GEMV projections (column-parallel: local N)
             if self._gemv_int4_dual:
@@ -844,14 +853,20 @@ class InferenceEngine:
                 self._launch_silu_fused(self.d_ffn_gate, self.d_ffn_up,
                                          self.d_ffn_gate, self.local_intermediate_size)
 
-            # Down projection (row-parallel with TP: local K, full N=hidden)
-            self._launch_gemv_int4(self.d_ffn_out, self.d_ffn_gate,
-                                    lw.down_qweight, lw.down_scales, lw.down_zeros,
-                                    self.local_intermediate_size, h)
-
-            # Note: with TP, allreduce of d_ffn_out + residual is done by TPInferenceEngine
+            # Down projection (row-parallel with TP: local K, full N=hidden).
+            # For single-GPU (tp_size <= 1): use residual epilogue to fuse
+            # residual-add into the GEMV kernel, writing directly to d_hidden.
+            # This eliminates the separate residual-add launch after down_proj.
+            # For TP: TPInferenceEngine handles allreduce+residual externally.
             if self.tp_size <= 1:
-                self._launch_residual_add(self.d_hidden, self.d_ffn_out, h)
+                self._launch_gemv_int4(self.d_hidden, self.d_ffn_gate,
+                                        lw.down_qweight, lw.down_scales, lw.down_zeros,
+                                        self.local_intermediate_size, h,
+                                        residual=self.d_hidden)
+            else:
+                self._launch_gemv_int4(self.d_ffn_out, self.d_ffn_gate,
+                                        lw.down_qweight, lw.down_scales, lw.down_zeros,
+                                        self.local_intermediate_size, h)
 
         self.kv_cache.advance()
 
@@ -901,12 +916,22 @@ class InferenceEngine:
         # Apply sigmoid gate: attn_out *= sigmoid(gate)
         self._launch_sigmoid_mul(self.d_attn_out, self.d_q_gate, self.q_dim)
 
-        # Output projection (row-parallel with TP: local K=q_dim, full N=hidden)
-        self._launch_gemv_fp16(self.d_proj_out, self.d_attn_out, lw.o_weight,
-                                self.q_dim, h)
+        # Output projection (row-parallel with TP: local K=q_dim, full N=hidden).
+        # For single-GPU (tp_size <= 1): use residual epilogue to fuse residual-add
+        # into the GEMV kernel, writing d_hidden += proj_result directly.
+        # This eliminates the need for a separate residual_add; the subsequent
+        # pre-FFN norm in decode_step becomes plain rmsnorm (not skip_rmsnorm).
+        # For TP: write to d_proj_out; TPInferenceEngine allreduces first, then
+        # decode_step falls through to skip_rmsnorm to handle residual+norm.
+        if self.tp_size <= 1:
+            self._launch_gemv_fp16(self.d_hidden, self.d_attn_out, lw.o_weight,
+                                    self.q_dim, h, residual=self.d_hidden)
+        else:
+            self._launch_gemv_fp16(self.d_proj_out, self.d_attn_out, lw.o_weight,
+                                    self.q_dim, h)
 
-        # Note: residual add is deferred to decode_step() via _launch_skip_rmsnorm,
-        # which fuses the residual add with the pre-FFN RMSNorm into one kernel launch.
+        # Note: for tp_size <= 1, d_hidden now contains (old_hidden + out_proj_result).
+        # decode_step will run plain rmsnorm on d_hidden for the pre-FFN position.
         # For TP (tp_size > 1): TPInferenceEngine handles allreduce + residual + norm.
 
     def _decode_linear_attention(self, layer_idx: int, lw: LayerWeights,
@@ -1118,12 +1143,19 @@ class InferenceEngine:
             self.device.launch(func, (self.local_linear_num_v_heads, 1, 1),
                                (256, 1, 1), params, shared_mem=4096)
 
-        # 3. Output projection (row-parallel with TP: local K=la_z_dim, full N=hidden)
-        self._launch_gemv_fp16(self.d_proj_out, self.d_la_out, lw.la_out_proj,
-                                self.la_z_dim, h)
+        # 3. Output projection (row-parallel with TP: local K=la_z_dim, full N=hidden).
+        # For single-GPU (tp_size <= 1): use residual epilogue to fuse residual-add
+        # into the GEMV kernel, writing d_hidden += la_out_proj result directly.
+        # For TP: write to d_proj_out; TPInferenceEngine allreduces first.
+        if self.tp_size <= 1:
+            self._launch_gemv_fp16(self.d_hidden, self.d_la_out, lw.la_out_proj,
+                                    self.la_z_dim, h, residual=self.d_hidden)
+        else:
+            self._launch_gemv_fp16(self.d_proj_out, self.d_la_out, lw.la_out_proj,
+                                    self.la_z_dim, h)
 
-        # Note: residual add is deferred to decode_step() via _launch_skip_rmsnorm,
-        # which fuses the residual add with the pre-FFN RMSNorm into one kernel launch.
+        # Note: for tp_size <= 1, d_hidden now contains (old_hidden + la_out_proj_result).
+        # decode_step will run plain rmsnorm on d_hidden for the pre-FFN position.
         # For TP (tp_size > 1): TPInferenceEngine handles allreduce + residual + norm.
 
     # --- Kernel launchers ---
@@ -1198,8 +1230,13 @@ class InferenceEngine:
         # One block per head; 256 threads per block
         self.device.launch(func, (num_heads, 1, 1), (256, 1, 1), params)
 
-    def _launch_gemv_fp16(self, dst, src, weight, K, N):
-        """FP16 GEMV: dst[N] = weight[N, K] * src[K]."""
+    def _launch_gemv_fp16(self, dst, src, weight, K, N, residual=0):
+        """FP16 GEMV: dst[N] = weight[N, K] * src[K].
+
+        Optional residual epilogue: if residual != 0, dst[i] += residual[i]
+        This fuses the residual-add into the GEMV kernel, eliminating a
+        separate residual_add launch (used for out_proj with residual=d_hidden).
+        """
         if self._gemv_fp16_v2:
             func = self.kernels.get_hip("gemv_fp16_v2", "gemv_fp16_v2")
             params = [
@@ -1208,6 +1245,7 @@ class InferenceEngine:
                 ctypes.c_uint64(dst),
                 ctypes.c_uint32(K),
                 ctypes.c_uint32(N),
+                ctypes.c_uint64(residual),  # optional residual ptr (0 = null = no residual)
             ]
             # 4 rows per WG (one per wavefront)
             grid_x = (N + 3) // 4
@@ -1222,6 +1260,9 @@ class InferenceEngine:
                 ctypes.c_uint32(N),
             ]
             self.device.launch(func, (N, 1, 1), (256, 1, 1), params, shared_mem=1024)
+            # Fallback: apply residual separately if requested
+            if residual:
+                self._launch_residual_add(dst, residual, N)
 
     def _launch_gemm_fp16(self, dst, src, weight, M, N, K):
         """FP16 GEMM: dst[M, N] = src[M, K] @ weight[N, K]^T.
@@ -1259,12 +1300,13 @@ class InferenceEngine:
         grid_y = (M + 63) // 64
         self.device.launch(func, (grid_x, grid_y, 1), (256, 1, 1), params)
 
-    def _launch_gemv_int4(self, dst, src, qweight, scales, zeros, K, N):
+    def _launch_gemv_int4(self, dst, src, qweight, scales, zeros, K, N, residual=0):
         if self._gemv_int4_v2:
             grid_x = (N + 255) // 256
             k_splits = self._gemv_int4_k_splits
             # Single fused launch: no separate memset or fp32_to_fp16 needed.
             # The kernel initializes C_fp32 internally and writes FP16 output directly.
+            # Optional residual epilogue: if residual != 0, dst[i] += residual[i]
             func = self.kernels.get_hip("gemv_int4_v2_fused", "gemv_int4_v2")
             params = [
                 ctypes.c_uint64(src),
@@ -1278,6 +1320,7 @@ class InferenceEngine:
                 ctypes.c_uint32(N),
                 ctypes.c_uint32(self.config.group_size),
                 ctypes.c_uint32(k_splits),
+                ctypes.c_uint64(residual),  # optional residual ptr (0 = null = no residual)
             ]
             self.device.launch(func, (grid_x, k_splits, 1), (256, 1, 1), params)
         else:
@@ -1293,6 +1336,9 @@ class InferenceEngine:
                 ctypes.c_uint32(self.config.group_size),
             ]
             self.device.launch(func, (N, 1, 1), (256, 1, 1), params, shared_mem=1024)
+            # Fallback: apply residual separately if requested
+            if residual:
+                self._launch_residual_add(dst, residual, N)
 
     def _launch_ffn_gate_up_silu(self, dst, src, lw, K, N):
         """Fused gate+up INT4 GEMV + SiLU: dst = silu(gate(x)) * up(x).
