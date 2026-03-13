@@ -374,13 +374,19 @@ class InferenceEngine:
             hip_path = HIP_DIR / "gemv_int4_v2.hip"
             if hip_path.exists():
                 self.kernels.get_hip("gemv_int4_v2_direct", "gemv_int4_v2")
-                self.kernels.get_hip("gemv_int4_v2_splitk", "gemv_int4_v2")
-                self.kernels.get_hip("fp32_to_fp16", "gemv_int4_v2")
+                self.kernels.get_hip("gemv_int4_v2_fused", "gemv_int4_v2")
                 self._gemv_int4_v2 = True
                 max_n = max(self.local_intermediate_size, self.config.hidden_size)
+                # Persistent FP32 accumulator buffer (zeroed once at init, reset by kernel)
                 self.d_gemv_fp32 = self.device.malloc(max_n * 4)
+                self.device.memset(self.d_gemv_fp32, 0, max_n * 4)
+                # Persistent done-counter buffer (uint32, zeroed once at init, reset by kernel)
+                self.d_gemv_done = self.device.malloc(max_n * 4)
+                self.device.memset(self.d_gemv_done, 0, max_n * 4)
+                # Second pair for dual (gate+up) path (these are still 3-launch via dual kernel)
                 self.d_gemv_fp32_2 = self.device.malloc(max_n * 4)
-                print("GEMV INT4 v2 (coalesced + split-K) loaded")
+                self.device.memset(self.d_gemv_fp32_2, 0, max_n * 4)
+                print("GEMV INT4 v2 (coalesced + fused split-K) loaded")
         except Exception as e:
             print(f"GEMV INT4 v2 failed: {e}")
         self._gemv_int4_dual = False
@@ -1218,27 +1224,23 @@ class InferenceEngine:
         if self._gemv_int4_v2:
             grid_x = (N + 255) // 256
             k_splits = self._gemv_int4_k_splits
-            # Zero FP32 accumulator, launch split-K GEMV, convert to FP16
-            self.device.memset(self.d_gemv_fp32, 0, N * 4)
-            func = self.kernels.get_hip("gemv_int4_v2_splitk", "gemv_int4_v2")
+            # Single fused launch: no separate memset or fp32_to_fp16 needed.
+            # The kernel initializes C_fp32 internally and writes FP16 output directly.
+            func = self.kernels.get_hip("gemv_int4_v2_fused", "gemv_int4_v2")
             params = [
                 ctypes.c_uint64(src),
                 ctypes.c_uint64(qweight),
                 ctypes.c_uint64(scales),
                 ctypes.c_uint64(zeros),
                 ctypes.c_uint64(self.d_gemv_fp32),
+                ctypes.c_uint64(self.d_gemv_done),
+                ctypes.c_uint64(dst),
                 ctypes.c_uint32(K),
                 ctypes.c_uint32(N),
                 ctypes.c_uint32(self.config.group_size),
+                ctypes.c_uint32(k_splits),
             ]
             self.device.launch(func, (grid_x, k_splits, 1), (256, 1, 1), params)
-            func2 = self.kernels.get_hip("fp32_to_fp16", "gemv_int4_v2")
-            params2 = [
-                ctypes.c_uint64(self.d_gemv_fp32),
-                ctypes.c_uint64(dst),
-                ctypes.c_uint32(N),
-            ]
-            self.device.launch(func2, (grid_x, 1, 1), (256, 1, 1), params2)
         else:
             func = self.kernels.get("gemv_int4_fp16", "gemm_int4")
             params = [
