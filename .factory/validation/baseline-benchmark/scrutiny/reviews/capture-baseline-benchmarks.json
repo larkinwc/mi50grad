@@ -1,0 +1,39 @@
+{
+  "featureId": "capture-baseline-benchmarks",
+  "reviewedAt": "2026-03-14T17:00:00.000Z",
+  "commitId": "9705649",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "The implementation fully satisfies the feature specification. The benchmark script correctly builds all 10 target kernel categories, measures 100 iterations with 10 warmup, uses median latency, covers all specified shapes, saves to bench/optimization_baseline.json with the correct structure, prints a summary table, and handles missing kernels gracefully. The script was deployed and ran on the MI60 LXC with exit code 0, and the captured JSON contains real data with reasonable microsecond-range latencies. All requirements from VAL-BASE-001 are fulfilled.",
+    "issues": [
+      {
+        "file": "tests/bench_optimization_baseline.py",
+        "line": 90,
+        "severity": "non_blocking",
+        "description": "The bench_kernel function uses time.perf_counter() + dev.synchronize() per iteration for timing, which adds the synchronization overhead to each measurement. This is correct for wall-clock latency, but serializes GPU execution. The synchronize-per-iteration approach is consistent with other bench scripts in the codebase (bench_w8a8.py, bench_w4a8.py) so this is intentional and fine."
+      },
+      {
+        "file": "tests/bench_optimization_baseline.py",
+        "line": null,
+        "severity": "non_blocking",
+        "description": "The script does not benchmark seq_len=2048 for FlashAttention prefill with a grid_y calculation — looking at the code, grid_y = (seq_len + 3) // 4, which for seq_len=2048 gives grid_y=512. This is correct. The seq_len=2048 benchmark completed (77.8ms) confirming no issue."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "library",
+      "observation": "The kernel build process calls build_hip_hsaco() which wraps hipcc. The environment.md already documents that HIP kernels compile to .so not .hsaco — but the function is named build_hip_hsaco. This naming inconsistency might confuse future workers. The launcher.py likely handles this transparently.",
+      "evidence": "environment.md: 'HIP kernels are compiled as shared objects (.so) not HSACO'. bench script uses build_hip_hsaco() function from src/kernels/launcher.py"
+    },
+    {
+      "area": "services",
+      "observation": "The benchmark script is deployed to the LXC via rsync (using the existing 'deploy' command in services.yaml) and run via SSH (using the 'test' command prefix). Both are already documented in services.yaml. No new commands are needed.",
+      "evidence": "services.yaml has 'deploy' and 'test' commands that worker used"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS. The capture-baseline-benchmarks feature is correctly implemented. All 10 kernel categories (flash_attn decode/prefill, gemm_fp16_prefill, gemm_int4_prefill, gemv_int4_v3 t4/t8/t16, rmsnorm_v2, silu_fused_v2, residual_add_v2) are benchmarked at specified shapes. Results are captured in bench/optimization_baseline.json with {latency_us, tflops/gbs} per shape. Script ran successfully on MI60 LXC (exit code 0). VAL-BASE-001 is fully satisfied. Two minor non-blocking observations noted (timing methodology comment, naming consistency) but neither affects functionality."
+}
