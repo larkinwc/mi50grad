@@ -1,0 +1,59 @@
+{
+  "milestone": "isa-vectorization",
+  "round": 1,
+  "status": "pass",
+  "assertionsSummary": {
+    "total": 4,
+    "passed": 4,
+    "failed": 0,
+    "blocked": 0
+  },
+  "passedAssertions": ["VAL-I4GV-001", "VAL-I4GV-002", "VAL-ELEM-001", "VAL-ELEM-002"],
+  "failedAssertions": [],
+  "blockedAssertions": [],
+  "appliedUpdates": [
+    {
+      "target": "user-testing.md",
+      "description": "Added 'Flow Validator Guidance: GPU Kernel - isa-vectorization' section with test file mapping and SSH setup instructions",
+      "source": "setup"
+    }
+  ],
+  "previousRound": null,
+  "details": {
+    "VAL-I4GV-001": {
+      "testFile": "tests/test_gemv_int4_v4.py",
+      "N4096_K4096_v4t16_max_abs_err": 0.001953,
+      "N11008_K4096_v4t16_max_abs_err": 0.000977,
+      "threshold": 0.01,
+      "verdict": "All v4 kernel variants (t4, t8, t16) passed correctness at both shapes"
+    },
+    "VAL-I4GV-002": {
+      "testFile": "tests/test_gemv_int4_v4.py",
+      "N4096_K4096_v3_us": 67.0,
+      "N4096_K4096_v4_us": 80.1,
+      "N4096_K4096_speedup": 0.837,
+      "N11008_K4096_v3_us": 107.1,
+      "N11008_K4096_v4_us": 128.2,
+      "N11008_K4096_speedup": 0.835,
+      "verdict": "Latency comparison reported with numbers (v4 is ~1.2x slower than v3 at both shapes — regression reported as required)"
+    },
+    "VAL-ELEM-001": {
+      "testFile": "tests/test_elementwise_v3.py",
+      "residual_add_v3_max_abs_err": 0.0,
+      "silu_fused_v3_max_abs_err": 0.0,
+      "rmsnorm_v3_max_abs_err": 0.000977,
+      "skip_rmsnorm_v3_max_abs_err_dst": 0.001953,
+      "verdict": "ALL TESTS PASSED. All kernels within their respective error thresholds."
+    },
+    "VAL-ELEM-002": {
+      "testFile": "tests/test_elementwise_v3.py",
+      "silu_fused_v2_bw_GBs": 0.5,
+      "silu_fused_v3_bw_GBs": 0.6,
+      "silu_fused_speedup": 1.31,
+      "rmsnorm_v2_bw_GBs": 0.5,
+      "rmsnorm_v3_bw_GBs": 0.6,
+      "rmsnorm_speedup": 1.30,
+      "verdict": "silu_fused_v3 and rmsnorm_v3 both show 1.30x+ bandwidth improvement over v2"
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "flowId": "gemv-int4",
+  "assertions": [
+    {
+      "id": "VAL-I4GV-001",
+      "status": "pass",
+      "evidence": "test_gemv_int4_v4.py ran successfully. Correctness tests PASSED at both shapes. N=4096,K=4096,gs=128: v4_t16 max_abs_err=0.001953 < 1e-2 [PASS]. N=11008,K=4096,gs=128: v4_t16 max_abs_err=0.000977 < 1e-2 [PASS]. All v4 variants (t4, t8, t16) passed both shapes.",
+      "details": {
+        "shape_4096_4096": {
+          "v4_t4_max_abs_err": 0.001953,
+          "v4_t8_max_abs_err": 0.001953,
+          "v4_t16_max_abs_err": 0.001953,
+          "threshold": 0.01,
+          "pass": true
+        },
+        "shape_11008_4096": {
+          "v4_t4_max_abs_err": 0.000977,
+          "v4_t8_max_abs_err": 0.000977,
+          "v4_t16_max_abs_err": 0.000977,
+          "threshold": 0.01,
+          "pass": true
+        }
+      }
+    },
+    {
+      "id": "VAL-I4GV-002",
+      "status": "pass",
+      "evidence": "Latency comparison reported for both shapes. N=4096,K=4096: v3=67.0us, v4_t16=80.1us (speedup=0.837x — v4 is 1.195x SLOWER). N=11008,K=4096: v3=107.1us, v4_t16=128.2us (speedup=0.835x — v4 is 1.198x SLOWER). Results are reported with numbers as required by assertion spec — the assertion says 'Results are reported (improvement or regression with numbers)' which means reporting is sufficient regardless of direction.",
+      "details": {
+        "shape_4096_4096": {
+          "v3_t16_latency_us": 67.0,
+          "v4_t16_latency_us": 80.1,
+          "speedup": 0.837
+        },
+        "shape_11008_4096": {
+          "v3_t16_latency_us": 107.1,
+          "v4_t16_latency_us": 128.2,
+          "speedup": 0.835
+        }
+      }
+    }
+  ],
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "python", "hipcc"]
+}

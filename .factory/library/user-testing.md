@@ -169,6 +169,36 @@ ssh -o ConnectTimeout=20 -o StrictHostKeyChecking=no -J root@wittymantis.netbird
 
 ---
 
+## Flow Validator Guidance: GPU Kernel - isa-vectorization
+
+**Surface**: SSH to LXC (mi60-jupyter at 192.168.1.189), run Python test scripts on MI60 GPU
+
+**SSH Setup** (required for every command):
+```bash
+export SSH_AUTH_SOCK=$(ls /private/tmp/com.apple.launchd.*/Listeners 2>/dev/null | head -1)
+ssh -o ConnectTimeout=20 -o StrictHostKeyChecking=no -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'COMMAND'
+```
+
+**Isolation rules**:
+- Run tests sequentially within a subagent (GPU is single, VRAM shared)
+- VRAM currently at 0% — kernel tests allocate modest VRAM and are fine
+- Do NOT kill existing GPU processes
+
+**Deploy before testing** (if needed):
+```bash
+rsync -avz --exclude='.git' --exclude='build' --exclude='__pycache__' --exclude='.factory' \
+    -e 'ssh -J root@wittymantis.netbird.selfhosted' \
+    /Users/larkinwc/personal/ml/mi50grad/ root@192.168.1.189:/root/mi50grad/
+```
+
+**Key test files for isa-vectorization milestone**:
+- `tests/test_gemv_int4_v4.py` — VAL-I4GV-001 (correctness at N=4096,K=4096 and N=11008,K=4096), VAL-I4GV-002 (latency comparison v4 vs v3)
+- `tests/test_elementwise_v3.py` — VAL-ELEM-001 (correctness: residual_add, silu_fused, rmsnorm, skip_rmsnorm at dim=5120), VAL-ELEM-002 (bandwidth comparison v3 vs v2 GB/s)
+
+**Evidence format**: Capture full stdout/stderr from each test command. Look for PASS/FAIL lines and max abs error values and bandwidth (GB/s) numbers.
+
+---
+
 ## Flow Validator Guidance: GPU Kernel - compute-kernels
 
 **Surface**: SSH to LXC (mi60-jupyter at 192.168.1.189), run Python test scripts on MI60 GPU

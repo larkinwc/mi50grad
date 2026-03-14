@@ -1,0 +1,69 @@
+{
+  "flowId": "elementwise",
+  "assertions": [
+    {
+      "id": "VAL-ELEM-001",
+      "status": "pass",
+      "evidence": "test_elementwise_v3.py ran successfully. ALL TESTS PASSED. residual_add_v3: max_abs_err=0.000000 < 1e-4 [PASS]. silu_fused_v3: max_abs_err=0.000000 < 5e-3 [PASS]. rmsnorm_v3: max_abs_err=0.000977 < 5e-3 [PASS]. skip_rmsnorm_v3: max_abs_err_dst=0.001953 < 5e-3, max_abs_err_hidden=0.000000 < 1e-4 [PASS]. Edge case tests at dim=7,16,256,1024,4096 also passed.",
+      "details": {
+        "residual_add_v3": {
+          "dim": 5120,
+          "max_abs_err": 0.0,
+          "threshold": 0.0001,
+          "pass": true
+        },
+        "silu_fused_v3": {
+          "dim": 5120,
+          "max_abs_err": 0.0,
+          "threshold": 0.005,
+          "pass": true
+        },
+        "rmsnorm_v3": {
+          "dim": 5120,
+          "max_abs_err": 0.000977,
+          "threshold": 0.005,
+          "pass": true
+        },
+        "skip_rmsnorm_v3": {
+          "dim": 5120,
+          "max_abs_err_dst": 0.001953,
+          "max_abs_err_hidden": 0.0,
+          "threshold_dst": 0.005,
+          "threshold_hidden": 0.0001,
+          "pass": true
+        }
+      }
+    },
+    {
+      "id": "VAL-ELEM-002",
+      "status": "pass",
+      "evidence": "Bandwidth comparison: silu_fused_v3 at 0.6 GB/s vs v2 at 0.5 GB/s (1.31x speedup). rmsnorm_v3 at 0.6 GB/s vs v2 at 0.5 GB/s (1.30x speedup). At least one kernel (silu_fused and rmsnorm) shows measurable bandwidth improvement over v2.",
+      "details": {
+        "residual_add": {
+          "v2_latency_us": 48.5,
+          "v3_latency_us": 50.0,
+          "v2_bw_GBs": 0.6,
+          "v3_bw_GBs": 0.6,
+          "speedup": 0.97
+        },
+        "silu_fused": {
+          "v2_latency_us": 66.1,
+          "v3_latency_us": 50.3,
+          "v2_bw_GBs": 0.5,
+          "v3_bw_GBs": 0.6,
+          "speedup": 1.31
+        },
+        "rmsnorm": {
+          "v2_latency_us": 63.7,
+          "v3_latency_us": 49.2,
+          "v2_bw_GBs": 0.5,
+          "v3_bw_GBs": 0.6,
+          "speedup": 1.30
+        }
+      }
+    }
+  ],
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "python", "hipcc"]
+}
