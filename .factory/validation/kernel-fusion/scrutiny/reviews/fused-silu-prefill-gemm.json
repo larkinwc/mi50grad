@@ -1,0 +1,29 @@
+{
+  "featureId": "fused-silu-prefill-gemm",
+  "status": "pass",
+  "issues": [
+    {
+      "severity": "non_blocking",
+      "description": "Strategy A (dual GEMM) shows a 0.777x slowdown vs baseline at M=128, N=11008, K=5120. While HBM traffic savings are correctly analyzed (229MB vs 458MB), the GEMM at this shape is compute-dominated (~1800us per kernel on gfx906 with 13.4 TFLOPS peak), not bandwidth-dominated. The test output and code comments clearly explain this, satisfying VAL-FUSE-003.",
+      "location": "tests/test_gemm_silu_fused.py"
+    },
+    {
+      "severity": "suggestion",
+      "description": "Strategy A (dual GEMM) changes the grid from (N/64) to (N/32) workgroups, doubling the number of workgroups in the N dimension. At M=128, N=11008, each WG has less compute work than the original (2x4 outputs vs 4x4), which means more scheduling overhead and worse L2 hit rates for weight tiles. Consider profiling smaller M values (M=16, M=32) where bandwidth-dominated regime makes fusion more beneficial.",
+      "location": "src/kernels/gemm_fp16_prefill_silu_dual.hip"
+    },
+    {
+      "severity": "suggestion",
+      "description": "The traffic analysis in gemm_fp16_prefill_silu_dual.hip header comment appears to double-count A reads in the baseline: it computes 2*(A+W_gate+W_up reads) = 458.6MB total, but A is only read once per GEMM kernel (not 2x per kernel). The correct baseline should be 2*A_reads + 2*W_reads + 3*MN_writes + 2*MN_reads ≈ 230MB for actual data movement accounting for a correct memory model. This does not affect correctness of the actual kernel code.",
+      "location": "src/kernels/gemm_fp16_prefill_silu_dual.hip:header comment"
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "target": "library",
+      "content": "FP16 GEMM fusion analysis on gfx906: At prefill shapes (M=128, N≥6144, K≥5120), gfx906 GEMM kernels are compute-dominated (~1700-1800us per kernel). The gfx906 peak is ~13.4 TFLOPS FP16, so M=128, N=11008, K=5120 requires 2*128*11008*5120 / 13.4e12 ≈ 1066us minimum. Actual measured ≈1787us indicates ~60% efficiency. HBM savings from fusion (5-50MB per FFN call) are negligible compared to compute time at these shapes. Fusion benefits would require either smaller N/K shapes or an architecture with faster compute (e.g., MI100 with MFMA).",
+      "rationale": "Key finding for future workers: at Qwen3 27B prefill shapes on gfx906, GEMM epilogue fusions do not improve latency. Fusion would only help if the kernel becomes bandwidth-dominated (e.g., very small M < 32 or small N/K)."
+    }
+  ],
+  "summary": "Feature passes VAL-FUSE-002 and VAL-FUSE-003. Both Strategy A (dual GEMM+SiLU in 1 launch) and Strategy B (separate gate GEMM + GEMM with SiLU epilogue in 2 launches) pass correctness at all test shapes (max_abs_err < 4e-3 at M=128, N=11008, K=5120, well below 1e-2 threshold). Performance analysis is thorough: Strategy B achieves 0.987x (neutral, within noise) and Strategy A achieves 0.777x (slower due to 2x grid launch overhead). Both strategies include a detailed HBM traffic analysis and explanation of why fusion doesn't help at compute-dominated shapes. Code quality is high: clean separation of strategies into separate .hip files, comprehensive test coverage at 5 shapes, clear inline comments."
+}

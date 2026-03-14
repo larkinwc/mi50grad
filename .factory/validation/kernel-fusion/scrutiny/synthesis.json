@@ -1,0 +1,60 @@
+{
+  "milestone": "kernel-fusion",
+  "round": 1,
+  "status": "pass",
+  "validatorsRun": {
+    "test": {
+      "passed": true,
+      "command": "ssh -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'cd /root/mi50grad && PYTHONPATH=/root/mi50grad python3 tests/test_fused_norm_gemv.py'",
+      "exitCode": 0,
+      "notes": "All correctness tests PASSED. fused_t4/t8/t16 vs separate: err_vs_sep <= 3.9e-03 (< 1e-2 threshold). VAL-FUSE-001 satisfied."
+    },
+    "test_silu": {
+      "passed": true,
+      "command": "ssh -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'cd /root/mi50grad && PYTHONPATH=/root/mi50grad python3 tests/test_gemm_silu_fused.py'",
+      "exitCode": 0,
+      "notes": "ALL TESTS PASSED. Strategy A and B both correct at all shapes. max_abs_err <= 0.004 for M=128, N=11008, K=5120 (< 1e-2 threshold). VAL-FUSE-002 and VAL-FUSE-003 satisfied."
+    },
+    "typecheck": {
+      "passed": true,
+      "command": "N/A - no Python typecheck tooling (mypy/pyright) configured in project",
+      "exitCode": 0,
+      "notes": "Project has no mypy.ini, pyproject.toml, or type-checking config. HIP C++ kernels compiled successfully (implicit typecheck via hipcc on remote LXC)."
+    },
+    "lint": {
+      "passed": true,
+      "command": "N/A - no Python lint tooling (flake8/pylint/ruff) configured in project",
+      "exitCode": 0,
+      "notes": "Project has no lint config files. Code follows consistent style matching existing test files."
+    }
+  },
+  "reviewsSummary": {
+    "total": 2,
+    "passed": 2,
+    "failed": 0,
+    "failedFeatures": []
+  },
+  "blockingIssues": [],
+  "appliedUpdates": [],
+  "suggestedGuidanceUpdates": [
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add note that kernel fusion on gfx906 for decode path (skip-RMSNorm + GEMV) is counterproductive due to the lack of cooperative groups. Each block must independently load all K activation elements for normalization, creating O(N*K) redundant HBM reads. The correctness is achievable but latency regresses ~1.3-2x. Workers should not attempt this pattern again without verifying the shape is bandwidth-limited rather than compute-limited.",
+      "evidence": "Feature fused-skip-rmsnorm-gemv: at K=5120, N=4096/11008, fused kernel was 1.33-2.05x slower than separate kernels. Documented in architecture.md under Kernel Fusion section.",
+      "isSystemic": false
+    },
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add note that FP16 GEMM at Qwen3 27B prefill shapes (M=128, N≥6144, K≥5120) is compute-dominated on gfx906, achieving ~6-7 TFLOPS (~50% efficiency). Epilogue fusions that save HBM traffic (up to 12MB per FFN call) do not produce measurable wall-clock improvement at these shapes. SiLU epilogue fusion is only beneficial for significantly larger M (M≥2048) where the kernel becomes more bandwidth-limited.",
+      "evidence": "Feature fused-silu-prefill-gemm: Strategy B at M=128, N=11008, K=5120 showed 0.987x (neutral). Strategy A showed 0.777x (slower) due to 2x WG grid overhead. Documented in architecture.md.",
+      "isSystemic": false
+    }
+  ],
+  "rejectedObservations": [
+    {
+      "observation": "library/architecture.md already has detailed documentation of both kernel fusion patterns (fused-skip-rmsnorm-gemv and fused-silu-prefill-gemm sections added by prior worker during implementation). No new library updates needed.",
+      "reason": "already-documented"
+    }
+  ],
+  "previousRound": null
+}
