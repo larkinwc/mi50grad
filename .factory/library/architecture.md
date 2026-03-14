@@ -6,6 +6,42 @@ Architectural decisions, patterns discovered, and kernel design notes.
 
 ---
 
+## Optimization Sprint Reference (kernel-optimization-sprint mission)
+
+### FlashAttention Block-Tiling Design
+The current flash_attn_256 prefill kernel uses per-token warp reduction (O(seq_len) warp reductions).
+The optimization target is FlashAttention-2 style block-tiled approach:
+- Q tile: [Br x d] in registers, Br=64 (or 32 if VGPR-limited)
+- KV blocks: [Bc x d] streamed through LDS, Bc=16 (based on flash-attention-gfx906 Triton findings)
+- QK^T: [Br x Bc] block GEMM via v_dot2_f32_f16
+- PV: [Br x d] accumulation via v_dot2_f32_f16
+- Online softmax at block granularity (not per-token)
+- LDS: K[Bc x d] + V[Bc x d] = 16*256*2*2 = 16KB with XOR-swizzle
+
+### Double-Buffering Pattern for GEMM
+Overlap global load of tile t+1 with compute of tile t:
+- Two LDS buffer sets: ping (smem_A0/B0) and pong (smem_A1/B1)
+- Total LDS: 2 * 4608 = 9216 bytes (still < 32KB)
+- Requires careful __syncthreads() placement between phases
+
+### INT4 On-the-Fly Dequantization
+Instead of extracting nibbles to FP16 in LDS load phase:
+- Store packed uint32 in LDS (4x less LDS traffic for B tile)
+- Dequant during compute loop: either via v_dot8_i32_i4 or nibble extract + v_dot2
+
+### v_dot8_i32_i4 for INT4 GEMV
+The W4A8 kernel (gemv_w4a8_dot8) demonstrates the activation-splitting technique:
+- x = x_lo_s + 16*x_hi where x_lo_s = (x&0xF)-8, x_hi = x>>4
+- dot(W,x) = dot8(W, x_lo_s) + 8*sum(W) + 16*dot8(W, x_hi)
+This can be adapted for FP16 activations by quantizing to INT4 on-the-fly.
+
+### Elementwise Vectorization
+float4 loads = 128-bit = 8 FP16 per load instruction (global_load_dwordx4).
+Polynomial sigmoid: sigmoid(x) ≈ 0.5*(1 + x/(1+|x|)) — no MUFU exp needed.
+
+---
+
+
 ## Kernel Execution Hierarchy
 1. Engine (Python) — `src/inference/engine.py` — orchestrates decode/prefill steps
 2. Launcher (Python) — `src/kernels/launcher.py` — KernelCache, loads HSACO/SO, dispatches via HIP

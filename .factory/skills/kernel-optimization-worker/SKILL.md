@@ -16,6 +16,7 @@ Use for any feature that involves:
 - Creating kernel correctness tests
 - Running performance benchmarks
 - Integrating kernels into the inference engine
+- Creating benchmark/comparison scripts
 
 ## Work Procedure
 
@@ -31,9 +32,9 @@ Read AGENTS.md for mission boundaries and coding conventions. Read `.factory/lib
 ### Step 2: Study Existing Code
 Before writing ANY code, read:
 - The existing kernel being modified/replaced (understand current approach)
-- The engine integration point (`src/inference/engine.py` — find where the kernel is launched)
 - The launcher (`src/kernels/launcher.py` — understand how kernels are loaded)
 - Any existing tests for the kernel being modified
+- Related kernels that use similar patterns (e.g., study gemv_w4a8_dot8 when implementing v_dot8 for INT4 GEMV)
 
 ### Step 3: Write Correctness Tests FIRST (TDD)
 Create a test file `tests/test_<feature>.py` that:
@@ -42,6 +43,7 @@ Create a test file `tests/test_<feature>.py` that:
 3. Will upload inputs, launch kernel, download outputs, compare
 4. Reports max absolute error and PASS/FAIL
 5. Include edge cases (minimum dimensions, boundary conditions)
+6. For optimization features: include a performance comparison section that benchmarks old vs new
 
 The test should FAIL initially (kernel doesn't exist yet or produces wrong output).
 
@@ -49,41 +51,51 @@ The test should FAIL initially (kernel doesn't exist yet or produces wrong outpu
 Write the kernel code following existing patterns:
 - For HIP C++: Create/modify `src/kernels/<name>.hip`
 - For assembly: Create/modify `src/asm/<name>.s`
-- For Python integration: Modify `src/kernels/launcher.py` and/or `src/inference/engine.py`
 
-**Assembly kernel template** (follow macros.inc patterns):
-- Include `.include "macros.inc"` or define kernel metadata inline
-- Use `.amdgcn_target "amdgcn-amd-amdhsa--gfx906"`
-- Set `.amdhsa_kernel` metadata (VGPRs, SGPRs, LDS size)
-- Use FP32/INT32 accumulators (MANDATORY)
+**IMPORTANT: Create NEW kernel files (versioned names like _v3, _v4) rather than overwriting existing ones.** This allows A/B comparison.
 
-**HIP C++ kernel template** (follow elementwise_v2.hip patterns):
+**HIP C++ kernel conventions:**
 - Use `extern "C" __global__` for kernel functions
 - Use `__builtin_amdgcn_fdot2` for v_dot2_f32_f16
-- Use `__shfl_xor` or `__builtin_amdgcn_ds_swizzle` for DPP reductions
+- Use `__builtin_amdgcn_sdot4` for v_dot4_i32_i8
+- Use `__builtin_amdgcn_sdot8` for v_dot8_i32_i4
+- Use `__shfl_xor` for DPP butterfly reductions
 - Use `__half2` packed types for vectorized loads
+- Use `__attribute__((amdgpu_flat_work_group_size(N, N)))` for workgroup size hints
+- FP32/INT32 accumulators are MANDATORY
+- Target 64-80 VGPRs for 4-5 waves/SIMD occupancy
 
 ### Step 5: Deploy and Build on LXC
+
+**CRITICAL: Fix SSH auth first if needed:**
 ```bash
-# Deploy
+export SSH_AUTH_SOCK=$(ls /private/tmp/com.apple.launchd.*/Listeners 2>/dev/null | head -1)
+```
+
+**Deploy:**
+```bash
 rsync -avz --exclude='.git' --exclude='build' --exclude='__pycache__' --exclude='.factory' \
     -e 'ssh -J root@wittymantis.netbird.selfhosted' \
     /Users/larkinwc/personal/ml/mi50grad/ root@192.168.1.189:/root/mi50grad/
+```
 
-# Build assembly kernels
-ssh -J root@wittymantis.netbird.selfhosted root@192.168.1.189 \
+**Build specific HIP kernel:**
+```bash
+ssh -o StrictHostKeyChecking=no -J root@wittymantis.netbird.selfhosted root@192.168.1.189 \
+    'cd /root/mi50grad && mkdir -p build/kernels && /opt/rocm/bin/hipcc -O3 --offload-arch=gfx906 -std=c++17 -shared -fPIC -o build/kernels/KERNEL.so src/kernels/KERNEL.hip'
+```
+
+**Build assembly kernels (if needed):**
+```bash
+ssh -o StrictHostKeyChecking=no -J root@wittymantis.netbird.selfhosted root@192.168.1.189 \
     'cd /root/mi50grad && export ROCM_PATH=/opt/rocm && make kernels'
-
-# Build specific HIP kernel
-ssh -J root@wittymantis.netbird.selfhosted root@192.168.1.189 \
-    'cd /root/mi50grad && /opt/rocm/bin/hipcc -O3 --offload-arch=gfx906 -std=c++17 -shared -fPIC -o build/kernels/KERNEL.so src/kernels/KERNEL.hip'
 ```
 
 If build fails, fix compilation errors and retry. Do NOT proceed to testing with a broken build.
 
 ### Step 6: Run Correctness Tests on LXC GPU
 ```bash
-ssh -J root@wittymantis.netbird.selfhosted root@192.168.1.189 \
+ssh -o StrictHostKeyChecking=no -J root@wittymantis.netbird.selfhosted root@192.168.1.189 \
     'cd /root/mi50grad && PYTHONPATH=/root/mi50grad python3 tests/test_<feature>.py'
 ```
 
@@ -94,15 +106,15 @@ Tests must PASS. If they fail:
 
 ### Step 7: Run Performance Benchmarks (if applicable)
 If the feature has a performance target, measure before and after:
-- Use existing benchmark patterns from test files
-- Report TFLOPS, GB/s, or latency (us)
-- Compare against baseline
-- Document the improvement
+- Build BOTH old and new kernels in the same test script
+- Run 100+ iterations with 10 warmup for each
+- Report median latency (us), compute TFLOPS or GB/s where applicable
+- Print speedup ratio clearly
 
 ### Step 8: Run Non-Regression Check
 Run at least one existing related test to verify no regressions:
 ```bash
-ssh -J root@wittymantis.netbird.selfhosted root@192.168.1.189 \
+ssh -o StrictHostKeyChecking=no -J root@wittymantis.netbird.selfhosted root@192.168.1.189 \
     'cd /root/mi50grad && PYTHONPATH=/root/mi50grad python3 tests/test_<related>.py'
 ```
 
