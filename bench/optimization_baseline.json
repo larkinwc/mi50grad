@@ -1,0 +1,98 @@
+{
+  "flash_attn_decode": {
+    "kv_len=256,h=48,kvh=8,d=256": {
+      "latency_us": 92.42,
+      "tflops": 0.136149
+    },
+    "kv_len=1024,h=48,kvh=8,d=256": {
+      "latency_us": 248.236,
+      "tflops": 0.202758
+    }
+  },
+  "flash_attn_prefill": {
+    "seq=128,h=48,kvh=8,d=256": {
+      "latency_us": 378.494,
+      "tflops": 2.12766
+    },
+    "seq=512,h=48,kvh=8,d=256": {
+      "latency_us": 4910.83,
+      "tflops": 2.623773
+    },
+    "seq=2048,h=48,kvh=8,d=256": {
+      "latency_us": 77778.915,
+      "tflops": 2.65057
+    }
+  },
+  "gemm_fp16_prefill": {
+    "M=128,N=6144,K=5120": {
+      "latency_us": 1243.734,
+      "tflops": 6.474906
+    },
+    "M=128,N=5120,K=6144": {
+      "latency_us": 1830.725,
+      "tflops": 4.398837
+    },
+    "M=128,N=1024,K=5120": {
+      "latency_us": 538.094,
+      "tflops": 2.494318
+    }
+  },
+  "gemm_int4_prefill": {
+    "M=128,N=4096,K=4096,gs=128": {
+      "latency_us": 3735.342,
+      "tflops": 1.149819
+    },
+    "M=64,N=11008,K=4096,gs=128": {
+      "latency_us": 4244.103,
+      "tflops": 1.359854
+    }
+  },
+  "gemv_int4_v3_t4": {
+    "N=4096,K=4096,gs=128": {
+      "latency_us": 119.695,
+      "gbs": 74.6
+    },
+    "N=11008,K=4096,gs=128": {
+      "latency_us": 148.212,
+      "gbs": 161.82
+    }
+  },
+  "gemv_int4_v3_t8": {
+    "N=4096,K=4096,gs=128": {
+      "latency_us": 80.951,
+      "gbs": 110.304
+    },
+    "N=11008,K=4096,gs=128": {
+      "latency_us": 104.923,
+      "gbs": 228.584
+    }
+  },
+  "gemv_int4_v3_t16": {
+    "N=4096,K=4096,gs=128": {
+      "latency_us": 63.16,
+      "gbs": 141.376
+    },
+    "N=11008,K=4096,gs=128": {
+      "latency_us": 99.878,
+      "gbs": 240.13
+    }
+  },
+  "rmsnorm_v2": {
+    "dim=5120,n=128": {
+      "latency_us": 49.671,
+      "gbs": 52.983
+    }
+  },
+  "silu_fused_v2": {
+    "dim=11008,n=128": {
+      "latency_us": 39.953,
+      "gbs": 211.605
+    }
+  },
+  "residual_add_v2": {
+    "dim=5120,n=128": {
+      "latency_us": 33.02,
+      "gbs": 119.084
+    }
+  }
+}
