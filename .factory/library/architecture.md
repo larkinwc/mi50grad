@@ -324,6 +324,42 @@ else:
 
 ---
 
+## INT4 GEMV v4 fdot2 Approach (int4-gemv-dot8 feature)
+
+**File:** `src/kernels/gemv_int4_v4.hip`
+**Test:** `tests/test_gemv_int4_v4.py`
+
+**Approach:** Uses `__builtin_amdgcn_fdot2` (v_dot2_f32_f16) — extracts weight nibbles
+to FP16 pairs (dequantized via `(q - zero) * scale`), then uses fdot2 for 2 FMAs/instruction.
+
+**Performance on MI60 gfx906:**
+- N=4096,  K=4096: v3_t16=70.9us, v4_t16=84.0us (v4 is 1.19x slower)
+- N=11008, K=4096: v3_t16=109.5us, v4_t16=116.4us (v4 is 1.06x slower)
+
+**Correctness:** max_abs_err < 2e-3 at both shapes (well under 1e-2 threshold).
+
+**Why v4 fdot2 is slower than v3 ubfe+scalar:**
+- fdot2 benefit (2 FMAs/instruction) is offset by the FP16 conversion overhead: each
+  nibble must be sign-extracted, scaled, and converted to FP16 before packing as half2.
+- v3 scalar approach uses `__builtin_amdgcn_ubfe` which is also a single instruction,
+  then scalar FP32 FMA — fewer total operations since no float→half conversion is needed.
+- The kernel is memory bandwidth-limited (HBM), not compute-limited, so instruction
+  reduction via fdot2 provides less benefit than expected.
+
+**Three variants provided:** v4_t4 (64 cols/WG), v4_t8 (32 cols/WG), v4_t16 (16 cols/WG).
+All compile for gfx906 and pass correctness.
+
+**Key lesson:** For INT4 GEMV with FP16 activations and asymmetric GPTQ quantization
+(unsigned 0-15 + zero offset), the scalar ubfe+FP32-FMA approach (v3) is faster because:
+1. Kernel is bandwidth-limited, not compute-limited
+2. fdot2 requires nibble→FP16 conversion that adds instructions
+3. The correction term optimization in v3 (factor out zero: acc*scale - zero*scale*Σa)
+   reduces operations per uint32 at the cost of 1 FP32 multiply and 1 FP32 FMA
+
+**Recommendation:** Use v3_t16 for production INT4 GEMV decode path (faster at all tested shapes).
+
+---
+
 ## INT4 GEMM On-the-Fly Dequantization (int4-gemm-onthefly-dequant)
 
 **File:** `src/kernels/gemm_int4_prefill_v2.hip`
@@ -405,3 +441,46 @@ out = (acc0*c0 + acc1*c1 + acc2*c2 + acc3*c3) / gsum
 - Both use `__attribute__((amdgpu_flat_work_group_size(256,256)))` for occupancy hint
 
 **Note on fast_exp**: Schraudolph's approximation (`fast_exp_schraudolph`) is available but disabled. __expf() has better accuracy and the bottleneck turned out to be compute parallelism, not exp latency per se.
+
+---
+
+## Elementwise Vectorization (elementwise-vectorization feature)
+
+**File:** `src/kernels/elementwise_v3.hip`
+**Test:** `tests/test_elementwise_v3.py`
+
+**Approach:** Upgrade from half2 (2 FP16 per load) to float4 (8 FP16 per load).
+- `global_load_dwordx4` instead of `global_load_dwordx2`
+- Grid: (ceil(n/2048), 1, 1) vs v2's (ceil(n/512), 1, 1)
+- Each thread processes 8 elements per iteration instead of 2
+
+**Key implementation insight (tail handling):**
+  For RMSNorm/SkipRMSNorm, the vectorized 8-element loop and scalar tail MUST NOT overlap.
+  - WRONG: `tail_start = (dim / (256*8)) * (256*8)` — this double-counts elements when dim%2048!=0
+  - CORRECT: `tail_start = (dim / 8) * 8` — only elements where dim%8!=0 need scalar treatment
+  - For dim=5120 (Qwen), `5120%8==0`, so the scalar tail loop never executes
+  - Double-counting causes sum_sq inflation → rms_inv underestimated → output too small
+
+**Polynomial sigmoid note:**
+  The logistic approximation `0.5 + 0.5*x/(1+|x|)` has max error ~5e-2 in sigmoid(x).
+  For SiLU output (= gate * sigmoid * up), this gets amplified by |gate|, exceeding the 5e-3
+  threshold for realistic LLM activations. We therefore use exact __expf for sigmoid in
+  silu_fused_v3 for correctness, while keeping the float4 vectorized loads for bandwidth.
+
+**Performance on MI60 gfx906 (dim=5120, single vector):**
+- residual_add: v2=49us, v3=53us (essentially tied — kernel too small to saturate HBM BW)
+- silu_fused:   v2=53us, v3=54us (essentially tied — same sigmoid computation cost)
+- rmsnorm:      v2=50us, v3=35us → **1.43x faster** (0.9 GB/s vs 0.6 GB/s)
+
+**Why rmsnorm shows improvement but residual_add does not:**
+  - RMSNorm does TWO passes over the data (sum-sq + normalize), both benefiting from float4
+  - residual_add reads 3 arrays (dst, src, write dst) — the kernel launch overhead dominates at dim=5120
+  - At larger dims or with multiple vectors, residual_add would show more speedup
+
+**Correctness:**
+  - residual_add_v3: max_err = 0.00 (exact, below 1e-4 threshold)
+  - silu_fused_v3:   max_err = 0.00 (exact sigmoid, below 5e-3 threshold)
+  - rmsnorm_v3:      max_err = 0.001 (FP16 rounding, below 5e-3 threshold)
+  - skip_rmsnorm_v3: max_err = 0.002 (FP16 rounding, below 5e-3 threshold)
+
+**Function signatures:** Identical to v2 for drop-in compatibility.
