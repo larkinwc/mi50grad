@@ -1,0 +1,27 @@
+{
+  "flowId": "flash-attention",
+  "milestone": "compute-kernels",
+  "assertions": [
+    {
+      "id": "VAL-FA-001",
+      "status": "pass",
+      "reason": "All correctness tests passed at seq_len=16,64,128,512 with heads=4, kv_heads=2, causal=1. Max abs error <= 0.004150, well below 1e-2 threshold. Also tested causal=0 and kv_heads=4 configs, all pass.",
+      "evidence": "seq_len=16: max_err=0.003174 PASS; seq_len=64: max_err=0.004150 PASS; seq_len=128: max_err=0.003662 PASS; seq_len=512: max_err=0.004028 PASS; seq_len=16 causal=0: max_err=0.001648 PASS; seq_len=128 causal=0: max_err=0.000290 PASS"
+    },
+    {
+      "id": "VAL-FA-002",
+      "status": "pass",
+      "reason": "V3 prefill is significantly faster than tuned prefill at seq_len=128 (1.63x speedup) and seq_len=512 (1.90x speedup), meeting the any-positive-improvement requirement.",
+      "evidence": "Seq=128: Tuned=0.361ms, V3=0.222ms, 1.63x faster; Seq=512: Tuned=4.826ms, V3=2.546ms, 1.90x faster"
+    },
+    {
+      "id": "VAL-FA-003",
+      "status": "pass",
+      "reason": "Decode path regression test passes at kv_len=64,256,512,1024 with heads=4,8,48 and kv_heads=2,4,8. Max abs error <= 0.000008, well below 1e-2 threshold.",
+      "evidence": "decode h=4 kv_h=2 kv_len=256: max_err=0.000000 PASS; decode h=48 kv_h=8 kv_len=256: max_err=0.000008 PASS; decode h=48 kv_h=8 kv_len=512: max_err=0.000008 PASS; decode h=48 kv_h=8 kv_len=1024: max_err=0.000001 PASS"
+    }
+  ],
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "python3"]
+}

@@ -1,0 +1,33 @@
+{
+  "flowId": "gemm-int4",
+  "milestone": "compute-kernels",
+  "assertions": [
+    {
+      "id": "VAL-GEMM-001",
+      "status": "pass",
+      "reason": "Double-buffered FP16 GEMM passes correctness at all Qwen shapes. Max abs error <= 0.000982, well below 1e-2 threshold.",
+      "evidence": "M=128,N=6144,K=5120: max_abs_err=0.000982 PASS; M=128,N=1024,K=5120: max_abs_err=0.000978 PASS; M=128,N=5120,K=6144: max_abs_err=0.000979 PASS"
+    },
+    {
+      "id": "VAL-GEMM-002",
+      "status": "pass",
+      "reason": "Double-buffered GEMM shows 1.08x speedup (6.51 -> 7.01 TFLOPS) at M=128,N=6144,K=5120, meeting the any-positive-improvement requirement.",
+      "evidence": "original (single-buffer): 1237.7 us (6.51 TFLOPS); double-buffered: 1149.3 us (7.01 TFLOPS); speedup: 1.08x PASS"
+    },
+    {
+      "id": "VAL-I4GM-001",
+      "status": "pass",
+      "reason": "On-the-fly dequant INT4 GEMM passes correctness at both required shapes. Max abs error = 0.000977, well below 1e-2 threshold.",
+      "evidence": "M=128,N=4096,K=4096,gs=128: max_abs_err=0.000977 PASS; M=64,N=11008,K=4096,gs=128: max_abs_err=0.000977 PASS"
+    },
+    {
+      "id": "VAL-I4GM-002",
+      "status": "pass",
+      "reason": "On-the-fly dequant INT4 GEMM v2 shows 2.07x speedup at M=128,N=4096,K=4096,gs=128 (3710.5us -> 1795.7us), greatly exceeding the any-positive-improvement requirement.",
+      "evidence": "Original: 3710.5 us; v2 (on-the-fly dequant): 1795.7 us; Speedup: 2.066x PASS"
+    }
+  ],
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "python3"]
+}

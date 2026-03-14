@@ -166,3 +166,36 @@ ssh -o ConnectTimeout=20 -o StrictHostKeyChecking=no -J root@wittymantis.netbird
 - `tests/test_m2_prefill.py` — VAL-CROSS-003
 - `tests/test_gemm_fp16.py` + `tests/test_gemv_int4.py` + others — VAL-CROSS-004, VAL-CROSS-005
 - `tests/test_m1m2_combined.py` — VAL-CROSS-006
+
+---
+
+## Flow Validator Guidance: GPU Kernel - compute-kernels
+
+**Surface**: SSH to LXC (mi60-jupyter at 192.168.1.189), run Python test scripts on MI60 GPU
+
+**SSH Setup** (required for every command):
+```bash
+export SSH_AUTH_SOCK=$(ls /private/tmp/com.apple.launchd.*/Listeners 2>/dev/null | head -1)
+ssh -o ConnectTimeout=20 -o StrictHostKeyChecking=no -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'COMMAND'
+```
+
+**Isolation rules**:
+- Run tests sequentially within a subagent (GPU is single, VRAM shared)
+- ~20GB VRAM already in use — individual kernel tests allocate modest VRAM and are fine
+- Integration tests (engine.py) may need more VRAM — run in separate batch
+- Do NOT kill existing GPU processes
+- Max 2 subagents running GPU tests concurrently
+
+**Deploy before testing** (if needed):
+```bash
+rsync -avz --exclude='.git' --exclude='build' --exclude='__pycache__' --exclude='.factory' \
+    -e 'ssh -J root@wittymantis.netbird.selfhosted' \
+    /Users/larkinwc/personal/ml/mi50grad/ root@192.168.1.189:/root/mi50grad/
+```
+
+**Key test files for compute-kernels milestone**:
+- `tests/test_flash_attn_v3.py` — VAL-FA-001, VAL-FA-002, VAL-FA-003 (block-tiled FlashAttention v3: correctness, perf, decode regression)
+- `tests/test_gemm_fp16_db.py` — VAL-GEMM-001, VAL-GEMM-002 (double-buffered FP16 GEMM: correctness, perf)
+- `tests/test_gemm_int4_v2.py` — VAL-I4GM-001, VAL-I4GM-002 (on-the-fly dequant INT4 GEMM: correctness, perf)
+
+**Evidence format**: Capture full stdout/stderr from each test command. Look for PASS/FAIL lines and error values.

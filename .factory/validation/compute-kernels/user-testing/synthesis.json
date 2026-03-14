@@ -1,0 +1,30 @@
+{
+  "milestone": "compute-kernels",
+  "round": 1,
+  "status": "pass",
+  "assertionsSummary": {
+    "total": 7,
+    "passed": 7,
+    "failed": 0,
+    "blocked": 0
+  },
+  "passedAssertions": [
+    "VAL-FA-001",
+    "VAL-FA-002",
+    "VAL-FA-003",
+    "VAL-GEMM-001",
+    "VAL-GEMM-002",
+    "VAL-I4GM-001",
+    "VAL-I4GM-002"
+  ],
+  "failedAssertions": [],
+  "blockedAssertions": [],
+  "appliedUpdates": [
+    {
+      "target": "user-testing.md",
+      "description": "Added Flow Validator Guidance section for compute-kernels milestone with test file mapping and SSH setup",
+      "source": "setup"
+    }
+  ],
+  "previousRound": null
+}
