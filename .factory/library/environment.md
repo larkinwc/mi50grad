@@ -7,6 +7,44 @@ Environment variables, external dependencies, and setup notes.
 
 ---
 
+## Dev Server (TP=4 Optimization Mission)
+
+**Server:** root@192.168.1.198 (direct SSH, key auth, no jump host)
+**CPUs:** 64 cores, 247GB RAM, 1.5TB storage
+**GPUs:** 4x MI50/MI60 (gfx906 Vega 20), all PCIe x16 Gen4
+- All GPUs are 2 hops apart via PCIe (through CPU/chipset, not direct)
+- P2P peer access confirmed for all 12 GPU pairs (hipDeviceCanAccessPeer = 1)
+- 16GB VRAM per GPU
+- Device IDs: 0x66a0 (all four)
+
+**PCIe Topology:**
+- All GPU-to-GPU links: PCIE, weight=40, hops=2
+- Link speed: 16.0 GT/s PCIe, width=16
+- Theoretical bidirectional bandwidth per link: ~32 GB/s
+- Practical P2P bandwidth: ~12-16 GB/s (2-hop overhead)
+
+**Docker:**
+- Image: `mi50grad` (based on mixa3607/rocm-gfx906:7.1.0-complete)
+- ROCm 7.1.0, hipcc, llvm-mc, ld.lld
+- Python 3 with numpy
+- Access GPUs via `--device=/dev/kfd --device=/dev/dri --group-add video`
+
+**vLLM Container:**
+- Name: `vllm-mobydick` (larkinwc/vllm-gfx906:mobydick-main-rocm-6.3.4)
+- Serves Qwen3.5-27B-AWQ on port 8000, TP=4
+- Uses 93% VRAM on all 4 GPUs - MUST be stopped before TP benchmarks
+- Host networking mode
+
+**Model:** /opt/models/Qwen3.5-27B-GPTQ-Int4
+- ~30GB total (mixed FP16 attention + INT4 FFN weights)
+- Requires all 4 GPUs for TP=4 (each gets ~7.5GB of weights)
+
+## Performance Baselines (measured 2026-03-14)
+
+- vLLM (TP=4, AWQ, all 4 GPUs): 46.9 tok/s, TTFT 173ms
+- mi50grad single-GPU (GPTQ-Int4): 20.3 tok/s (49.3 ms/tok)
+- Theoretical TP=4 ceiling: ~81 tok/s (assuming perfect scaling)
+
 ## Development Machine
 - macOS (local editing only, no GPU)
 - Code lives at `/Users/larkinwc/personal/ml/mi50grad`
