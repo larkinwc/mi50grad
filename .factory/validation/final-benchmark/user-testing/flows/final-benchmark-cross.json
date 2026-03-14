@@ -1,0 +1,21 @@
+{
+  "groupId": "final-benchmark-cross",
+  "milestone": "final-benchmark",
+  "assertions": ["VAL-CROSS-001", "VAL-CROSS-002"],
+  "status": "pass",
+  "results": {
+    "VAL-CROSS-001": {
+      "status": "pass",
+      "evidence": "All 4 required test files passed:\n1. tests/test_flash_attn_256.py: All 6 correctness configs PASS (maxerr < 0.0001 for all), performance benchmark completed\n2. tests/test_gemm_fp16_prefill.py: All 6 correctness configs PASS (maxerr <= 0.002), performance comparison completed\n3. tests/test_elementwise.py: SiLU, fused SiLU*up, RoPE tests all PASS (maxerr < 0.001)\n4. tests/test_gemv_int4.py: Both INT4 GEMV configs PASS (maxerr = 0.0 for both)\nAll tests printed 'ALL TESTS PASSED' or equivalent pass summary.",
+      "detail": "Non-regression tests run after deploying latest code via rsync. No test failures observed."
+    },
+    "VAL-CROSS-002": {
+      "status": "pass",
+      "evidence": "All new and modified HIP kernel files compiled successfully with hipcc --offload-arch=gfx906 -O3:\n- flash_attn_256_v3.hip: COMPILED OK\n- gemm_int4_prefill_v2.hip: COMPILED OK\n- gemv_int4_v4.hip: COMPILED OK\n- elementwise_v3.hip: COMPILED OK\n- fused_skip_rmsnorm_gemv.hip: COMPILED OK\n- gemm_fp16_prefill_silu.hip: COMPILED OK\n- gemm_fp16_prefill.hip (includes double-buffered variant): COMPILED OK\nAll .so files verified present in /root/mi50grad/build/kernels/. Exit code 0 for all compilations.",
+      "detail": "Compilation verified by running hipcc -O3 --offload-arch=gfx906 -std=c++17 for each new kernel file. All compiled without errors."
+    }
+  },
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "python3", "hipcc", "rsync"]
+}

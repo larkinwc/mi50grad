@@ -232,6 +232,41 @@ rsync -avz --exclude='.git' --exclude='build' --exclude='__pycache__' --exclude=
 
 ---
 
+## Flow Validator Guidance: GPU Kernel - final-benchmark
+
+**Surface**: SSH to LXC (mi60-jupyter at 192.168.1.189), run Python test scripts on MI60 GPU
+
+**SSH Setup** (required for every command):
+```bash
+export SSH_AUTH_SOCK=$(ls /private/tmp/com.apple.launchd.*/Listeners 2>/dev/null | head -1)
+ssh -o ConnectTimeout=20 -o StrictHostKeyChecking=no -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'COMMAND'
+```
+
+**Isolation rules**:
+- Run tests sequentially within a subagent (GPU is single, VRAM shared)
+- VRAM usage is low — individual kernel tests allocate modest VRAM and are fine
+- Do NOT kill existing GPU processes
+
+**Deploy before testing**:
+```bash
+rsync -avz --exclude='.git' --exclude='build' --exclude='__pycache__' --exclude='.factory' \
+    -e 'ssh -J root@wittymantis.netbird.selfhosted' \
+    /Users/larkinwc/personal/ml/mi50grad/ root@192.168.1.189:/root/mi50grad/
+```
+
+**Key test files for final-benchmark milestone**:
+- `tests/bench_optimization_final.py` — VAL-FINAL-001 (final benchmark produces bench/optimization_final.json)
+- `bench/optimization_report.md` + `bench/optimization_final.json` — VAL-FINAL-002 (comparison report with per-kernel speedup, ≥3 areas improved)
+- `tests/test_flash_attn_256.py` — VAL-CROSS-001 (non-regression: FlashAttention)
+- `tests/test_gemm_fp16_prefill.py` — VAL-CROSS-001 (non-regression: FP16 GEMM)
+- `tests/test_elementwise.py` — VAL-CROSS-001 (non-regression: elementwise kernels)
+- `tests/test_gemv_int4.py` — VAL-CROSS-001 (non-regression: INT4 GEMV)
+- All new HIP kernel files in src/kernels/ — VAL-CROSS-002 (compile check for gfx906)
+
+**Evidence format**: Capture full stdout/stderr from each test command. Look for PASS/FAIL lines and check that JSON files are generated.
+
+---
+
 ## Flow Validator Guidance: GPU Kernel - kernel-fusion
 
 **Surface**: SSH to LXC (mi60-jupyter at 192.168.1.189), run Python test scripts on MI60 GPU

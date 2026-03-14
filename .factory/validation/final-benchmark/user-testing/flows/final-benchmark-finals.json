@@ -1,0 +1,21 @@
+{
+  "groupId": "final-benchmark-finals",
+  "milestone": "final-benchmark",
+  "assertions": ["VAL-FINAL-001", "VAL-FINAL-002"],
+  "status": "pass",
+  "results": {
+    "VAL-FINAL-001": {
+      "status": "pass",
+      "evidence": "bench/optimization_final.json exists on LXC at /root/mi50grad/bench/optimization_final.json (2192 bytes, last modified Mar 14 18:53). Contains valid JSON with all required kernel benchmarks: flash_attn_decode (2 configs), flash_attn_prefill (3 seq_len configs), gemm_fp16_prefill (3 shapes), gemm_int4_prefill (2 shapes), gemv_int4_v4_t4/t8/t16 (2 shapes each), rmsnorm_v3, silu_fused_v3, residual_add_v3, fused_skip_rmsnorm_gemv, gemm_fp16_prefill_silu_epilogue. All keys include latency_us and throughput metrics.",
+      "detail": "File verified present on LXC with cat command. JSON is valid with 14 benchmark categories covering all optimized kernels from the sprint."
+    },
+    "VAL-FINAL-002": {
+      "status": "pass",
+      "evidence": "bench/optimization_report.md exists on LXC (8453 bytes, Mar 14 18:48). Report shows side-by-side comparison tables for all 6 areas. Speedup summary: FA Prefill=1.58-1.99x (IMPROVED), FP16 GEMM=1.02-1.09x (IMPROVED), INT4 GEMM=1.40-2.07x (IMPROVED), INT4 GEMV=1.04-1.12x at t4/t8 (IMPROVED), Elementwise rmsnorm=1.33x silu=1.01x residual=1.02x (IMPROVED), Fusion-GEMV=1.07x (IMPROVED), Fusion-GEMM=0.82x (REGRESSION). 5 of 6 areas show measurable improvement (threshold was at least 3 of 6).",
+      "detail": "Comparison report confirmed present and contains per-kernel speedup ratios for all 6 optimization areas. At least 3 areas show improvement — requirement satisfied."
+    }
+  },
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "cat"]
+}
