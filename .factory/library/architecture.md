@@ -30,11 +30,43 @@ Architectural decisions, patterns discovered, and kernel design notes.
 - `rope_v2.hip`: **HIP RoPE** — replaces assembly rope.s. Vectorized half2 loads, FP32 rotation. Same interface as rope.s.
 - `qknorm_rope.hip`: Fused per-head RMSNorm + partial RoPE (used in decode path for Q and K).
 
+## W4A8 GEMV (gemv_w4a8.hip — m3-w4a8-gemv)
+**W4A8 = INT4 weights stored + INT8 activations → INT32 accumulation → FP16 output.**
+
+Three kernels:
+- `gemv_w4a8_dot4`: Uses v_dot4_i32_i8. Unpack INT4→INT8 on-the-fly, then 2× v_dot4 per 8 weights. PRIMARY.
+- `gemv_w4a8_dot8`: Uses v_dot8_i32_i4. Splits INT8 activation into lo/hi nibbles:
+  x = x_lo_s + 16*x_hi (where x_lo_s = (x&0xF)-8 ∈ [-8,7], x_hi = x>>4 ∈ [-8,7])
+  dot(W,x) = dot8(W, x_lo_s) + 8*sum(W) + 16*dot8(W, x_hi) (three-term formula)
+- `gemv_w4a8_grouped`: Per-group FP16 scales (like GPTQ group_size=128). Uses v_dot4.
+
+Weight format (W4A8 packed):
+  W_packed[N, K/8] uint32, N-major row-major
+  bits[4b+3:4b] = w[n, k+b], signed INT4 ∈ [-8,7] (zero-subtracted)
+  Repacked from GPTQ format via `src/kernels/repack_w4a8.py`
+
+**Benchmark results on MI60 gfx906:**
+- N=4096, K=4096:  dot4=59.5us, dot8=67.4us, W4A16-v3t16=30.4us → W4A16 1.95x faster
+- N=11008, K=4096: dot4=59.1us, dot8=86.7us, W4A16-v3t16=66.2us → W4A8-dot4 1.12x faster
+
+**Key insight:** W4A8 and W4A16 have same weight bandwidth (both INT4 = K*N/2 bytes).
+W4A8 advantage is less activation bandwidth (INT8 vs FP16 = saves K bytes).
+For N=4096 (square-ish shapes), W4A16 v3_t16 wins due to better thread utilization.
+For N=11008 (wider), W4A8 dot4 wins slightly (INT32 accumulation vs FP32 FMA overhead).
+
+**v_dot8_i32_i4 intrinsic:** `__builtin_amdgcn_sdot8(int a, int b, int c, bool sat)`
+→ c + sum_{i=0}^{7} a[i]*b[i] where a[i],b[i] = signed 4-bit at bits[4i+3:4i]
+**Confirmed working on gfx906** (validated by correctness tests in test_w4a8_gemv.py).
+
+**INT4→INT8 nibble unpacking trick (for v_dot4 path):**
+  w_i8 = ((int)(w_packed << (28 - b*4))) >> 28  (arithmetic right-shift for sign extension)
+  Packs 4 signed INT8 bytes into one int32: (n0&0xFF) | ((n1&0xFF)<<8) | ...
+
 ## gfx906 Confirmed Instructions
 All verified on real hardware:
 - `v_dot2_f32_f16`: ~7.58 instr/cycle (packed FP16 dot product)
 - `v_dot4_i32_i8`: ~7.58 instr/cycle (INT8 4-element dot)
-- `v_dot8_i32_i4`: ~7.58 instr/cycle (INT4 8-element dot)
+- `v_dot8_i32_i4`: ~7.58 instr/cycle (INT4 8-element dot) — **CONFIRMED working**
 - `v_pk_fma_f16`: ~7.58 instr/cycle (packed FP16 FMA)
 - `v_fmac_f32`: ~7.58 instr/cycle (FP32 FMA)
 - `v_exp_f32`: ~3.69 instr/cycle (MUFU transcendental — much slower)
