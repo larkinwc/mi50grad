@@ -1,0 +1,14 @@
+{
+  "groupId": "val-base-001",
+  "assertions": [
+    {
+      "id": "VAL-BASE-001",
+      "status": "pass",
+      "evidence": "Benchmark script tests/bench_optimization_baseline.py ran successfully on MI60 LXC (exit code 0). Captured timing for all required kernels: FlashAttention prefill (seq=128: 0.376ms/2.14TFLOPS, seq=512: 4.887ms/2.64TFLOPS, seq=2048: 77.58ms/2.66TFLOPS), FP16 GEMM (M=128,N=6144,K=5120: 1228us/6.56TFLOPS; M=128,N=5120,K=6144: 1812us/4.44TFLOPS; M=128,N=1024,K=5120: 532us/2.52TFLOPS), INT4 GEMM prefill (M=128,N=4096,K=4096: 3708us/1.16TFLOPS; M=64,N=11008,K=4096: 4221us/1.37TFLOPS), INT4 GEMV decode t4/t8/t16 at N=4096,K=4096 and N=11008,K=4096, elementwise ops (rmsnorm_v2: 48us/54.5GB/s, silu_fused_v2: 39us/216.7GB/s, residual_add_v2: 32us/122.8GB/s). Results saved to bench/optimization_baseline.json with 10 kernel categories.",
+      "details": "All 5 kernel types covered: FlashAttention prefill (3 seq_len configs), FP16 GEMM (3 Qwen shapes), INT4 GEMM prefill (2 shapes), INT4 GEMV decode (3 variants x 2 shapes), elementwise (RMSNorm/SiLU/residual_add). JSON file confirmed to exist with all latency_us fields populated."
+    }
+  ],
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "python3"]
+}
