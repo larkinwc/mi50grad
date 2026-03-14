@@ -484,3 +484,34 @@ out = (acc0*c0 + acc1*c1 + acc2*c2 + acc3*c3) / gsum
   - skip_rmsnorm_v3: max_err = 0.002 (FP16 rounding, below 5e-3 threshold)
 
 **Function signatures:** Identical to v2 for drop-in compatibility.
+
+
+---
+
+## Kernel Fusion: Skip-RMSNorm + INT4 GEMV (fused-skip-rmsnorm-gemv)
+
+### Design: fused_skip_rmsnorm_gemv.hip
+Fuses skip-connection + RMSNorm + INT4 GEMV decode path into a single kernel.
+
+**Interface:** `hidden` is READ-ONLY. `hidden_out` receives h+r update (MUST be different buffer).
+New parameter order: `(out_gemv, hidden_out, hidden, residual, weight, eps, B_q4, scales, zeros, K, N, gs)`
+
+**Dynamic shared memory (per block):**
+- `lds_hval[K]` (FP16): pre-normalization h+r values; `lds_A[K]` (FP16): normalized activations
+- `s_warp[4]` (float) + `s_reduce[256]` (float)
+- Total: K*4 + 16 + 1024 bytes. For K=5120: 21536 bytes < 64KB. Caller: `shared_mem = K*4 + 16 + 256*4`
+
+**Race condition analysis (CRITICAL):**
+1. Multiple blocks all write `hidden[i]` -> later blocks read updated value -> double-counts residual
+2. Symptom: correct for blocks 0-127, wrong for blocks 128+ (hardware occupancy boundary ~128 blocks)
+3. Fix: `hidden` is CONST, `hidden_out` is a SEPARATE pointer, block 0 writes it in Phase 3
+
+**Performance (MI60, K=5120, N=4096):**
+- Separate (skip_rmsnorm_v2 + gemv_int4_v3_t16): ~91us
+- Fused t16 (256 blocks): ~133us (1.46x SLOWER)
+- **Root cause:** Each block loads ALL K elements (20KB) for its own Phase 1. 256 blocks = 5MB redundant
+  reads, dwarfing the 20KB savings from eliminating norm_out HBM round-trip.
+- **Correctness:** PASSES. Max abs err vs separate: <4e-3 (VAL-FUSE-001).
+- **Lesson:** Multi-block fused skip+norm+GEMV requires cooperative groups for efficiency.
+  Without global barrier, each block must independently compute skip+norm, causing O(N*K) reads
+  instead of O(K) for the norm phase. Not worth it for N>=128 blocks.
