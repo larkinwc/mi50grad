@@ -175,3 +175,45 @@ Engine wiring:
 - Hybrid attention: some layers use full GQA (head_dim=256), others use DeltaNet linear attention
 - hidden_size=5120, num_heads=48, num_kv_heads=8
 - FFN: gate+up (fused) → SiLU → down, with INT4 quantized weights (GPTQ)
+
+## FlashAttention-256 Tuning (m3-flashattn-tune)
+
+**Tuned kernel**: `flash_attn_256_tuned.hip` contains `flash_attn_256_decode` and `flash_attn_256_prefill`.
+
+**Key insight for decode (seq_len=1)**: The original `flash_attn_256.hip` uses 256 threads (4 wavefronts) per WG, but for decode only 1 wavefront does work (q_rows 1,2,3 exit immediately since num_q_rows=1). This is a 4x waste.
+
+**Solution**: Split KV range across 4 wavefronts. Each wavefront sweeps kv_len/4 positions independently with its own online softmax state. Merge 4 partial (max, sum, acc) states via LDS at the end. Only wavefront 0 writes output.
+
+**Merge formula**:
+```
+gmax = max(max0, max1, max2, max3)
+ci = exp(maxi - gmax)
+gsum = sum0*c0 + sum1*c1 + sum2*c2 + sum3*c3
+out = (acc0*c0 + acc1*c1 + acc2*c2 + acc3*c3) / gsum
+```
+
+**Benchmark results** (MI60 gfx906, 48 heads, 8 KV heads):
+- decode kv=256:  222us → 62us  (3.57x)
+- decode kv=512:  587us → 113us (5.21x)
+- decode kv=1024: 1240us → 223us (5.56x)
+- decode kv=2048: 2469us → 435us (5.68x)
+- decode kv=4096: 4964us → 859us (5.78x)
+- prefill seq=128: 0.40ms → 0.38ms (1.04x)
+- prefill seq=512: 5.03ms → 4.81ms (1.04x)
+- prefill seq=2048: 82.9ms → 77.6ms (1.07x)
+
+**Decode bottleneck analysis**: The original kernel was compute-bound by v_exp_f32 (2 per KV step × kv_len steps). With 4x parallelism, each wavefront does 1/4 of exp calls, halving the exp cost (plus better HBM utilization). The LDS merge adds only 4 exp calls total (negligible).
+
+**Why prefill improvement is smaller**: Prefill already processes 4 Q rows per WG (1 per wavefront). LDS tiling saves some redundant global loads but the kernel is already reasonably efficient. Prefill is dominated by compute (causal attention = O(n²) work).
+
+**LDS layout for decode merge**:
+- `float partial_max[4]` + `float partial_sum[4]` = 32 bytes
+- `float partial_acc[4][256]` = 4096 bytes (each wf stores its 256-dim acc)
+- Total: ~4.1KB LDS per WG (well within 64KB LDS limit)
+
+**Grid launch**:
+- decode: Grid=(num_heads, 1, 1), Block=(256, 1, 1)
+- prefill: Grid=(num_heads, ceil(num_q_rows/4), 1), Block=(256, 1, 1)
+- Both use `__attribute__((amdgpu_flat_work_group_size(256,256)))` for occupancy hint
+
+**Note on fast_exp**: Schraudolph's approximation (`fast_exp_schraudolph`) is available but disabled. __expf() has better accuracy and the bottleneck turned out to be compute parallelism, not exp latency per se.
