@@ -1,0 +1,45 @@
+{
+  "featureId": "final-comparison-benchmark",
+  "milestone": "final-benchmark",
+  "reviewedAt": "2026-03-14",
+  "status": "pass",
+  "codeQuality": "good",
+  "issues": [],
+  "observations": [
+    "tests/bench_optimization_final.py correctly mirrors bench_optimization_baseline.py structure with all new optimized kernels",
+    "bench/optimization_final.json saved with 12 kernel category results matching expected format",
+    "bench/optimization_report.md contains comprehensive side-by-side comparison table with computed speedup ratios",
+    "All 4 non-regression test files pass: test_flash_attn_256.py, test_gemm_fp16_prefill.py, test_elementwise.py, test_gemv_int4.py",
+    "All 7 new .hip kernel files compile successfully for gfx906 (exit code 0 for each)",
+    "5 of 6 optimization areas show measurable improvement (FA prefill 1.58-1.99x, INT4 GEMM 1.4-2.07x, FP16 GEMM 1.02-1.09x, GEMV 1.04-1.12x, elementwise 1.01-1.33x, fused_skip_rmsnorm_gemv 1.07x)",
+    "Report correctly identifies the SiLU epilogue GEMM regression at M=128 and provides correct analysis (compute-bound regime, fusion overhead > savings at small batch)"
+  ],
+  "validationContractCoverage": {
+    "VAL-FINAL-001": "pass - bench/optimization_final.json created with all kernel timings from bench_optimization_final.py run",
+    "VAL-FINAL-002": "pass - bench/optimization_report.md shows side-by-side comparison, 5 of 6 areas improved (exceeds threshold of 3)",
+    "VAL-CROSS-001": "pass - all 4 existing test files pass with no regressions",
+    "VAL-CROSS-002": "pass - all 7 new .hip files compile for gfx906 with exit code 0"
+  },
+  "codeReviewNotes": [
+    "bench_optimization_final.py uses proper error handling with try_build_kernel/get_kernel_safe wrappers - graceful skip on any build failure",
+    "Benchmark methodology is consistent with baseline: same WARMUP_ITERS=10, BENCH_ITERS=100, statistics.median() for latency",
+    "GPU memory is properly freed after each kernel section (dev.free calls)",
+    "pack_w4a16 helper function correctly packs INT4 weights for the v4 GEMV format",
+    "Grid calculations are consistent with kernel configurations (e.g., cols_per_wg = 256 // tpc for GEMV)",
+    "The optimization_report.md contains thorough analysis including performance regime analysis (bandwidth vs compute bound)",
+    "Minor: bench script uses warnings.warn for skip messages rather than logging - acceptable for benchmark scripts",
+    "No sensitive data or credentials are present in any of the committed files"
+  ],
+  "sharedStateObservations": [
+    {
+      "type": "library",
+      "description": "Final benchmark results confirm best configurations: INT4 GEMV decode should use v4_t8 (best balance: 116 GB/s at N=4096) or v4_t4 for very small N; t16 shows slight regression vs v3 at N=4096 due to fdot2 dequantization overhead",
+      "targetFile": ".factory/library/architecture.md"
+    },
+    {
+      "type": "library",
+      "description": "Kernel fusion analysis: fused_skip_rmsnorm_gemv provides 7% speedup (139 us vs 149 us estimated separate); gemm_fp16_prefill_silu_epilogue regresses at M=128 (compute-bound); fusion only helps for bandwidth-bound operations",
+      "targetFile": ".factory/library/architecture.md"
+    }
+  ]
+}

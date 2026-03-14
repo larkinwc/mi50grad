@@ -580,3 +580,31 @@ compute AND bandwidth limited but neither at a level where the fusion savings ma
 The SiLU kernel itself (40us) is a small fraction of the total (3580us), so eliminating it
 doesn't produce measurable improvement.
 
+
+---
+
+## Final Benchmark Summary (final-benchmark milestone)
+
+**Benchmark files:** `tests/bench_optimization_final.py`, `bench/optimization_final.json`, `bench/optimization_report.md`
+**Baseline files:** `tests/bench_optimization_baseline.py`, `bench/optimization_baseline.json`
+
+### Sprint Results (MI60 gfx906, measured 2026-03-14)
+
+| Area | Baseline Kernel | Final Kernel | Best Speedup | Result |
+|------|----------------|--------------|--------------|--------|
+| FA Prefill | flash_attn_256_tuned | flash_attn_256_v3_prefill | 1.99× (seq=2048) | ✅ IMPROVED |
+| FA Decode | flash_attn_256_decode | (unchanged) | 1.00× | ➖ NEUTRAL |
+| FP16 GEMM | gemm_fp16_prefill | gemm_fp16_prefill_db | 1.09× (N=5120,K=6144) | ✅ IMPROVED |
+| INT4 GEMM | gemm_int4_prefill_hip | gemm_int4_prefill_v2 | 2.07× (M=128,N=4096) | ✅ IMPROVED |
+| INT4 GEMV | gemv_int4_v3 | gemv_int4_v4 | 1.12× (N=11008, t4) | ✅ IMPROVED (t4/t8) |
+| Elementwise | elementwise_v2 | elementwise_v3 | 1.33× (rmsnorm) | ✅ IMPROVED |
+| Fusion-GEMV | skip_rmsnorm+gemv | fused_skip_rmsnorm_gemv | 1.07× | ✅ IMPROVED |
+| Fusion-GEMM | gemm+silu | gemm_silu_epilogue | 0.82× | ⚠️ REGRESSION (M=128) |
+
+**5 of 6 optimization areas improved.** INT4 GEMM and FA prefill show the largest gains.
+
+### INT4 GEMV v4 Configuration Guide (post-final-benchmark)
+- **t8 is best for decode**: N=4096 (116 GB/s), N=11008 (221 GB/s)
+- **t16 shows slight regression** vs v3 at N=4096 due to fdot2 dequant overhead
+- **Use gemv_int4_v4_t8** as the default for decode GEMV; reserve t16 only for N>11008
+
