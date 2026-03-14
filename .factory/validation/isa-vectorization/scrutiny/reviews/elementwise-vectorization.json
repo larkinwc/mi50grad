@@ -1,0 +1,45 @@
+{
+  "featureId": "elementwise-vectorization",
+  "reviewedAt": "2026-03-14T17:47:00.000Z",
+  "commitId": "b01e39b",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "elementwise_v3.hip correctly implements float4 (128-bit) vectorized loads processing 8 FP16 per thread. All 4 kernels (residual_add_v3, silu_fused_v3, rmsnorm_v3, skip_rmsnorm_v3) pass correctness thresholds (residual_add < 1e-4, silu/rms < 5e-3). The key design decisions are sound: (1) exact __expf sigmoid for SiLU is correct — polynomial approximation at the logistic function level gets amplified by gate magnitude, exceeding 5e-3 threshold; (2) tail handling uses (dim/8)*8 which correctly avoids double-counting; (3) RMSNorm shows clear 1.43x bandwidth improvement (0.9 vs 0.6 GB/s). The residual_add and silu kernels showing no speedup at dim=5120 is correctly explained by kernel launch overhead dominance for small workloads. The architecture.md update is well-placed and informative.",
+    "issues": [
+      {
+        "file": "src/kernels/elementwise_v3.hip",
+        "line": 39,
+        "severity": "non_blocking",
+        "description": "residual_add_v3 uses float4 load-modify-store but reads dst as const float4 pointer then writes back. The const qualifier is cast away via reinterpret_cast for the store. This is fine for correctness but the const __restrict__ qualifier on dst is misleading—the function does modify dst in-place. This was the same pattern in v2 so it's a pre-existing style issue, not a regression."
+      },
+      {
+        "file": "src/kernels/elementwise_v3.hip",
+        "line": 85,
+        "severity": "non_blocking",
+        "description": "silu_fused_v3 tail path calls __expf (a MUFU instruction) in a scalar loop. This is correct and matches the vectorized path. The scalar tail only activates for n%8 != 0 elements, so at dim=11008 (11008%8=0) there is no tail. For odd-sized dimensions this correctly falls back to scalar."
+      },
+      {
+        "file": "src/kernels/elementwise_v3.hip",
+        "line": 156,
+        "severity": "non_blocking",
+        "description": "rmsnorm_v3 cross-warp reduction uses s_warp[4] but writes via threadIdx.x < 4. With 256 threads (4 warps of 64), lane==0 of each warp is at threadIdx.x = 0, 64, 128, 192 — so wf_id 0-3 correctly map to 4 unique LDS slots. The subsequent reduction block (threadIdx.x < 4) reads s_warp[0..3] and broadcasts via s_warp[threadIdx.x] = total. This is correct: all 4 threads in the reduction block write the same total to slots 0-3, ensuring all subsequent reads get the same value. Well-implemented."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "knowledge",
+      "observation": "Polynomial sigmoid approximations (including logistic approximation sigmoid(x)≈0.5+0.5*x/(1+|x|)) are insufficient for SiLU correctness on gfx906 when the 5e-3 threshold is applied to the full SiLU output x*sigmoid(x)*up. The approximation error at the sigmoid level (~5e-2) is amplified by gate magnitude. Exact __expf (MUFU v_exp_f32) must be used. This is documented in the handoff but not yet in architecture.md.",
+      "evidence": "Handoff discoveredIssues: 'Polynomial sigmoid...has max error ~5e-2, which gets amplified by |gate|'. Worker note: 'silu_fused_v3 uses exact __expf for sigmoid (polynomial approx too inaccurate)'."
+    },
+    {
+      "area": "knowledge",
+      "observation": "float4 (dwordx4, 128-bit) loads provide measurable bandwidth improvement for RMSNorm at dim=5120 on MI60 (1.43x), but NOT for residual_add and silu_fused at single invocations of dim=5120. These smaller kernels are dominated by kernel launch overhead. The float4 approach only helps when the kernel is actually bandwidth-limited (multi-pass like RMSNorm, or large dim).",
+      "evidence": "Test results: RMSNorm v2=49.8us/0.6GB/s vs v3=34.5us/0.9GB/s (1.45x). Handoff: 'residual_add and silu_fused show no speedup...kernel launch overhead dominates'."
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS. elementwise_v3.hip correctly implements float4 vectorization for all 4 kernels. All correctness thresholds met on MI60. RMSNorm shows 1.43x bandwidth improvement (VAL-ELEM-002 fulfilled). The key design decision to use exact __expf for SiLU sigmoid is correct and justified. The tail handling fix (dim/8)*8 is important and properly implemented. No blocking issues found."
+}

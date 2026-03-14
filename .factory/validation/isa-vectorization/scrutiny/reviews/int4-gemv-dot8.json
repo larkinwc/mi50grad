@@ -1,0 +1,39 @@
+{
+  "featureId": "int4-gemv-dot8",
+  "reviewedAt": "2026-03-14T17:45:00.000Z",
+  "commitId": "edc4b33",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "gemv_int4_v4.hip correctly implements the fdot2 (v_dot2_f32_f16) approach for INT4 GEMV. The implementation is clean, well-documented, and matches the same cooperative reduction pattern from v3. All three variants (t4, t8, t16) compile for gfx906 and pass correctness with max_abs_err < 2e-3 (well under 1e-2). The performance regression (0.84-0.94x vs v3) is a known and acceptable tradeoff: the fdot2 benefit is offset by nibble-to-FP16 conversion overhead in a memory-bandwidth-limited kernel. The feature description requested 'try both, keep the one with better correctness/performance tradeoff' — worker correctly chose fdot2 over sdot8 because fdot2 avoids activation quantization error entirely. The performance comparison is properly documented.",
+    "issues": [
+      {
+        "file": "src/kernels/gemv_int4_v4.hip",
+        "line": 58,
+        "severity": "non_blocking",
+        "description": "The dequant_fdot2 function loads 8 FP16 activations directly from A (uncoalesced if threads access different columns). In the cooperative reduction, multiple threads sharing a column each load A from the same k-range but different offsets. This access pattern is correct but relies on L1/L2 cache for the shared A rows. No correctness issue, just a note for future optimization."
+      },
+      {
+        "file": "src/kernels/gemv_int4_v4.hip",
+        "line": 98,
+        "severity": "non_blocking",
+        "description": "The groups_per_scale power-of-2 shift (gps_log2) assumes group_size is a power of 2. This is documented implicitly. For non-power-of-2 group sizes this would compute incorrect scale indices. The feature's target group_size=128 satisfies this, but a comment or assertion would make the constraint explicit."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "knowledge",
+      "observation": "The INT4 GEMV kernel is memory-bandwidth-limited (100-260 GB/s actual vs 857 GB/s theoretical on MI60), meaning reducing FMA count via fdot2 doesn't help—the bottleneck is HBM bandwidth. This insight explains why v4 (fdot2) is slower than v3 (scalar) despite higher arithmetic throughput: the kernel can't keep the compute units busy regardless. This finding is relevant for future kernel design decisions.",
+      "evidence": "Handoff notes: 'actual throughput ~100-260 GB/s vs 857 GB/s theoretical'. Performance 0.84-0.94x vs v3 despite fdot2 being 2x higher arithmetic throughput."
+    },
+    {
+      "area": "knowledge",
+      "observation": "For gfx906 (MI50/MI60) INT4 GEMV, v3_t16 (scalar nibble extraction + float FMA) is faster than v4 (fdot2). The recommended production kernel for INT4 GEMV decode path is gemv_int4_v3_t16 at shapes N=4096,K=4096 and N=11008,K=4096. This should be documented in architecture.md if not already present.",
+      "evidence": "Handoff: 'v3_t16 remains the recommended kernel for production use'. Performance: v3=70.9us vs v4=84.0us at N=4096."
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS. gemv_int4_v4.hip correctly implements v_dot2_f32_f16 (fdot2) for INT4 GEMV with all correctness criteria met (max_abs_err < 2e-3 << 1e-2 threshold). The performance regression (0.84-0.94x) is fully expected and explained: the kernel is memory-bandwidth-limited, so higher arithmetic throughput from fdot2 provides no net benefit while the nibble-to-FP16 conversion adds overhead. The performance comparison is properly documented (VAL-I4GV-002 fulfilled). No blocking issues found."
+}
