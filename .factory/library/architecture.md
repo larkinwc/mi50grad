@@ -320,6 +320,46 @@ else:
 
 ---
 
+## INT4 GEMM On-the-Fly Dequantization (int4-gemm-onthefly-dequant)
+
+**File:** `src/kernels/gemm_int4_prefill_v2.hip`
+**Test:** `tests/test_gemm_int4_v2.py`
+
+**Key insight:** Store B tile packed (uint32, 8 INT4 per word) in LDS instead of dequantizing to FP16.
+- Original LDS for B: 64×32×2 = 4096 bytes (FP16)
+- v2 LDS for B: 64×4×4 = 1024 bytes (uint32, packed)  → **4x LDS reduction**
+- Total LDS: 5120 bytes vs original 8192 bytes
+
+**LDS load:** 256 threads load exactly 256 packed uint32s (one each) for B tile.
+- Each thread handles: b_col = tid/4, b_k8 = tid%4 (TILE_K_PACKED=4 since TILE_K=32, 32/8=4)
+- B_q4 is [K/8, N] row-major: index = k8_global * N + n_global
+
+**Compute inner loop:** For each k in [0, TILE_K):
+1. Load A values for 4 output rows from smem_A
+2. For each of 4 output columns: read packed uint32 from smem_Bp, extract nibble via `__builtin_amdgcn_ubfe`
+3. Update scale/zero cache if group boundary crossed (g = k_global / group_size)
+4. Dequant: `w = (nibble - zero) * scale`, then `acc += a * w`
+
+**Scale/zero caching:** Per thread, cache cur_scale[4] and cur_zero[4] (one per output column) with
+last-used-group tracking → reload only when group boundary crossed.
+
+**Performance on MI60 gfx906 (M=128, N=4096, K=4096, gs=128):**
+- Original (FP16 dequant in LDS load): 3721 us
+- v2 (on-the-fly dequant): 1799 us
+- **Speedup: 2.07x**
+
+**Correctness:** max_abs_err = 9.77e-4 (well below 1e-2 threshold) at both test shapes.
+
+**Why so much faster:** LDS bandwidth is the bottleneck. The B tile load in the original requires
+reading INT4 and writing FP16 to LDS (2x the data per element), then reading FP16 back for compute.
+v2 writes only packed uint32 (4x less LDS traffic), saving LDS write bandwidth and improving
+cache line utilization for compute reads.
+
+**`amdgpu_flat_work_group_size(256,256)` attribute:** Applied on v2 kernel — same pattern as
+gemm_fp16_prefill.hip that improved TFLOPS from 10→18.
+
+---
+
 ## FlashAttention-256 Tuning (m3-flashattn-tune)
 
 **Tuned kernel**: `flash_attn_256_tuned.hip` contains `flash_attn_256_decode` and `flash_attn_256_prefill`.
