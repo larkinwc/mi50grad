@@ -1,0 +1,108 @@
+{
+  "flash_attn_decode": {
+    "kv_len=256,h=48,kvh=8,d=256": {
+      "latency_us": 93.388,
+      "tflops": 0.134738
+    },
+    "kv_len=1024,h=48,kvh=8,d=256": {
+      "latency_us": 249.854,
+      "tflops": 0.201445
+    }
+  },
+  "flash_attn_prefill": {
+    "seq=128,h=48,kvh=8,d=256": {
+      "latency_us": 240.139,
+      "tflops": 3.353494
+    },
+    "seq=512,h=48,kvh=8,d=256": {
+      "latency_us": 2596.668,
+      "tflops": 4.962092
+    },
+    "seq=2048,h=48,kvh=8,d=256": {
+      "latency_us": 39188.226,
+      "tflops": 5.260724
+    }
+  },
+  "gemm_fp16_prefill": {
+    "M=128,N=6144,K=5120": {
+      "latency_us": 1151.082,
+      "tflops": 6.996082
+    },
+    "M=128,N=5120,K=6144": {
+      "latency_us": 1675.843,
+      "tflops": 4.805382
+    },
+    "M=128,N=1024,K=5120": {
+      "latency_us": 527.058,
+      "tflops": 2.546543
+    }
+  },
+  "gemm_int4_prefill": {
+    "M=128,N=4096,K=4096,gs=128": {
+      "latency_us": 1807.921,
+      "tflops": 2.375639
+    },
+    "M=64,N=11008,K=4096,gs=128": {
+      "latency_us": 3032.944,
+      "tflops": 1.902891
+    }
+  },
+  "gemv_int4_v4_t4": {
+    "N=4096,K=4096,gs=128": {
+      "latency_us": 115.239,
+      "gbs": 77.485
+    },
+    "N=11008,K=4096,gs=128": {
+      "latency_us": 132.506,
+      "gbs": 181.001
+    }
+  },
+  "gemv_int4_v4_t8": {
+    "N=4096,K=4096,gs=128": {
+      "latency_us": 76.671,
+      "gbs": 116.462
+    },
+    "N=11008,K=4096,gs=128": {
+      "latency_us": 107.615,
+      "gbs": 222.864
+    }
+  },
+  "gemv_int4_v4_t16": {
+    "N=4096,K=4096,gs=128": {
+      "latency_us": 73.25,
+      "gbs": 121.901
+    },
+    "N=11008,K=4096,gs=128": {
+      "latency_us": 110.846,
+      "gbs": 216.369
+    }
+  },
+  "rmsnorm_v3": {
+    "dim=5120,n=128": {
+      "latency_us": 37.317,
+      "gbs": 70.521
+    }
+  },
+  "silu_fused_v3": {
+    "dim=11008,n=128": {
+      "latency_us": 39.593,
+      "gbs": 213.524
+    }
+  },
+  "residual_add_v3": {
+    "dim=5120,n=128": {
+      "latency_us": 32.519,
+      "gbs": 120.917
+    }
+  },
+  "fused_skip_rmsnorm_gemv": {
+    "K=5120,N=4096,gs=128": {
+      "latency_us": 139.403
+    }
+  },
+  "gemm_fp16_prefill_silu_epilogue": {
+    "M=128,N=11008,K=5120": {
+      "latency_us": 1842.763
+    }
+  }
+}
