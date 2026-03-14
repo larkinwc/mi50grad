@@ -608,3 +608,59 @@ doesn't produce measurable improvement.
 - **t16 shows slight regression** vs v3 at N=4096 due to fdot2 dequant overhead
 - **Use gemv_int4_v4_t8** as the default for decode GEMV; reserve t16 only for N>11008
 
+---
+
+## P2P Allreduce (p2p-allreduce milestone)
+
+### Architecture
+
+`src/kernels/p2p_allreduce.hip` provides HIP C++ kernels for on-device FP16 reduction:
+- `p2p_reduce_sum_residual_tp{2,3,4}_kernel`: reduces partials into hidden buffer (fused allreduce + residual add)
+- `p2p_reduce_sum_only_tp{2,3,4}_kernel`: reduces partials only (no residual)
+- Host-callable C wrappers (`p2p_reduce_residual_tp2`, etc.) using `hipLaunchKernelGGL`
+
+`src/runtime/p2p_allreduce.py` wraps the shared library:
+- `P2PAllreduce`: async P2P gather → on-device kernel → async broadcast → single sync
+- `PinnedAsyncAllreduce`: pinned host memory with async D2H + CPU accumulate + async H2D
+
+### P2P Allreduce Protocol (TP=4, hidden_size=5120)
+
+1. `hipMemcpyPeerAsync` gather partials from GPU1,2,3 to GPU0 gather buffers (on stream0)
+2. `hipStreamSynchronize(stream0)` to wait for gather
+3. `p2p_reduce_residual_tp4_kernel` on GPU0: `hidden[0] = hidden[0] + p0 + p1 + p2 + p3`
+4. `hipStreamSynchronize(stream0)` to wait for kernel
+5. `hipMemcpyPeerAsync` broadcast hidden[0] to GPU1,2,3 (on per-GPU streams)
+6. `hipStreamSynchronize` on each GPU's stream
+
+### Performance Results (TP=2, hidden=5120, 200 iters, gfx906 MI50/MI60)
+- Host-mediated (fast_allreduce.c): 123.9 us/call median
+- P2P GPU allreduce (new): 75.4 us/call median
+- **Speedup: 1.64x** ✓ (target was 1.5x)
+
+### Critical Implementation Notes
+
+**Shared library vs HSACO module**:
+- Using `hipcc -shared -fPIC` to compile as a shared library IS the correct approach
+- `hipModuleLaunchKernel` from Python ctypes fails with `hipErrorInvalidDevice (101)` in
+  multi-GPU contexts (likely because the kernel was loaded in a different device context)
+- The fix is to compile host-callable C wrappers that use `hipLaunchKernelGGL` internally
+- This is the same approach as `fast_allreduce.c` (shared library with host functions)
+
+**Stale HIP error state**:
+- When `hipDeviceEnablePeerAccess` fails with error 704 (`hipErrorPeerAccessAlreadyEnabled`),
+  this error remains in the HIP error state
+- `hipGetLastError()` at the end of the C wrapper picks up this stale error as kernel error
+- **Fix**: call `(void)hipGetLastError()` at the START of each C wrapper to clear stale errors
+
+**Two-hop PCIe topology**:
+- All 4 MI50 GPUs are 2 PCIe hops apart (through CPU/chipset)
+- P2P `hipMemcpyPeerAsync` still works but may have ~10-20us latency per transfer
+- For TP=4, we do 3 async P2P gathers + 3 async P2P broadcasts = 6 P2P transfers total
+- Speedup of 1.64x for TP=2 (measured); TP=4 expected similar ratio
+
+**TPInferenceEngine integration**:
+- `P2PAllreduce` is initialized in `TPInferenceEngine.__init__` after `TensorParallelGroup`
+- Uses `tp_group.streams` (one per GPU) for async P2P operations
+- Falls back to `fast_allreduce.c` path if P2P allreduce unavailable
+- `_allreduce_residual` and `_allreduce_sum` check `self._p2p_ar is not None` first
+

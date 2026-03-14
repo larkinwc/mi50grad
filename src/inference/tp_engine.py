@@ -14,6 +14,7 @@ from typing import Optional
 
 from src.inference.engine import InferenceEngine
 from src.runtime.tensor_parallel import TensorParallelGroup
+from src.runtime.p2p_allreduce import P2PAllreduce
 from src.model.qwen import QwenConfig
 
 
@@ -117,6 +118,20 @@ class TPInferenceEngine:
         else:
             print("Using Python allreduce fallback")
 
+        # Initialize P2P GPU allreduce (new path)
+        # Use streams from tp_group for async P2P operations
+        self._p2p_ar = None
+        if self.tp_size >= 2:
+            try:
+                h = config.hidden_size
+                streams = self.tp_group.streams  # per-GPU streams
+                self._p2p_ar = P2PAllreduce(
+                    self._hip, device_ids, h, streams=streams)
+                print(f"P2P allreduce loaded (TP={self.tp_size}, GPU P2P reduce kernel)")
+            except Exception as e:
+                print(f"P2P allreduce unavailable ({e}), using host-mediated fallback")
+                self._p2p_ar = None
+
         # Fallback host buffers
         h = config.hidden_size
         self._host_bufs = [ctypes.create_string_buffer(h * 2)
@@ -218,7 +233,18 @@ class TPInferenceEngine:
                              dtype=np.float16)
 
     def _allreduce_sum(self, buffer_name: str, hidden_size: int):
-        """Allreduce partials only (no hidden download). 2 D2H + 2 H2D."""
+        """Allreduce partials only (no hidden download).
+
+        Tries P2P GPU allreduce first, falls back to fast_ar C extension,
+        then Python fallback.
+        """
+        # P2P GPU allreduce (primary path): async P2P gather + on-device kernel + broadcast
+        if self._p2p_ar is not None and 2 <= self.tp_size <= 4:
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            self._p2p_ar.allreduce_sum(partial_ptrs, hidden_size)
+            return
+
+        # Host-mediated C extension fallback (TP=2 only)
         if self._fast_ar and self.tp_size == 2:
             e0, e1 = self.engines
             err = self._fast_ar.fast_ar_sum_tp2(
@@ -250,7 +276,19 @@ class TPInferenceEngine:
             hip.memcpy_h2d(getattr(engine, buffer_name), result_bytes, size)
 
     def _allreduce_residual(self, buffer_name: str, hidden_size: int):
-        """Allreduce + residual add to d_hidden."""
+        """Allreduce + residual add to d_hidden.
+
+        Tries P2P GPU allreduce first, falls back to fast_ar C extension,
+        then Python fallback.
+        """
+        # P2P GPU allreduce (primary path): async P2P gather + on-device kernel + broadcast
+        if self._p2p_ar is not None and 2 <= self.tp_size <= 4:
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            hidden_ptrs = [e.d_hidden for e in self.engines]
+            self._p2p_ar.allreduce_residual(partial_ptrs, hidden_ptrs, hidden_size)
+            return
+
+        # Host-mediated C extension fallback (TP=2,3,4)
         if self._fast_ar and self.tp_size == 2:
             e0, e1 = self.engines
             err = self._fast_ar.fast_ar_fused_tp2(
@@ -314,6 +352,9 @@ class TPInferenceEngine:
             engine.device.synchronize()
 
     def cleanup(self):
+        if self._p2p_ar:
+            self._p2p_ar.cleanup()
+            self._p2p_ar = None
         for engine in self.engines:
             engine.cleanup()
         self.tp_group.cleanup()

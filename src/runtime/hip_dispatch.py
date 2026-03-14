@@ -185,6 +185,13 @@ class HIPRuntime:
         lib.hipHostFree.argtypes = [ctypes.c_void_p]
         lib.hipHostFree.restype = ctypes.c_int
 
+        # hipMemcpyAsync (async host<->device transfer on stream)
+        lib.hipMemcpyAsync.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_int, ctypes.c_void_p  # dst, src, size, kind, stream
+        ]
+        lib.hipMemcpyAsync.restype = ctypes.c_int
+
     def _check(self, err: int, msg: str = ""):
         if err != 0:
             raise HIPError(f"HIP error {err}: {msg}")
@@ -251,6 +258,28 @@ class HIPRuntime:
     def host_free(self, ptr: int):
         """Free pinned host memory."""
         self._check(self._lib.hipHostFree(ctypes.c_void_p(ptr)), "hipHostFree")
+
+    def memcpy_h2d_async(self, dst: int, src: int, size: int, stream: int = 0):
+        """Async host to device copy on stream (pinned host memory)."""
+        self._check(
+            self._lib.hipMemcpyAsync(
+                ctypes.c_void_p(dst),
+                ctypes.c_void_p(src),
+                size, 1, ctypes.c_void_p(stream)  # hipMemcpyHostToDevice = 1
+            ),
+            "hipMemcpyAsync H2D"
+        )
+
+    def memcpy_d2h_async(self, dst: int, src: int, size: int, stream: int = 0):
+        """Async device to host copy on stream (pinned host memory)."""
+        self._check(
+            self._lib.hipMemcpyAsync(
+                ctypes.c_void_p(dst),
+                ctypes.c_void_p(src),
+                size, 2, ctypes.c_void_p(stream)  # hipMemcpyDeviceToHost = 2
+            ),
+            "hipMemcpyAsync D2H"
+        )
 
     def memset(self, ptr: int, value: int, size: int):
         self._check(
