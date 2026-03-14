@@ -275,6 +275,24 @@ class LayerWeights:
         self.down_scales = 0
         self.down_zeros = 0
 
+        # FFN weights for W8A8: INT8 weight + FP32 per-channel scale (device ptrs)
+        # gate_w8a8: [N, K] INT8, gate_scale_w8a8: [N] FP32
+        self.gate_w8a8 = 0
+        self.gate_scale_w8a8 = 0
+        self.up_w8a8 = 0
+        self.up_scale_w8a8 = 0
+        self.down_w8a8 = 0
+        self.down_scale_w8a8 = 0
+
+        # FFN weights for W4A8: packed INT4 + per-group FP32 scales (device ptrs)
+        # gate_w4a8: [N, K/8] uint32, gate_scale_w4a8: [K/group_size, N] FP16
+        self.gate_w4a8 = 0
+        self.gate_scale_w4a8 = 0
+        self.up_w4a8 = 0
+        self.up_scale_w4a8 = 0
+        self.down_w4a8 = 0
+        self.down_scale_w4a8 = 0
+
         # RMSNorm (FP16, device ptrs)
         self.attn_norm = 0
         self.ffn_norm = 0
@@ -284,11 +302,24 @@ class InferenceEngine:
     """Inference engine for Qwen 3.5 27B on MI50.
 
     Supports tensor parallelism: pass tp_size > 1 to shard heads and FFN.
+
+    quant_format selects the FFN quantization format:
+      'w4a16' (default): INT4 weights, FP16 activations (existing path)
+      'w8a8':            INT8 weights, INT8 activations (W8A8 GEMV/GEMM)
+      'w4a8':            INT4 weights packed for W4A8, INT8 activations
     """
+
+    VALID_QUANT_FORMATS = ('w4a16', 'w8a8', 'w4a8')
 
     def __init__(self, config: QwenConfig, device_id: int = 0,
                  max_seq_len: int = 2048,
-                 tp_size: int = 1, tp_rank: int = 0):
+                 tp_size: int = 1, tp_rank: int = 0,
+                 quant_format: str = 'w4a16'):
+        if quant_format not in self.VALID_QUANT_FORMATS:
+            raise ValueError(
+                f"quant_format must be one of {self.VALID_QUANT_FORMATS}, got {quant_format!r}")
+        self.quant_format = quant_format
+
         self.config = config
         self.device = GPUDevice(device_id)
         self.kernels = KernelCache(self.device)
@@ -322,6 +353,7 @@ class InferenceEngine:
         self._init_rope_hip()
         self._init_gemv_v2()
         self._init_gemm_prefill()
+        self._init_quant_kernels()
         self._init_streams()
 
         # Launch counting infrastructure: tracks kernel launches per layer.
@@ -495,6 +527,90 @@ class InferenceEngine:
                 print("GEMM INT4 prefill kernel loaded")
         except Exception as e:
             print(f"GEMM INT4 prefill failed: {e}, using per-token GEMV fallback")
+
+    def _init_quant_kernels(self):
+        """Initialize W8A8/W4A8 quantization kernels based on quant_format.
+
+        W8A8: loads gemv_w8a8.hip (INT8 weight + INT8 activation GEMV)
+              and activation_quant.hip (dynamic INT8 quantization of FP16 activations).
+        W4A8: loads gemv_w4a8.hip (INT4 weight + INT8 activation GEMV)
+              and activation_quant.hip.
+        W4A16 (default): no extra kernels needed.
+
+        Allocates INT8 activation buffer and FP32 max_abs/scale buffers for the
+        two-kernel activation quantization pipeline.
+        """
+        self._w8a8_ready = False
+        self._w4a8_ready = False
+        self._act_quant_ready = False
+
+        if self.quant_format == 'w4a16':
+            print("quant_format=w4a16 (default INT4 weight + FP16 activation path)")
+            return
+
+        # Both W8A8 and W4A8 need the activation quantization kernel.
+        hip_aq = HIP_DIR / "activation_quant.hip"
+        if not hip_aq.exists():
+            raise RuntimeError(
+                f"activation_quant.hip not found at {hip_aq}. "
+                f"Required for quant_format={self.quant_format!r}."
+            )
+        try:
+            self.kernels.get_hip("activation_quant_reduce", "activation_quant")
+            self.kernels.get_hip("activation_quant_quant", "activation_quant")
+            self._act_quant_ready = True
+            print("Activation quantization kernels loaded (activation_quant.hip)")
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load activation_quant.hip: {e}. "
+                f"Required for quant_format={self.quant_format!r}."
+            ) from e
+
+        # Allocate persistent buffers for activation quantization:
+        #   d_act_int8:   [max_act_size] INT8 — quantized activation
+        #   d_act_maxabs: scalar FP32 — max absolute value (output of reduce pass)
+        #   d_act_scale:  scalar FP32 — scale = max_abs / 127.0 (output of quant pass)
+        max_act_size = max(self.config.hidden_size, self.local_intermediate_size)
+        self.d_act_int8 = self.device.malloc(max_act_size)   # INT8 = 1 byte each
+        self.d_act_maxabs = self.device.malloc(4)  # FP32 scalar
+        self.d_act_scale = self.device.malloc(4)   # FP32 scalar
+
+        if self.quant_format == 'w8a8':
+            hip_w8a8 = HIP_DIR / "gemv_w8a8.hip"
+            if not hip_w8a8.exists():
+                raise RuntimeError(
+                    f"gemv_w8a8.hip not found at {hip_w8a8}. "
+                    "Required for quant_format='w8a8'."
+                )
+            try:
+                self.kernels.get_hip("gemv_w8a8", "gemv_w8a8")
+                self._w8a8_ready = True
+                print("W8A8 GEMV kernel loaded (gemv_w8a8.hip)")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to load gemv_w8a8.hip: {e}. "
+                    "Required for quant_format='w8a8'."
+                ) from e
+
+        elif self.quant_format == 'w4a8':
+            hip_w4a8 = HIP_DIR / "gemv_w4a8.hip"
+            if not hip_w4a8.exists():
+                raise RuntimeError(
+                    f"gemv_w4a8.hip not found at {hip_w4a8}. "
+                    "Required for quant_format='w4a8'."
+                )
+            try:
+                # Load the grouped variant (per-group scales, GPTQ-compatible)
+                self.kernels.get_hip("gemv_w4a8_grouped", "gemv_w4a8")
+                # Also load the per-channel dot4 variant for testing
+                self.kernels.get_hip("gemv_w4a8_dot4", "gemv_w4a8")
+                self._w4a8_ready = True
+                print("W4A8 GEMV kernels loaded (gemv_w4a8.hip)")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to load gemv_w4a8.hip: {e}. "
+                    "Required for quant_format='w4a8'."
+                ) from e
 
     def _init_streams(self):
         """Create two HIP streams for concurrent Q+Qgate and K+V GEMV projections.
@@ -790,7 +906,8 @@ class InferenceEngine:
         lw.layer_type = weights.get('layer_type', 'full_attention')
 
         def upload(data: np.ndarray) -> int:
-            if data.dtype != np.float16 and data.dtype not in (np.int32, np.uint32, np.float32):
+            if data.dtype != np.float16 and data.dtype not in (np.int32, np.uint32, np.float32,
+                                                                 np.int8, np.uint8):
                 data = data.astype(np.float16)
             ptr = self.device.malloc(data.nbytes)
             self.device.upload(ptr, data.tobytes())
@@ -921,34 +1038,39 @@ class InferenceEngine:
                 self._launch_skip_rmsnorm(self.d_normed, self.d_hidden, self.d_proj_out,
                                            lw.ffn_norm, h)
 
-            # Gate + up INT4 GEMV projections (column-parallel: local N)
-            if self._gemv_int4_dual:
-                self._launch_ffn_gate_up_silu(self.d_ffn_gate, self.d_normed,
-                                               lw, h, self.local_intermediate_size)
+            # Gate + up INT4 GEMV projections + down projection (column+row parallel)
+            if self.quant_format in ('w8a8', 'w4a8'):
+                # W8A8/W4A8: dispatch to quantized FFN helper (includes residual_add)
+                self._decode_ffn_quantized(lw, h)
             else:
-                self._launch_gemv_int4(self.d_ffn_gate, self.d_normed,
-                                        lw.gate_qweight, lw.gate_scales,
-                                        lw.gate_zeros, h, self.local_intermediate_size)
-                self._launch_gemv_int4(self.d_ffn_up, self.d_normed,
-                                        lw.up_qweight, lw.up_scales,
-                                        lw.up_zeros, h, self.local_intermediate_size)
-                self._launch_silu_fused(self.d_ffn_gate, self.d_ffn_up,
-                                         self.d_ffn_gate, self.local_intermediate_size)
+                # W4A16 path: fused gate+up dual GEMV, and down_proj with residual epilogue
+                if self._gemv_int4_dual:
+                    self._launch_ffn_gate_up_silu(self.d_ffn_gate, self.d_normed,
+                                                   lw, h, self.local_intermediate_size)
+                else:
+                    self._launch_gemv_int4(self.d_ffn_gate, self.d_normed,
+                                            lw.gate_qweight, lw.gate_scales,
+                                            lw.gate_zeros, h, self.local_intermediate_size)
+                    self._launch_gemv_int4(self.d_ffn_up, self.d_normed,
+                                            lw.up_qweight, lw.up_scales,
+                                            lw.up_zeros, h, self.local_intermediate_size)
+                    self._launch_silu_fused(self.d_ffn_gate, self.d_ffn_up,
+                                             self.d_ffn_gate, self.local_intermediate_size)
 
-            # Down projection (row-parallel with TP: local K, full N=hidden).
-            # For single-GPU (tp_size <= 1): use residual epilogue to fuse
-            # residual-add into the GEMV kernel, writing directly to d_hidden.
-            # This eliminates the separate residual-add launch after down_proj.
-            # For TP: TPInferenceEngine handles allreduce+residual externally.
-            if self.tp_size <= 1:
-                self._launch_gemv_int4(self.d_hidden, self.d_ffn_gate,
-                                        lw.down_qweight, lw.down_scales, lw.down_zeros,
-                                        self.local_intermediate_size, h,
-                                        residual=self.d_hidden)
-            else:
-                self._launch_gemv_int4(self.d_ffn_out, self.d_ffn_gate,
-                                        lw.down_qweight, lw.down_scales, lw.down_zeros,
-                                        self.local_intermediate_size, h)
+                # Down projection (row-parallel with TP: local K, full N=hidden).
+                # For single-GPU (tp_size <= 1): use residual epilogue to fuse
+                # residual-add into the GEMV kernel, writing directly to d_hidden.
+                # This eliminates the separate residual-add launch after down_proj.
+                # For TP: TPInferenceEngine handles allreduce+residual externally.
+                if self.tp_size <= 1:
+                    self._launch_gemv_int4(self.d_hidden, self.d_ffn_gate,
+                                            lw.down_qweight, lw.down_scales, lw.down_zeros,
+                                            self.local_intermediate_size, h,
+                                            residual=self.d_hidden)
+                else:
+                    self._launch_gemv_int4(self.d_ffn_out, self.d_ffn_gate,
+                                            lw.down_qweight, lw.down_scales, lw.down_zeros,
+                                            self.local_intermediate_size, h)
 
         self.kv_cache.advance()
 
@@ -959,6 +1081,43 @@ class InferenceEngine:
                                  dtype=np.float16)
         return np.frombuffer(self.device.download(self.d_hidden, h * 2),
                              dtype=np.float16)
+
+    def _decode_ffn_quantized(self, lw: 'LayerWeights', h: int):
+        """FFN block for W8A8 and W4A8 quantization formats (decode step).
+
+        Called by decode_step when quant_format is 'w8a8' or 'w4a8'.
+        Unlike the W4A16 path, these kernels don't support a fused residual
+        epilogue, so a separate _launch_residual_add is used after down_proj.
+
+        Args:
+            lw: layer weights (must have w8a8/w4a8 weight fields set)
+            h:  hidden size
+        """
+        inter = self.local_intermediate_size
+
+        if self.quant_format == 'w8a8' and self._w8a8_ready:
+            self._launch_gemv_w8a8(self.d_ffn_gate, self.d_normed,
+                                    lw.gate_w8a8, lw.gate_scale_w8a8, h, inter)
+            self._launch_gemv_w8a8(self.d_ffn_up, self.d_normed,
+                                    lw.up_w8a8, lw.up_scale_w8a8, h, inter)
+            self._launch_silu_fused(self.d_ffn_gate, self.d_ffn_up,
+                                     self.d_ffn_gate, inter)
+            self._launch_gemv_w8a8(self.d_ffn_out, self.d_ffn_gate,
+                                    lw.down_w8a8, lw.down_scale_w8a8, inter, h)
+            if self.tp_size <= 1:
+                self._launch_residual_add(self.d_hidden, self.d_ffn_out, h)
+
+        elif self.quant_format == 'w4a8' and self._w4a8_ready:
+            self._launch_gemv_w4a8(self.d_ffn_gate, self.d_normed,
+                                    lw.gate_w4a8, lw.gate_scale_w4a8, h, inter)
+            self._launch_gemv_w4a8(self.d_ffn_up, self.d_normed,
+                                    lw.up_w4a8, lw.up_scale_w4a8, h, inter)
+            self._launch_silu_fused(self.d_ffn_gate, self.d_ffn_up,
+                                     self.d_ffn_gate, inter)
+            self._launch_gemv_w4a8(self.d_ffn_out, self.d_ffn_gate,
+                                    lw.down_w4a8, lw.down_scale_w4a8, inter, h)
+            if self.tp_size <= 1:
+                self._launch_residual_add(self.d_hidden, self.d_ffn_out, h)
 
     def _decode_full_attention(self, layer_idx: int, lw: LayerWeights,
                                 position: int):
@@ -1620,6 +1779,122 @@ class InferenceEngine:
         grid_x = (n + 511) // 512  # each thread handles 2 elements
         self.device.launch(func, (grid_x, 1, 1), (256, 1, 1), params)
 
+        func = self.kernels.get_hip("residual_add_v2", "elementwise_v2")
+        params = [
+            ctypes.c_uint64(dst),
+            ctypes.c_uint64(src),
+            ctypes.c_uint32(n),
+        ]
+        grid_x = (n + 511) // 512  # each thread handles 2 elements
+        self.device.launch(func, (grid_x, 1, 1), (256, 1, 1), params)
+
+    def _launch_activation_quant(self, src_fp16, n):
+        """Quantize FP16 activations to INT8 (dynamic per-tensor).
+
+        Two-kernel pipeline:
+          1. activation_quant_reduce: finds max|x| → d_act_maxabs
+          2. activation_quant_quant: computes scale and quantizes → d_act_int8, d_act_scale
+
+        After this call:
+          self.d_act_int8   holds [n] INT8 quantized values
+          self.d_act_scale  holds FP32 scale = max_abs / 127.0
+        """
+        # Zero max_abs before reduce (uses atomicMax)
+        self.device.memset(self.d_act_maxabs, 0, 4)
+
+        # Pass 1: find max absolute value
+        grid_x = max(1, (n + 255) // 256)
+        func1 = self.kernels.get_hip("activation_quant_reduce", "activation_quant")
+        params1 = [
+            ctypes.c_uint64(src_fp16),
+            ctypes.c_uint64(self.d_act_maxabs),
+            ctypes.c_uint32(n),
+        ]
+        self.device.launch(func1, (grid_x, 1, 1), (256, 1, 1), params1)
+
+        # Pass 2: compute scale and quantize
+        grid_x2 = max(1, (n + 255) // 256)
+        func2 = self.kernels.get_hip("activation_quant_quant", "activation_quant")
+        params2 = [
+            ctypes.c_uint64(src_fp16),
+            ctypes.c_uint64(self.d_act_int8),
+            ctypes.c_uint64(self.d_act_maxabs),
+            ctypes.c_uint64(self.d_act_scale),
+            ctypes.c_uint32(n),
+        ]
+        self.device.launch(func2, (grid_x2, 1, 1), (256, 1, 1), params2)
+
+    def _launch_gemv_w8a8(self, dst, src_fp16, weight_int8, scale_w_fp32, K, N):
+        """W8A8 GEMV: quantize FP16 activations, then launch W8A8 GEMV kernel.
+
+        dst:          [N] FP16 output
+        src_fp16:     [K] FP16 activations
+        weight_int8:  [N, K] INT8 device ptr
+        scale_w_fp32: [N] FP32 per-channel weight scales device ptr
+        K, N:         dimensions
+        """
+        # Step 1: quantize FP16 activations to INT8 (dynamic per-tensor)
+        self._launch_activation_quant(src_fp16, K)
+
+        # Step 2: W8A8 GEMV — dst = scale_w[n] * scale_a * (W_int8 @ x_int8)
+        func = self.kernels.get_hip("gemv_w8a8", "gemv_w8a8")
+        grid_x = (N + 3) // 4  # 4 rows per workgroup
+        # scale_a is a float scalar — pass via a temporary GPU float buffer
+        # We read it from d_act_scale. The kernel signature takes float scale_a by value,
+        # so we need to download and pass it. But HIP kernels get scalars by-value in params.
+        # We use a workaround: pass d_act_scale pointer, then read it from kernel's perspective.
+        # Actually kernel signature: gemv_w8a8(x, W, scale_w, scale_a_float, out, K, N)
+        # scale_a is FP32 scalar — we need to download it from GPU then pass as ctypes.c_float.
+        # This is a necessary D2H sync for the scale (4 bytes only).
+        scale_a_bytes = self.device.download(self.d_act_scale, 4)
+        scale_a_val = float(np.frombuffer(scale_a_bytes, dtype=np.float32)[0])
+        params = [
+            ctypes.c_uint64(self.d_act_int8),
+            ctypes.c_uint64(weight_int8),
+            ctypes.c_uint64(scale_w_fp32),
+            ctypes.c_float(scale_a_val),
+            ctypes.c_uint64(dst),
+            ctypes.c_uint32(K),
+            ctypes.c_uint32(N),
+        ]
+        self.device.launch(func, (grid_x, 1, 1), (256, 1, 1), params)
+        self._record_launch(getattr(self, '_active_layer_idx', -1))
+
+    def _launch_gemv_w4a8(self, dst, src_fp16, weight_w4a8, scale_grp, K, N, group_size=None):
+        """W4A8 GEMV with per-group scales: quantize FP16 activations, then launch.
+
+        dst:          [N] FP16 output
+        src_fp16:     [K] FP16 activations
+        weight_w4a8:  [N, K/8] uint32 packed INT4 device ptr
+        scale_grp:    [K/group_size, N] FP16 per-group weight scales device ptr
+        K, N:         dimensions
+        group_size:   quantization group size (default: self.config.group_size)
+        """
+        if group_size is None:
+            group_size = self.config.group_size
+
+        # Step 1: quantize FP16 activations to INT8
+        self._launch_activation_quant(src_fp16, K)
+
+        # Step 2: W4A8 grouped GEMV
+        # Download scale_a (4 bytes, necessary for by-value scalar param)
+        scale_a_bytes = self.device.download(self.d_act_scale, 4)
+        scale_a_val = float(np.frombuffer(scale_a_bytes, dtype=np.float32)[0])
+        func = self.kernels.get_hip("gemv_w4a8_grouped", "gemv_w4a8")
+        grid_x = (N + 3) // 4
+        params = [
+            ctypes.c_uint64(self.d_act_int8),
+            ctypes.c_uint64(weight_w4a8),
+            ctypes.c_uint64(scale_grp),
+            ctypes.c_float(scale_a_val),
+            ctypes.c_uint64(dst),
+            ctypes.c_uint32(K),
+            ctypes.c_uint32(N),
+            ctypes.c_uint32(group_size),
+        ]
+        self.device.launch(func, (grid_x, 1, 1), (256, 1, 1), params)
+        self._record_launch(getattr(self, '_active_layer_idx', -1))
+
     def _alloc_prefill_scratch(self, seq_len: int):
         """Allocate GPU scratch buffers for prefill."""
         if hasattr(self, '_pf_seq_len') and self._pf_seq_len >= seq_len:
@@ -1802,7 +2077,8 @@ class InferenceEngine:
                 self._prefill_linear_attention(layer_idx, lw, seq_len)
 
             # FFN block
-            if self._gemm_int4_prefill and seq_len >= 32:
+            if (self.quant_format == 'w4a16' and self._gemm_int4_prefill
+                    and seq_len >= 32):
                 # Batched FFN: RMSNorm all tokens, GEMM gate/up, SiLU, GEMM down
                 inter = cfg.intermediate_size
 
@@ -1839,24 +2115,55 @@ class InferenceEngine:
                 self._launch_residual_add(self.d_pf_hidden, self.d_pf_ffn_out,
                                            seq_len * h)
             else:
-                # Per-token FFN fallback (uses fused gate+up GEMV)
+                # Per-token FFN fallback: supports W4A16, W8A8, W4A8
                 for t in range(seq_len):
                     t_off = t * h * 2
                     self._launch_rmsnorm(self.d_normed, self.d_pf_hidden + t_off,
                                           lw.ffn_norm, h)
-                    self._launch_gemv_int4(self.d_ffn_gate, self.d_normed,
-                                            lw.gate_qweight, lw.gate_scales,
-                                            lw.gate_zeros, h, cfg.intermediate_size)
-                    self._launch_gemv_int4(self.d_ffn_up, self.d_normed,
-                                            lw.up_qweight, lw.up_scales,
-                                            lw.up_zeros, h, cfg.intermediate_size)
-                    self._launch_silu_fused(self.d_ffn_gate, self.d_ffn_up,
-                                             self.d_ffn_gate, cfg.intermediate_size)
-                    self._launch_gemv_int4(self.d_ffn_out, self.d_ffn_gate,
-                                            lw.down_qweight, lw.down_scales,
-                                            lw.down_zeros, cfg.intermediate_size, h)
-                    self._launch_residual_add(self.d_pf_hidden + t_off,
-                                               self.d_ffn_out, h)
+
+                    if self.quant_format == 'w8a8' and self._w8a8_ready:
+                        self._launch_gemv_w8a8(self.d_ffn_gate, self.d_normed,
+                                                lw.gate_w8a8, lw.gate_scale_w8a8,
+                                                h, cfg.intermediate_size)
+                        self._launch_gemv_w8a8(self.d_ffn_up, self.d_normed,
+                                                lw.up_w8a8, lw.up_scale_w8a8,
+                                                h, cfg.intermediate_size)
+                        self._launch_silu_fused(self.d_ffn_gate, self.d_ffn_up,
+                                                 self.d_ffn_gate, cfg.intermediate_size)
+                        self._launch_gemv_w8a8(self.d_ffn_out, self.d_ffn_gate,
+                                                lw.down_w8a8, lw.down_scale_w8a8,
+                                                cfg.intermediate_size, h)
+                        self._launch_residual_add(self.d_pf_hidden + t_off,
+                                                   self.d_ffn_out, h)
+                    elif self.quant_format == 'w4a8' and self._w4a8_ready:
+                        self._launch_gemv_w4a8(self.d_ffn_gate, self.d_normed,
+                                                lw.gate_w4a8, lw.gate_scale_w4a8,
+                                                h, cfg.intermediate_size)
+                        self._launch_gemv_w4a8(self.d_ffn_up, self.d_normed,
+                                                lw.up_w4a8, lw.up_scale_w4a8,
+                                                h, cfg.intermediate_size)
+                        self._launch_silu_fused(self.d_ffn_gate, self.d_ffn_up,
+                                                 self.d_ffn_gate, cfg.intermediate_size)
+                        self._launch_gemv_w4a8(self.d_ffn_out, self.d_ffn_gate,
+                                                lw.down_w4a8, lw.down_scale_w4a8,
+                                                cfg.intermediate_size, h)
+                        self._launch_residual_add(self.d_pf_hidden + t_off,
+                                                   self.d_ffn_out, h)
+                    else:
+                        # W4A16 per-token fallback
+                        self._launch_gemv_int4(self.d_ffn_gate, self.d_normed,
+                                                lw.gate_qweight, lw.gate_scales,
+                                                lw.gate_zeros, h, cfg.intermediate_size)
+                        self._launch_gemv_int4(self.d_ffn_up, self.d_normed,
+                                                lw.up_qweight, lw.up_scales,
+                                                lw.up_zeros, h, cfg.intermediate_size)
+                        self._launch_silu_fused(self.d_ffn_gate, self.d_ffn_up,
+                                                 self.d_ffn_gate, cfg.intermediate_size)
+                        self._launch_gemv_int4(self.d_ffn_out, self.d_ffn_gate,
+                                                lw.down_qweight, lw.down_scales,
+                                                lw.down_zeros, cfg.intermediate_size, h)
+                        self._launch_residual_add(self.d_pf_hidden + t_off,
+                                                   self.d_ffn_out, h)
 
         # Set KV cache length
         self.kv_cache.current_len = seq_len
