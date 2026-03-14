@@ -1,0 +1,23 @@
+{
+  "group": "fuse-all",
+  "assertions": {
+    "VAL-FUSE-001": {
+      "status": "pass",
+      "evidence": "test_fused_norm_gemv.py ran successfully. All correctness tests PASSED. For dim=5120, N=4096: fused_t4 err_vs_sep=3.9062e-03 (PASS), fused_t8 err_vs_sep=3.9062e-03 (PASS), fused_t16 err_vs_sep=0.0000e+00 (PASS). For dim=5120, N=11008: all fused variants PASS with err_vs_sep <= 3.9062e-03 < 1e-2. Error vs separate kernel < 1e-2 as required by the assertion.",
+      "notes": "The assertion specifies 'max absolute error vs separate skip_rmsnorm_v2 + gemv_int4 < 1e-2'. The fused variants have err_vs_sep of 0 to 3.9e-3 which is well below the 1e-2 threshold. Note: both separate and fused have ~1.5625e-02 error vs CPU float reference (expected due to INT4 quantization noise). Performance is slower (fusion causes LDS overhead), but correctness is the acceptance criterion."
+    },
+    "VAL-FUSE-002": {
+      "status": "pass",
+      "evidence": "test_gemm_silu_fused.py ran successfully. Strategy B (gemm+silu_epilogue): at M=128,N=11008,K=5120 max_abs_err=0.003906 PASS. Strategy A (dual GEMM+silu): at M=128,N=11008,K=5120 max_abs_err=0.001953 PASS. All shapes tested passed including the required M=128,N=11008,K=5120.",
+      "notes": "Both strategies produce correct output with max abs error < 1e-2 vs separate GEMM + SiLU. Strategy B uses 2 launches, Strategy A uses 1 launch."
+    },
+    "VAL-FUSE-003": {
+      "status": "pass",
+      "evidence": "test_gemm_silu_fused.py provides full latency analysis at M=128,N=11008,K=5120: Baseline (3 launches)=3578.1us, Strategy B (2 launches)=3604.2us (0.993x), Strategy A (1 launch)=4604.5us (0.777x). HBM traffic analysis: Baseline=230.9MB, Strategy B=225.6MB (saves 5.4MB), Strategy A=218.9MB (saves 12.0MB). Analysis notes that at M=128,N=11008,K=5120 the GEMM is compute-dominated (~1700-1800us per kernel), so HBM traffic savings are negligible vs compute time, explaining the lack of wall-clock speedup.",
+      "notes": "The assertion requires latency comparison with analysis explaining compute-dominated vs bandwidth-dominated regime. The test provides exactly this: before/after numbers, speedup ratio, HBM traffic analysis, and regime explanation."
+    }
+  },
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "python3", "hipcc (pre-built kernels)"]
+}

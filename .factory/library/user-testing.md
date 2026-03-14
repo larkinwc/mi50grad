@@ -229,3 +229,33 @@ rsync -avz --exclude='.git' --exclude='build' --exclude='__pycache__' --exclude=
 - `tests/test_gemm_int4_v2.py` — VAL-I4GM-001, VAL-I4GM-002 (on-the-fly dequant INT4 GEMM: correctness, perf)
 
 **Evidence format**: Capture full stdout/stderr from each test command. Look for PASS/FAIL lines and error values.
+
+---
+
+## Flow Validator Guidance: GPU Kernel - kernel-fusion
+
+**Surface**: SSH to LXC (mi60-jupyter at 192.168.1.189), run Python test scripts on MI60 GPU
+
+**SSH Setup** (required for every command):
+```bash
+export SSH_AUTH_SOCK=$(ls /private/tmp/com.apple.launchd.*/Listeners 2>/dev/null | head -1)
+ssh -o ConnectTimeout=20 -o StrictHostKeyChecking=no -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'COMMAND'
+```
+
+**Isolation rules**:
+- Run tests sequentially within a subagent (GPU is single, VRAM shared)
+- VRAM is shared — individual kernel tests allocate modest VRAM and are fine
+- Do NOT kill existing GPU processes
+
+**Deploy before testing** (if needed):
+```bash
+rsync -avz --exclude='.git' --exclude='build' --exclude='__pycache__' --exclude='.factory' \
+    -e 'ssh -J root@wittymantis.netbird.selfhosted' \
+    /Users/larkinwc/personal/ml/mi50grad/ root@192.168.1.189:/root/mi50grad/
+```
+
+**Key test files for kernel-fusion milestone**:
+- `tests/test_fused_norm_gemv.py` — VAL-FUSE-001 (fused skip-RMSNorm + GEMV decode correctness at dim=5120, N=4096)
+- `tests/test_gemm_silu_fused.py` — VAL-FUSE-002 (fused SiLU+multiply in prefill GEMM epilogue correctness at M=128,N=11008,K=5120), VAL-FUSE-003 (latency analysis: fused vs separate latency comparison)
+
+**Evidence format**: Capture full stdout/stderr from each test command. Look for PASS/FAIL lines, max abs error values, and latency (us) + speedup numbers.
