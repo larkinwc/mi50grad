@@ -118,29 +118,30 @@ gemv_int4_fp16:
     // Accumulator (FP32)
     v_mov_b32 v20, 0
 
-    // Number of iterations = K / 8 / 256 = K / 2048
-    s_lshr_b32 s19, s14, 11                 // K / 2048
-    // But K might not divide evenly. Check bounds in loop.
-    // For simplicity assume K is multiple of 2048 for now.
+    // Number of iterations = ceil(K / 2048) = (K + 2047) / 2048
+    s_add_u32 s19, s14, 2047
+    s_lshr_b32 s19, s19, 11                 // ceil(K / 2048)
+
+    // Track current k_base for bounds checking
+    // k_base = tid * 8 (per thread starting K index)
+    v_lshlrev_b32 v21, 3, v0                // tid * 8
 
     // Strides for next iteration
     // B_q4: next iter is +256 rows -> + 256 * N * 4
-    s_lshl_b32 s20, s17, 8                  // 256 * N_stride_b... wait, this might overflow
-    // Actually: 256 * N * 4. If N=4096, that's 256*4096*4 = 4MB. Fits in 32 bits.
     s_mul_i32 s20, s17, 256                  // b_stride_iter = 256 * N_stride_b
 
     // A: next iter is +2048 elements -> +2048 * 2 = +4096 bytes
-    s_movk_i32 s21, 4096                     // a_stride_iter ... wait, this is actually
-    // 256 threads * 8 values * 2 bytes = 4096 bytes? Yes: 256*8=2048 elements, 2048*2=4096 bytes
-    // But s_movk_i32 only handles 16-bit immediates. 4096 fits.
-    s_movk_i32 s21, 0                        // Will use 4096 via two adds
-    // Actually 4096 is within 16-bit range (max 32767)
     s_mov_b32 s21, 4096
 
     s_cmp_eq_u32 s19, 0
     s_cbranch_scc1 .Lgemv_reduce
 
 .Lgemv_loop:
+    // Bounds check: skip if this thread's k_base >= K
+    v_cmp_lt_u32 vcc, v21, s14              // k_base < K ?
+    s_and_saveexec_b64 s[24:25], vcc
+    s_cbranch_execz .Lgemv_skip_iter
+
     // Load B_q4[k_group] = one uint32 = 8 packed INT4 values
     global_load_dword v11, v[1:2], off
     // Load A[k*8 .. k*8+7] = 4 dwords = 8 FP16
@@ -242,24 +243,20 @@ gemv_int4_fp16:
     v_add_co_u32 v3, vcc, v3, s21
     v_addc_co_u32 v4, vcc, v4, 0, vcc
 
-    // Update scale/zero group (every group_size/8 iterations)
-    // For now, reload every iteration (correct but slightly wasteful)
-    // Recompute group index for new k position
-    // new_k = (iter+1) * 2048 + tid * 8  ... complex. Just reload.
-    // Actually, since group_size=128 and we process 8 per iter with stride 2048,
-    // the group changes every iteration when stride >= group_size.
-    // For now, recalculate:
-    // new_k_start = old_k_start + 2048
-    // new_group = new_k_start / group_size
-    // scales_addr = scales_base + new_group * N * 2
-    // This is complex. For v1, just advance by the correct amount.
-    // Since stride = 2048 and group_size = 128: we skip 2048/128 = 16 groups
-    // scales stride = 16 * N * 2 per iteration
+    // Advance scale/zero pointers: skip 2048/128 = 16 groups per iter
     s_lshl_b32 s22, s18, 4                  // 16 * N_stride_s
     v_add_co_u32 v7, vcc, v7, s22
     v_addc_co_u32 v8, vcc, v8, 0, vcc
     v_add_co_u32 v9, vcc, v9, s22
     v_addc_co_u32 v10, vcc, v10, 0, vcc
+
+.Lgemv_skip_iter:
+    // Restore exec mask (all threads participate in control flow)
+    s_mov_b64 exec, s[24:25]
+
+    // Advance k_base for bounds checking (2048 > inline range, use s_mov)
+    s_movk_i32 s22, 2048
+    v_add_u32 v21, s22, v21                // k_base += 2048
 
     s_sub_u32 s19, s19, 1
     s_cmp_gt_u32 s19, 0
@@ -339,8 +336,8 @@ gemv_int4_fp16:
     .amdhsa_system_sgpr_workgroup_id_z 0
     .amdhsa_system_sgpr_workgroup_info 0
     .amdhsa_system_vgpr_workitem_id 0
-    .amdhsa_next_free_vgpr 21
-    .amdhsa_next_free_sgpr 25
+    .amdhsa_next_free_vgpr 22
+    .amdhsa_next_free_sgpr 26
     .amdhsa_reserve_vcc 1
     .amdhsa_reserve_flat_scratch 0
     .amdhsa_ieee_mode 1
@@ -392,9 +389,9 @@ amdhsa.kernels:
     .max_flat_workgroup_size: 256
     .name:           gemv_int4_fp16
     .private_segment_fixed_size: 0
-    .sgpr_count:     25
+    .sgpr_count:     26
     .symbol:         gemv_int4_fp16.kd
-    .vgpr_count:     21
+    .vgpr_count:     22
     .wavefront_size: 64
 amdhsa.target:   amdgcn-amd-amdhsa--gfx906
 amdhsa.version:

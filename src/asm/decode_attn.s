@@ -134,8 +134,15 @@ decode_attn_fp16:
     v_add_f32 v17, v17, v17 row_shr:2
     v_add_f32 v17, v17, v17 row_shr:4
     v_add_f32 v17, v17, v17 row_shr:8
-    v_add_f32 v17, v17, v17 row_bcast:15
-    v_add_f32 v17, v17, v17 row_bcast:31
+    // Lane 0 of each 16-lane row has the row sum; combine and broadcast
+    v_readlane_b32 s0, v17, 0
+    v_readlane_b32 s1, v17, 16
+    v_readlane_b32 s2, v17, 32
+    v_readlane_b32 s3, v17, 48
+    v_mov_b32 v17, s0
+    v_add_f32 v17, v17, s1
+    v_add_f32 v17, v17, s2
+    v_add_f32 v17, v17, s3
     // v17 = QK^T score, all lanes
 
     // Online softmax

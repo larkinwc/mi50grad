@@ -229,6 +229,7 @@ if __name__ == "__main__":
         # FFN down: M=seqlen, N=4096, K=11008
         print("\n\nPerformance benchmarks:")
         for M, N, K in [(256, 256, 256), (1024, 1024, 1024),
+                         (4096, 4096, 4096),
                          (128, 4096, 4096), (128, 11008, 4096)]:
             # Round to tile multiples
             M = ((M + 63) // 64) * 64

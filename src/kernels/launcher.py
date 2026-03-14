@@ -19,7 +19,29 @@ from ..runtime.hip_dispatch import GPUDevice
 
 LLVM_MC = "/opt/rocm/llvm/bin/llvm-mc"
 LD_LLD = "/opt/rocm/llvm/bin/ld.lld"
+HIPCC = "/opt/rocm/bin/hipcc"
 MCPU = "gfx906"
+
+
+def build_hip_hsaco(hip_path: str, hsaco_path: Optional[str] = None,
+                    mcpu: str = MCPU, extra_flags: Optional[list] = None) -> str:
+    """Compile .hip C++ source to .hsaco code object using hipcc."""
+    hip_path = Path(hip_path)
+    if hsaco_path is None:
+        hsaco_path = hip_path.with_suffix(".hsaco")
+    else:
+        hsaco_path = Path(hsaco_path)
+
+    cmd = [HIPCC, "--genco", f"--offload-arch={mcpu}",
+           "-O3", "-o", str(hsaco_path), str(hip_path)]
+    if extra_flags:
+        cmd.extend(extra_flags)
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"HIP compilation failed: {result.stderr}")
+
+    return str(hsaco_path)
 
 
 def build_hsaco(asm_path: str, hsaco_path: Optional[str] = None, mcpu: str = MCPU) -> str:

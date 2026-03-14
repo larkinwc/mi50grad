@@ -115,6 +115,76 @@ class HIPRuntime:
         ]
         lib.hipModuleLaunchKernel.restype = ctypes.c_int
 
+        # --- Peer-to-peer ---
+
+        # hipDeviceCanAccessPeer
+        lib.hipDeviceCanAccessPeer.argtypes = [
+            ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int
+        ]
+        lib.hipDeviceCanAccessPeer.restype = ctypes.c_int
+
+        # hipDeviceEnablePeerAccess
+        lib.hipDeviceEnablePeerAccess.argtypes = [ctypes.c_int, ctypes.c_uint]
+        lib.hipDeviceEnablePeerAccess.restype = ctypes.c_int
+
+        # hipMemcpyPeerAsync
+        lib.hipMemcpyPeerAsync.argtypes = [
+            ctypes.c_void_p, ctypes.c_int,       # dst, dst_device
+            ctypes.c_void_p, ctypes.c_int,       # src, src_device
+            ctypes.c_size_t, ctypes.c_void_p     # size, stream
+        ]
+        lib.hipMemcpyPeerAsync.restype = ctypes.c_int
+
+        # --- Events ---
+
+        # hipEventCreate
+        lib.hipEventCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        lib.hipEventCreate.restype = ctypes.c_int
+
+        # hipEventRecord
+        lib.hipEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.hipEventRecord.restype = ctypes.c_int
+
+        # hipEventSynchronize
+        lib.hipEventSynchronize.argtypes = [ctypes.c_void_p]
+        lib.hipEventSynchronize.restype = ctypes.c_int
+
+        # hipEventElapsedTime
+        lib.hipEventElapsedTime.argtypes = [
+            ctypes.POINTER(ctypes.c_float), ctypes.c_void_p, ctypes.c_void_p
+        ]
+        lib.hipEventElapsedTime.restype = ctypes.c_int
+
+        # hipEventDestroy
+        lib.hipEventDestroy.argtypes = [ctypes.c_void_p]
+        lib.hipEventDestroy.restype = ctypes.c_int
+
+        # --- Streams ---
+
+        # hipStreamCreate
+        lib.hipStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        lib.hipStreamCreate.restype = ctypes.c_int
+
+        # hipStreamSynchronize
+        lib.hipStreamSynchronize.argtypes = [ctypes.c_void_p]
+        lib.hipStreamSynchronize.restype = ctypes.c_int
+
+        # hipStreamDestroy
+        lib.hipStreamDestroy.argtypes = [ctypes.c_void_p]
+        lib.hipStreamDestroy.restype = ctypes.c_int
+
+        # --- Pinned host memory ---
+
+        # hipHostMalloc
+        lib.hipHostMalloc.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint
+        ]
+        lib.hipHostMalloc.restype = ctypes.c_int
+
+        # hipHostFree
+        lib.hipHostFree.argtypes = [ctypes.c_void_p]
+        lib.hipHostFree.restype = ctypes.c_int
+
     def _check(self, err: int, msg: str = ""):
         if err != 0:
             raise HIPError(f"HIP error {err}: {msg}")
@@ -169,6 +239,18 @@ class HIPRuntime:
             ),
             "hipMemcpy D2D"
         )
+
+    def host_malloc(self, size: int) -> int:
+        """Allocate pinned host memory. Returns host pointer."""
+        ptr = ctypes.c_void_p(0)
+        # hipHostMallocDefault = 0
+        self._check(self._lib.hipHostMalloc(ctypes.byref(ptr), size, 0),
+                     f"hipHostMalloc({size})")
+        return ptr.value
+
+    def host_free(self, ptr: int):
+        """Free pinned host memory."""
+        self._check(self._lib.hipHostFree(ctypes.c_void_p(ptr)), "hipHostFree")
 
     def memset(self, ptr: int, value: int, size: int):
         self._check(
@@ -236,6 +318,110 @@ class HIPRuntime:
             "hipModuleLaunchKernel"
         )
 
+    # --- Peer-to-peer methods ---
+
+    def device_can_access_peer(self, device_id: int, peer_device_id: int) -> bool:
+        """Check if device_id can access memory on peer_device_id."""
+        can_access = ctypes.c_int(0)
+        self._check(
+            self._lib.hipDeviceCanAccessPeer(
+                ctypes.byref(can_access), device_id, peer_device_id
+            ),
+            f"hipDeviceCanAccessPeer({device_id}, {peer_device_id})"
+        )
+        return can_access.value != 0
+
+    def device_enable_peer_access(self, peer_device_id: int):
+        """Enable peer access from the current device to peer_device_id."""
+        self._check(
+            self._lib.hipDeviceEnablePeerAccess(peer_device_id, 0),
+            f"hipDeviceEnablePeerAccess({peer_device_id})"
+        )
+
+    def memcpy_peer_async(self, dst: int, dst_device: int,
+                          src: int, src_device: int,
+                          size: int, stream: int = 0):
+        """Async peer-to-peer memory copy between devices."""
+        self._check(
+            self._lib.hipMemcpyPeerAsync(
+                ctypes.c_void_p(dst), dst_device,
+                ctypes.c_void_p(src), src_device,
+                size, ctypes.c_void_p(stream)
+            ),
+            "hipMemcpyPeerAsync"
+        )
+
+    # --- Event methods ---
+
+    def event_create(self) -> int:
+        """Create a HIP event. Returns event handle."""
+        event = ctypes.c_void_p(0)
+        self._check(
+            self._lib.hipEventCreate(ctypes.byref(event)),
+            "hipEventCreate"
+        )
+        return event.value
+
+    def event_record(self, event: int, stream: int = 0):
+        """Record an event on a stream."""
+        self._check(
+            self._lib.hipEventRecord(
+                ctypes.c_void_p(event), ctypes.c_void_p(stream)
+            ),
+            "hipEventRecord"
+        )
+
+    def event_synchronize(self, event: int):
+        """Wait for an event to complete."""
+        self._check(
+            self._lib.hipEventSynchronize(ctypes.c_void_p(event)),
+            "hipEventSynchronize"
+        )
+
+    def event_elapsed_time(self, start: int, end: int) -> float:
+        """Get elapsed time in milliseconds between two events."""
+        ms = ctypes.c_float(0.0)
+        self._check(
+            self._lib.hipEventElapsedTime(
+                ctypes.byref(ms),
+                ctypes.c_void_p(start), ctypes.c_void_p(end)
+            ),
+            "hipEventElapsedTime"
+        )
+        return ms.value
+
+    def event_destroy(self, event: int):
+        """Destroy a HIP event."""
+        self._check(
+            self._lib.hipEventDestroy(ctypes.c_void_p(event)),
+            "hipEventDestroy"
+        )
+
+    # --- Stream methods ---
+
+    def stream_create(self) -> int:
+        """Create a HIP stream. Returns stream handle."""
+        stream = ctypes.c_void_p(0)
+        self._check(
+            self._lib.hipStreamCreate(ctypes.byref(stream)),
+            "hipStreamCreate"
+        )
+        return stream.value
+
+    def stream_synchronize(self, stream: int):
+        """Wait for all operations on a stream to complete."""
+        self._check(
+            self._lib.hipStreamSynchronize(ctypes.c_void_p(stream)),
+            "hipStreamSynchronize"
+        )
+
+    def stream_destroy(self, stream: int):
+        """Destroy a HIP stream."""
+        self._check(
+            self._lib.hipStreamDestroy(ctypes.c_void_p(stream)),
+            "hipStreamDestroy"
+        )
+
 
 # ============================================================
 # High-level device abstraction
@@ -252,40 +438,72 @@ class GPUDevice:
         self._modules = {}  # path -> module handle
         self._allocations = []  # track for cleanup
 
+    def _ensure_device(self):
+        """Set current HIP device to this device (for multi-GPU safety)."""
+        self.hip.set_device(self.device_id)
+
     def malloc(self, size: int) -> int:
+        self._ensure_device()
         ptr = self.hip.malloc(size)
         self._allocations.append(ptr)
         return ptr
 
     def free(self, ptr: int):
+        self._ensure_device()
         self.hip.free(ptr)
         if ptr in self._allocations:
             self._allocations.remove(ptr)
 
     def upload(self, device_ptr: int, host_data: bytes):
+        self._ensure_device()
         self.hip.memcpy_h2d(device_ptr, host_data, len(host_data))
 
     def download(self, device_ptr: int, size: int) -> bytes:
+        self._ensure_device()
         buf = ctypes.create_string_buffer(size)
         self.hip.memcpy_d2h(buf, device_ptr, size)
         return buf.raw
 
+    def memset(self, ptr: int, value: int, size: int):
+        self._ensure_device()
+        self.hip.memset(ptr, value, size)
+
+    def memcpy_d2d(self, dst: int, src: int, size: int):
+        self._ensure_device()
+        self.hip.memcpy_d2d(dst, src, size)
+
     def synchronize(self):
+        self._ensure_device()
         self.hip.synchronize()
 
     def load_hsaco(self, path: str) -> int:
         """Load HSACO and cache the module."""
+        self._ensure_device()
         if path not in self._modules:
             self._modules[path] = self.hip.module_load(path)
         return self._modules[path]
 
     def get_kernel(self, module: int, name: str) -> int:
+        self._ensure_device()
         return self.hip.module_get_function(module, name)
 
+    def create_stream(self) -> int:
+        """Create a HIP stream on this device."""
+        self.hip.set_device(self.device_id)
+        return self.hip.stream_create()
+
+    def create_event(self) -> int:
+        """Create a HIP event on this device."""
+        self.hip.set_device(self.device_id)
+        return self.hip.event_create()
+
     def launch(self, func: int, grid: tuple, block: tuple,
-               kernel_params: list, shared_mem: int = 0):
+               kernel_params: list, shared_mem: int = 0,
+               stream: int = 0):
         """Launch kernel. kernel_params is a list of ctypes values."""
-        self.hip.launch_kernel(func, grid, block, kernel_params, shared_mem)
+        self.hip.set_device(self.device_id)
+        self.hip.launch_kernel(func, grid, block, kernel_params,
+                               shared_mem, stream)
 
     def cleanup(self):
         for ptr in self._allocations:
