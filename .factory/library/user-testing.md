@@ -97,6 +97,42 @@ ssh -o ConnectTimeout=20 -J root@wittymantis.netbird.selfhosted root@192.168.1.1
 - `tests/test_qknorm_rope.py` — VAL-DLR-005, VAL-DLR-010
 - `tests/test_m1_integration.py` — VAL-DLR-006, VAL-DLR-007, VAL-DLR-008, VAL-DLR-009, VAL-CROSS-001, VAL-CROSS-007
 
+## Flow Validator Guidance: GPU Kernel - w8a8-w4a8-flashattn
+
+**Surface**: SSH to LXC (mi60-jupyter at 192.168.1.189), run Python test scripts on MI60 GPU
+
+**SSH Setup** (required for every command):
+```bash
+export SSH_AUTH_SOCK=$(ls /private/tmp/com.apple.launchd.*/Listeners 2>/dev/null | head -1)
+ssh -o ConnectTimeout=20 -o StrictHostKeyChecking=no -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'COMMAND'
+```
+
+**Isolation rules**:
+- Run tests sequentially within a subagent (GPU is single, VRAM shared)
+- ~58% VRAM (~18GB of 32GB) already in use — individual kernel tests allocate modest VRAM and are fine
+- Integration tests (engine.py) may need more VRAM — run in separate batch
+- Do NOT kill existing GPU processes
+
+**Kernels are pre-built** in `/root/mi50grad/build/kernels/`:
+- `activation_quant.so` — for VAL-W8A8-003
+- `gemv_w8a8.so` — for VAL-W8A8-001, VAL-W8A8-004
+- `gemm_w8a8.so` — for VAL-W8A8-002
+- `gemv_w4a8.so` — for VAL-W4A8-001, VAL-W4A8-002, VAL-W4A8-003
+- `flash_attn_256.so` and `flash_attn_256_tuned.hsaco` — for VAL-FA-001, VAL-FA-002
+
+**Key test files for w8a8-w4a8-flashattn milestone**:
+- `tests/test_activation_quant.py` — VAL-W8A8-003
+- `tests/test_w8a8_gemv.py` — VAL-W8A8-001, VAL-W8A8-004
+- `tests/test_w8a8_gemm.py` — VAL-W8A8-002
+- `tests/bench_w8a8.py` — VAL-W8A8-004
+- `tests/test_w4a8_gemv.py` — VAL-W4A8-001, VAL-W4A8-003
+- `tests/test_w4a8_repack.py` — VAL-W4A8-002
+- `tests/bench_w4a8.py` — VAL-W4A8-003
+- `tests/test_flashattn_tune.py` — VAL-FA-001, VAL-FA-002
+- `tests/test_engine_w8a8_w4a8.py` — VAL-ENG-001, VAL-ENG-002
+
+---
+
 ## Flow Validator Guidance: GPU Kernel - core-kernel-optimization
 
 **Surface**: SSH to LXC (mi60-jupyter at 192.168.1.189), run Python test scripts on MI60 GPU

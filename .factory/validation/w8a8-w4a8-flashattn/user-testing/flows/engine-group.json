@@ -1,0 +1,16 @@
+{
+  "groupId": "engine-group",
+  "assertions": {
+    "VAL-ENG-001": {
+      "status": "pass",
+      "evidence": "test_engine_w8a8_w4a8.py: 10/10 tests passed. engine_init_w8a8: PASS (w8a8_ready=True, activation_quant + gemv_w8a8 kernels loaded). engine_init_w4a8: PASS (w4a8_ready=True, activation_quant + gemv_w4a8 kernels loaded). decode_step_w8a8: PASS (output shape=(256,), finite, max_abs=3.2715). decode_step_w4a8: PASS (output shape=(256,), finite, max_abs=3.2871). Both W8A8 and W4A8 decode steps complete successfully."
+    },
+    "VAL-ENG-002": {
+      "status": "pass",
+      "evidence": "test_engine_w8a8_w4a8.py: weight_loader_w8a8: PASS — W_int8 shape=(512,256), dtype=int8, scale_w shape=(512,), dtype=float32, range=[-127,111], positive scales, round-trip rel_err=0.0039<0.1. weight_loader_w4a8: PASS — W_packed shape=(512,32), dtype=uint32, scale_grp shape=(2,512), dtype=float16, nibble range=[-8,7]. invalid_quant_format: ValueError raised correctly."
+    }
+  },
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "python"]
+}

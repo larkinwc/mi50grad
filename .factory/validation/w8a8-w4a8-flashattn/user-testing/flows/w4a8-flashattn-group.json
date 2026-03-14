@@ -1,0 +1,28 @@
+{
+  "groupId": "w4a8-flashattn-group",
+  "assertions": {
+    "VAL-W4A8-001": {
+      "status": "pass",
+      "evidence": "test_w4a8_gemv.py: ALL TESTS PASSED. gemv_w4a8_dot4: 4096x4096 max_abs=0.00195 rel_err=0.048%, 11008x4096 max_abs=0.00195 rel_err=0.049%. gemv_w4a8_dot8 (v_dot8_i32_i4): same results. gemv_w4a8_grouped (group_size=128): 4096x4096 max_abs=0.00091, 11008x4096 max_abs=0.00104. Both v_dot8_i32_i4 and v_dot4_i32_i8 intrinsics verified in source."
+    },
+    "VAL-W4A8-002": {
+      "status": "pass",
+      "evidence": "test_w4a8_repack.py: ALL TESTS PASSED. Simple round-trip: 11008x4096 max_err=0.4212 max_rel=7.14% (expected INT4 quantization noise). GPTQ format repack round-trip: max_abs=0.00e+00 rel_err=0.00e+00 PASS. Nibble packing correctness: all 8 nibbles correct. Extreme INT4 values preserved. Scale correctness verified."
+    },
+    "VAL-W4A8-003": {
+      "status": "pass",
+      "evidence": "bench_w4a8.py: W4A8 achieves measurable throughput via v_dot8_i32_i4. N=11008,K=4096: W4A8 dot4=58.39us (1544 TOPS), W4A8 dot8=85.89us (1050 TOPS), W4A16 best=72.36us → W4A8 dot4 is 1.24x FASTER than W4A16. N=4096,K=4096: W4A8 dot4=58.80us vs W4A16 v3_t16=30.34us (W4A16 faster for this shape, but W4A8 competitive vs v3_t4=75.03us)."
+    },
+    "VAL-FA-001": {
+      "status": "pass",
+      "evidence": "test_flashattn_tune.py: ALL CORRECTNESS PASSED. Decode: all 7 test configs (kv_len=256/1024/4096, head configs) max_err=0.00000. Prefill: seq=128 max_err=0.00006, seq=512 max_err=0.00012. All within 1e-3 threshold."
+    },
+    "VAL-FA-002": {
+      "status": "pass",
+      "evidence": "test_flashattn_tune.py benchmark: Decode KV=256: tuned=75.1us vs original=221.5us (2.95x speedup). KV=1024: tuned=222.8us vs original=1237.6us (5.56x speedup). KV=4096: tuned=857.0us vs original=4928.7us (5.75x speedup). All KV cache sizes show clear improvement. Optimization: 4 wavefronts split KV range for parallel online softmax."
+    }
+  },
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "python"]
+}

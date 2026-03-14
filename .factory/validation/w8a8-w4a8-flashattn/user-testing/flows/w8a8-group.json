@@ -1,0 +1,26 @@
+{
+  "groupId": "w8a8-group",
+  "assertions": {
+    "VAL-W8A8-001": {
+      "status": "pass",
+      "evidence": "test_w8a8_gemv.py: ALL TESTS PASSED. 4096x4096: fp16_rel=0.19% max_abs=0.00767. 11008x4096: fp16_rel=0.18% max_abs=0.00775. v_dot4_i32_i8 intrinsic verified in source. Perf: N=4096 78.51us 213.9 GB/s, N=11008 118.24us 381.5 GB/s."
+    },
+    "VAL-W8A8-002": {
+      "status": "pass",
+      "evidence": "test_w8a8_gemm.py: ALL TESTS PASSED. 128x4096x4096 max_abs=0.00781 max_rel=0.05%. 4096x4096x4096 max_abs=0.01548 max_rel=0.05%. All tile boundary and K-alignment tests pass. Perf: 128x4096^2=3.417 TFLOPS, 4096^3=12.188 TFLOPS."
+    },
+    "VAL-W8A8-003": {
+      "status": "pass",
+      "evidence": "test_activation_quant.py: ALL TESTS PASSED. Scales match reference for all sizes (n=64..11008). Round-trip error within noise budget: n=4096 max_err=0.030712 < budget 0.036854, n=11008 max_err=0.032080 < budget 0.038497. Perf: n=4096 37.42us 0.3 GB/s."
+    },
+    "VAL-W8A8-004": {
+      "status": "fail",
+      "evidence": "bench_w8a8.py: W8A8 is NOT competitive vs W4A16. N=4096,K=4096: W8A8=74.96us vs W4A16(v3_t16)=30.33us → W4A16 is 2.47x FASTER. N=11008,K=4096: W8A8=114.56us vs W4A16(v3_t16)=63.74us → W4A16 is 1.80x FASTER. Root cause: W8A8 reads 2x weight data (INT8 vs INT4) in bandwidth-bound decode regime. W8A8 is expected to be competitive only for prefill (M>1) where compute density increases."
+    }
+  },
+  "frictions": [
+    "VAL-W8A8-004 criterion 'competitive or better' is ambiguous — W8A8 has physically 2x weight bandwidth versus W4A8/W4A16. For decode (M=1) workloads this is a fundamental limitation."
+  ],
+  "blockers": [],
+  "toolsUsed": ["ssh", "python"]
+}

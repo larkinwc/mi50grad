@@ -1,0 +1,43 @@
+{
+  "milestone": "w8a8-w4a8-flashattn",
+  "round": 1,
+  "status": "fail",
+  "assertionsSummary": {
+    "total": 11,
+    "passed": 10,
+    "failed": 1,
+    "blocked": 0
+  },
+  "passedAssertions": [
+    "VAL-W8A8-001",
+    "VAL-W8A8-002",
+    "VAL-W8A8-003",
+    "VAL-W4A8-001",
+    "VAL-W4A8-002",
+    "VAL-W4A8-003",
+    "VAL-FA-001",
+    "VAL-FA-002",
+    "VAL-ENG-001",
+    "VAL-ENG-002"
+  ],
+  "failedAssertions": [
+    {
+      "id": "VAL-W8A8-004",
+      "reason": "W8A8 GEMV is NOT competitive vs W4A16: for N=4096,K=4096 W8A8=74.96us vs W4A16(v3_t16)=30.33us (2.47x slower), for N=11008,K=4096 W8A8=114.56us vs W4A16=63.74us (1.80x slower). Root cause: W8A8 uses INT8 weights (2x more weight data than W4A16's INT4 weights) so it is bandwidth-limited in the decode (M=1) regime. The criterion 'competitive or better latency' is not satisfied — W8A8 is fundamentally slower for decode GEMV due to 2x weight bandwidth."
+    }
+  ],
+  "blockedAssertions": [],
+  "appliedUpdates": [
+    {
+      "target": "user-testing.md",
+      "description": "Added 'Flow Validator Guidance: GPU Kernel - w8a8-w4a8-flashattn' section with test files mapping for all 11 assertions in this milestone.",
+      "source": "setup"
+    },
+    {
+      "target": "build/kernels/gemv_w8a8.so",
+      "description": "Built missing gemv_w8a8.so on LXC (hsaco existed but .so was missing). Required for Python ctypes loading.",
+      "source": "setup"
+    }
+  ],
+  "previousRound": null
+}
