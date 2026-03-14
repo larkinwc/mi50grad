@@ -515,3 +515,68 @@ New parameter order: `(out_gemv, hidden_out, hidden, residual, weight, eps, B_q4
 - **Lesson:** Multi-block fused skip+norm+GEMV requires cooperative groups for efficiency.
   Without global barrier, each block must independently compute skip+norm, causing O(N*K) reads
   instead of O(K) for the norm phase. Not worth it for N>=128 blocks.
+
+---
+
+## Fused SiLU+multiply in Prefill GEMM Epilogue (fused-silu-prefill-gemm)
+
+**Files:**
+- `src/kernels/gemm_fp16_prefill_silu.hip`: Strategy B — epilogue fusion (gate GEMM + silu_epilogue GEMM)
+- `src/kernels/gemm_fp16_prefill_silu_dual.hip`: Strategy A — dual output (one kernel computes gate+up+silu)
+- `tests/test_gemm_silu_fused.py`: Correctness and benchmark tests for both strategies
+
+**Strategy B (gemm_fp16_prefill_silu_epilogue):**
+- Same structure as `gemm_fp16_prefill` but takes extra `gate_buf` pointer
+- In the epilogue, reads gate_buf[row,col] from HBM, applies SiLU, multiplies by GEMM result, writes output
+- Grid: (ceil(N/64), ceil(M/64), 1), Block: (256, 1, 1) — same as gemm_fp16_prefill
+- Correctness: max_abs_err = 0.0039 (well below 1e-2 threshold)
+- Performance: ~0.99x baseline (neutral) — GEMM is compute-dominated at this shape
+
+**Strategy A (gemm_fp16_prefill_silu_dual):**
+- Reduced tile: TILE_N=32 (half of original 64) to fit both B_gate and B_up in LDS
+- THREAD_N=2 (half of original 4) — dual FP32 accumulators (gate + up)
+- LDS layout: A[64×18] + B_gate[32×18] + B_up[32×18] = 4608 bytes (same total as original!)
+- Load split: tid<128→A, 128≤tid<192→B_gate, 192≤tid<256→B_up
+- Grid: (ceil(N/32), ceil(M/64), 1), Block: (256, 1, 1) — 2x WGs in N dimension
+- Epilogue: `silu(gate_acc) * up_acc` before writing, no intermediate HBM writes
+- Correctness: max_abs_err = 0.0020 (well below 1e-2 threshold)
+- Performance: ~0.78x baseline (SLOWER) — 2x WG overhead from TILE_N=32
+
+**Why fusion doesn't provide wall-clock speedup at M=128, N=11008, K=5120:**
+- Each GEMM takes ~1700-1800us (compute-dominated at 6-7 TFLOPS)
+- HBM traffic saved by fusion (~5-12MB) is negligible vs 225MB total weight traffic
+- The GEMM kernel is operating at ~7% of theoretical HBM peak — it's NOT bandwidth-limited
+- Strategy A adds more WGs (2x) which increases scheduling overhead
+
+**When SiLU fusion WOULD help:**
+- Significantly larger M (e.g., M=2048+) where GEMM becomes more bandwidth-limited
+- Smaller N (narrower projections where weight matrices are smaller than activation traffic)
+- SiLU fusion would help most when the activation matrices dominate over weight matrices
+- For decode (M=1): the existing `gemv_int4_dual.hip` already fuses gate+up+SiLU efficiently
+
+**HBM traffic analysis (M=128, N=11008, K=5120):**
+```
+Baseline (3 launches):
+  Reads:  A(1.3MB)*2 + W_gate(112.7MB) + W_up(112.7MB) + gate(2.8MB) + up(2.8MB) = 232.5MB
+  Writes: gate(2.8MB) + up(2.8MB) + out(2.8MB) = 8.4MB
+  Total:  ~241MB
+
+Strategy B (2 launches):
+  Reads:  A(1.3MB)*2 + W_gate(112.7MB) + W_up(112.7MB) + gate(2.8MB) = 230.8MB
+  Writes: gate(2.8MB) + out(2.8MB) = 5.6MB
+  Total:  ~236MB (saves ~5.4MB)
+
+Strategy A (1 launch):
+  Reads:  A(1.3MB) + W_gate(112.7MB) + W_up(112.7MB) = 226.7MB
+  Writes: out(2.8MB) = 2.8MB
+  Total:  ~230MB (saves ~12MB vs baseline)
+```
+
+**Key lesson for future workers:**
+Kernel fusion reduces HBM traffic, which helps when the kernel is bandwidth-limited.
+For FP16 GEMM with M=128, N=11008, K=5120 on MI60/gfx906, the kernel runs at ~6-7 TFLOPS
+(~7% of theoretical 26.8 TFLOPS peak and ~7% of 857GB/s HBM peak), suggesting it is both
+compute AND bandwidth limited but neither at a level where the fusion savings matter.
+The SiLU kernel itself (40us) is a small fraction of the total (3580us), so eliminating it
+doesn't produce measurable improvement.
+
