@@ -1,0 +1,41 @@
+{
+  "featureId": "int4-gemm-onthefly-dequant",
+  "milestone": "compute-kernels",
+  "status": "pass",
+  "issues": [
+    {
+      "severity": "non_blocking",
+      "description": "The inner compute loop `#pragma unroll 4` over TILE_K=32 iterations contains a conditional `if (g != cur_group[j])` for per-group scale/zero updates. Since group_size=128 and TILE_K=32, the group boundary is never crossed within a single TILE_K iteration (32 < 128), making this conditional always false after the first tile's first k. However, if group_size < TILE_K (e.g., group_size=16 or 8), this conditional would be evaluated per k step, adding branch overhead. The current usage at group_size=128 is safe.",
+      "file": "src/kernels/gemm_int4_prefill_v2.hip",
+      "line": null,
+      "suggestedFix": "For correctness with small group sizes: the current approach is correct. For performance, if group_size >= TILE_K is guaranteed (as in the test configurations), the per-k conditional can be hoisted out of the inner loop. Consider adding a comment asserting group_size >= TILE_K assumption."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "The smem_A tile uses `[TILE_M * TILE_K]` layout (64*32=2048 halfs, 4096 bytes) without XOR-swizzling, unlike the gemm_fp16_prefill.hip which uses XOR-swizzled layout with stride-18 to avoid LDS bank conflicts. For the A tile load pattern in v2, row-major access without swizzle could cause LDS bank conflicts on gfx906 if multiple threads in a wavefront access elements in the same bank. The 2.07x speedup vs original suggests this is not a dominant bottleneck in practice, possibly because the B tile dequant compute is the throughput limiter.",
+      "file": "src/kernels/gemm_int4_prefill_v2.hip",
+      "line": null,
+      "suggestedFix": "Consider adding XOR-swizzle to smem_A (matching the pattern from gemm_fp16_prefill.hip) to eliminate potential LDS bank conflicts. May yield additional speedup beyond the current 2.07x."
+    },
+    {
+      "severity": "suggestion",
+      "description": "The v_dot8_i32_i4 path was listed as an alternative approach in the feature description but was not tried; only the nibble extract + FP16 FMA path was implemented. Given that __builtin_amdgcn_sdot8 provides 8 INT4xINT4 products per instruction (7.58 instr/cycle), and the current nibble extract + FP16 FMA does individual conversions, the sdot8 path could potentially be faster. However, the 2.07x speedup vs original is already strong, and implementing the sdot8 activation-splitting approach would require quantizing A on-the-fly, adding complexity.",
+      "file": "src/kernels/gemm_int4_prefill_v2.hip",
+      "line": null,
+      "suggestedFix": "The current nibble+FMA approach is correct and fast (2.07x speedup). The sdot8 path could be explored as a future v3 optimization if further speedup is needed."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "target": "library",
+      "observation": "INT4 GEMM v2 (gemm_int4_prefill_v2.hip) achieves 2.07x speedup over original by storing B tile PACKED in LDS (uint32, 8 INT4/word): 1024 bytes vs 4096 bytes FP16. This 4x LDS traffic reduction for B tiles is the key optimization. Dequantization via __builtin_amdgcn_ubfe on-the-fly in the compute loop. The packed B layout is [TILE_N, TILE_K/8] uint32 with row=column_index, col=packed_word_index.",
+      "rationale": "Important design pattern for future INT4 kernel workers: packed LDS storage with on-the-fly dequant is significantly faster than staging dequantized FP16 in LDS."
+    },
+    {
+      "target": "library",
+      "observation": "gemm_int4_prefill_v2.hip compiles with --genco (HSACO) format, not -shared -fPIC (.so format). The launcher must use build_hip_hsaco() not build_hip_so() for this kernel. This is consistent with other kernels that use HSACO loading via dev.load_hsaco().",
+      "rationale": "Workers loading this kernel need to use the correct compilation command to avoid loader failures."
+    }
+  ],
+  "summary": "Feature PASSED review. gemm_int4_prefill_v2.hip correctly implements on-the-fly INT4 dequantization by storing B weights packed (uint32) in LDS, reducing B tile LDS traffic by 4x. Uses nibble extraction via __builtin_amdgcn_ubfe with cached per-group scale/zero. Correctness verified (max_abs_err=9.77e-4 << 1e-2 threshold) at both test shapes. Achieves 2.07x speedup over original. Issues are non-blocking and reflect minor optimization opportunities."
+}

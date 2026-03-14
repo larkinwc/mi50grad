@@ -23,6 +23,10 @@ Overlap global load of tile t+1 with compute of tile t:
 - Two LDS buffer sets: ping (smem_A0/B0) and pong (smem_A1/B1)
 - Total LDS: 2 * 4608 = 9216 bytes (still < 32KB)
 - Requires careful __syncthreads() placement between phases
+- **Benchmark result** (MI60, M=128, N=6144, K=5120): 1.06-1.08x speedup over single-buffered
+- **Key insight**: For small M=128, double-buffering benefit is modest because the kernel is
+  occupancy-limited rather than memory-bandwidth-limited. Larger M (512+) would benefit more.
+- **Kernel:** `gemm_fp16_prefill_db` in `gemm_fp16_prefill.hip` (alongside original `gemm_fp16_prefill`)
 
 ### INT4 On-the-Fly Dequantization
 Instead of extracting nibbles to FP16 in LDS load phase:

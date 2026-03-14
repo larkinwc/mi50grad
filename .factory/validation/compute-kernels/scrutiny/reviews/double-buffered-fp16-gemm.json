@@ -1,0 +1,36 @@
+{
+  "featureId": "double-buffered-fp16-gemm",
+  "milestone": "compute-kernels",
+  "status": "pass",
+  "issues": [
+    {
+      "severity": "non_blocking",
+      "description": "The double-buffering implementation uses a bool `use_buf0 = ((t & 1) == 0)` with two separate if-else branches calling COMPUTE_TILE and LOAD_TILE macros. This means at runtime the compiler sees two divergent paths and cannot guarantee the branches will be folded. Modern LLVM/HCC should handle this, but on gfx906, if the compiler doesn't unify the two LOAD_TILE/COMPUTE_TILE paths, there could be code bloat from the branch. The approach is functionally correct and achieves 1.06-1.08x speedup.",
+      "file": "src/kernels/gemm_fp16_prefill.hip",
+      "line": null,
+      "suggestedFix": "Consider using pointer arrays `smem_A[2]` and `smem_B[2]` and indexing by `t & 1`, which would let the compiler generate a single code path. Minor optimization."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "The double-buffered kernel uses a macro `LOAD_TILE` and `COMPUTE_TILE` approach which introduces `_Pragma(\"unroll\")` strings inside macros. While this compiles correctly, it's harder to read and maintain than inline functions or lambda-style helpers. The LOAD_TILE macro does not align the double-sync semantics with the HIP memory model explicitly (no `__threadfence_block` or `__builtin_amdgcn_ds_permute` for async hints), so the 'overlap' is really software-pipelining at the instruction scheduler level rather than true async loading.",
+      "file": "src/kernels/gemm_fp16_prefill.hip",
+      "line": null,
+      "suggestedFix": "Non-critical. The measured 1.06-1.08x speedup confirms the scheduler is indeed overlapping loads with compute. Future versions could use `__builtin_amdgcn_s_barrier` + explicit prefetch instructions for more explicit overlap."
+    },
+    {
+      "severity": "suggestion",
+      "description": "The 1.06-1.08x speedup at (128,6144,5120) is modest. For small M=128, the kernel is likely occupancy-limited rather than bandwidth-limited. The double-buffering primarily helps when the kernel is memory-bandwidth-bound; at small M the compute/memory ratio may already favor compute. This is expected behavior and correctly documented in the handoff.",
+      "file": "tests/test_gemm_fp16_db.py",
+      "line": null,
+      "suggestedFix": "Consider benchmarking at larger M values (e.g., M=512, M=2048) where double-buffering may show larger gains. Not required for current validation."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "target": "library",
+      "observation": "Double-buffered FP16 GEMM (gemm_fp16_prefill_db) achieves ~1.06-1.08x speedup at M=128 on gfx906. For prefill-phase GEMM at typical LLM shapes (M=128, N=6144, K=5120), the speedup is modest because small-M workloads are occupancy-limited rather than pure memory-bandwidth-limited. Double-buffering benefits more at larger M values.",
+      "rationale": "Factual performance insight for future workers optimizing GEMM kernels."
+    }
+  ],
+  "summary": "Feature PASSED review. gemm_fp16_prefill_db correctly implements double-buffered K-loop alongside the existing gemm_fp16_prefill. Uses ping/pong LDS buffers (9216 bytes total, < 32KB limit) with the same XOR-swizzled layout and v_dot2_f32_f16 compute. All 6 correctness tests pass (max_abs_err < 1e-3, threshold 1e-2). Achieves 1.06-1.08x speedup at (128,6144,5120). Original kernel preserved unmodified (backward compatible). Issues found are non-blocking."
+}

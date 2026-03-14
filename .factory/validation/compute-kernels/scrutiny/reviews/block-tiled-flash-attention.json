@@ -1,0 +1,41 @@
+{
+  "featureId": "block-tiled-flash-attention",
+  "milestone": "compute-kernels",
+  "status": "pass",
+  "issues": [
+    {
+      "severity": "non_blocking",
+      "description": "The double __syncthreads() at the end of the KV block loop body is present: one at the end of step 5 (PV accumulate) and one at the top of the next iteration (before K load). The second __syncthreads() before the loop condition check means the loop always has an extra sync on the last iteration even when not needed. This is harmless but a minor inefficiency.",
+      "file": "src/kernels/flash_attn_256_v3.hip",
+      "line": null,
+      "suggestedFix": "Minor: the final __syncthreads() in the PV accumulate section (step 5) and the one at the start of the next K tile load are separated by computation. Consider whether the final sync can be elided for the last tile. Functionally correct as-is."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "BLOCK_M was reduced from the planned 64 to 16 due to VGPR pressure on gfx906. The feature description asked for Br=64 as a starting point with fallback to Br=32. The worker chose Br=16 directly, skipping Br=32. While the VGPR reasoning is sound, it wasn't experimentally verified whether Br=32 would fit. At Br=32, each wavefront would have 8 Q rows with 8-thread reduction over 32 dims/thread = ~80 VGPRs, which is at the upper edge but might work. The design documentation in the kernel header correctly explains the choice.",
+      "file": "src/kernels/flash_attn_256_v3.hip",
+      "line": null,
+      "suggestedFix": "Acceptable engineering tradeoff. BLOCK_M=16 achieves 1.6-1.9x speedup already. Exploring BLOCK_M=32 could be a future optimization task."
+    },
+    {
+      "severity": "suggestion",
+      "description": "The fdot2 call in the score computation converts float to half2 on-the-fly: `__half2(__float2half(qreg[d]), __float2half(qreg[d+1]))`. This means qreg is stored as FP32 and converted each time it's used in fdot2. Storing qreg as FP16 (or __half2) instead could avoid repeated FP32->FP16 conversions in the hot inner loop, saving ~DIMS_PER_PART/2 = 8 conversions per K tile row.",
+      "file": "src/kernels/flash_attn_256_v3.hip",
+      "line": null,
+      "suggestedFix": "Store `qreg` as `__half2 qreg[DIMS_PER_PART/2]` to avoid repeated __float2half conversions in the score loop. Minor optimization; correctness is unaffected."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "target": "library",
+      "observation": "BLOCK_M=16 (not 64) is the correct tile size for FlashAttention prefill on gfx906. With HEAD_DIM=256, using BLOCK_M=16 allows 4 Q rows per wavefront (16 dims/thread) → ~50 VGPRs total, maintaining healthy occupancy. The requested Br=64 would require 64 Q-dims/thread in registers → exceeds the 64-80 VGPR budget.",
+      "rationale": "This is a factual design constraint discovered during implementation that should be documented in the architecture library for future workers."
+    },
+    {
+      "target": "library",
+      "observation": "FlashAttention v3 prefill uses BLOCK_M=16 / BLOCK_N=16 tile sizes. Grid: (num_heads, ceil(num_q_rows/16), 1), Block: (256, 1, 1). This is different from the tuned prefill which uses grid_y = ceil(num_q_rows/4). Test scripts must use the correct grid calculation.",
+      "rationale": "Important for future workers who need to integrate or benchmark this kernel."
+    }
+  ],
+  "summary": "Feature PASSED review. flash_attn_256_v3.hip correctly implements block-tiled FlashAttention-2 prefill with BLOCK_M=16 (adapted from planned 64 due to gfx906 VGPR constraints), BLOCK_N=16, v_dot2_f32_f16 for score computation, vectorized float4 global loads for K/V, online softmax with FP32 accumulators, GQA and causal masking. All correctness tests pass (max_err < 5e-3 vs 1e-2 threshold) and performance shows 1.6-1.9x speedup at seq=128-512 over tuned baseline. Decode kernel is an unchanged copy, regression tests pass. Issues found are non-blocking."
+}
