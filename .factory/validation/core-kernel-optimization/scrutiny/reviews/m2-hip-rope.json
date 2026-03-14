@@ -1,0 +1,39 @@
+{
+  "featureId": "m2-hip-rope",
+  "milestone": "core-kernel-optimization",
+  "workerSession": "d3803efb-a2a8-438e-a5f1-5a3be118517c",
+  "commitId": "776dc9a",
+  "status": "pass",
+  "assertionsCovered": ["VAL-ROPE-001", "VAL-ROPE-002"],
+  "assertionResults": {
+    "VAL-ROPE-001": {
+      "status": "pass",
+      "evidence": "All 8 test cases pass. Single-token correctness (6 cases): max_err=0.000000 (exact FP16 match vs CPU reference). Multi-token correctness (2 cases): max_err<=0.000244. All within 1e-3 tolerance. Tested for head_dim=128 and head_dim=256 as required. HIP kernel is actually MORE accurate than assembly (HIP max_err vs ref=0, ASM max_err vs ref=0.000977 due to FP16 intermediate in assembly vs FP32 in HIP)."
+    },
+    "VAL-ROPE-002": {
+      "status": "pass",
+      "evidence": "Engine code inspection confirms: _init_rope_hip() function defined, _rope_hip flag used, rope_fp16_v2 referenced, rope_v2.hip source exists, engine wired to use HIP RoPE. 5/5 engine checks pass in test."
+    }
+  },
+  "codeQualityIssues": [],
+  "nonBlockingIssues": [
+    {
+      "severity": "non_blocking",
+      "description": "Assembly rope.s has a pre-existing bug for multi-token use (outputs zeros for token_idx>0). The HIP kernel correctly handles multi-token. This is a pre-existing issue not introduced by this feature.",
+      "suggestedFix": "No action required — assembly rope is now backup and the HIP kernel handles multi-token correctly."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "_launch_rope() (standalone RoPE) is rarely called in practice — decode path uses fused _launch_qknorm_rope(). The HIP kernel is wired and correct but may not be exercised in normal decode operation.",
+      "suggestedFix": "No action needed — the kernel is correctly wired and will be used if called."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "observation": "The cos/sin table stride convention (head_dim/2 vs half_rotary) must match between the assembly kernel interface and HIP kernel interface. This is a subtle API mismatch risk when replacing assembly with HIP.",
+      "target": "library",
+      "suggestedContent": "Add to architecture.md: 'RoPE kernel API: cos_tab/sin_tab indexed as [num_tokens, head_dim/2]. The half_rotary parameter controls how many dimension pairs are rotated; non-rotated pairs are passed through unchanged. When implementing HIP alternatives to assembly kernels, carefully verify cos/sin table stride matches.'"
+    }
+  ],
+  "summary": "Feature fully satisfies VAL-ROPE-001 and VAL-ROPE-002. HIP RoPE kernel is exact match vs CPU reference (max_err=0.000000) and more accurate than assembly. Vectorized half2 loads correctly implemented. Engine wiring confirmed. No blocking issues."
+}

@@ -1,0 +1,47 @@
+{
+  "featureId": "m2-int4-gemv-optimize",
+  "milestone": "core-kernel-optimization",
+  "workerSession": "303551e8-47f3-4421-b3d9-cc0bb8081b91",
+  "commitId": "876a8e2",
+  "status": "pass",
+  "assertionsCovered": ["VAL-INT4-001", "VAL-INT4-002", "VAL-INT4-003", "VAL-INT4-004"],
+  "assertionResults": {
+    "VAL-INT4-001": {
+      "status": "pass",
+      "evidence": "Optimized v2_fused and v3 kernels pass correctness for all Qwen dims (N=4096,K=4096: max_err=0.000482; N=11008,K=4096: max_err=0.000484; N=5120,K=5120: max_err=0.000488). All well within 1e-2 tolerance. ubfe instruction (__builtin_amdgcn_ubfe) confirmed present in both v2 and v3 source."
+    },
+    "VAL-INT4-002": {
+      "status": "pass",
+      "evidence": "v3_t16 achieves 29.5us vs 36.7us v2_fused for N=4096 (1.24x speedup). N=11008: 64.7us vs 64.9us (essentially tied). Clear performance improvement for the most common decode shape."
+    },
+    "VAL-INT4-003": {
+      "status": "pass",
+      "evidence": "v3 benchmarked vs all variants (t4, t8, t16, dpp). v3_t16 is winner. Engine wired: v3_t16 for non-residual GEMV (gate, up, q, k, v projections); v2_fused for down_proj with residual epilogue. Engine inspection confirms _gemv_int4_v3 flag and correct dispatch."
+    },
+    "VAL-INT4-004": {
+      "status": "pass",
+      "evidence": "v3_dpp variant (DPP-based reduction using __shfl_xor butterfly + LDS for cross-warp) implemented and produces correct output (max_err=0.000482 for N=4096). DPP is explored but slower than t16 (67.7us vs 29.5us) due to high WG count overhead. v3_t16 chosen as default."
+    }
+  },
+  "codeQualityIssues": [],
+  "nonBlockingIssues": [
+    {
+      "severity": "non_blocking",
+      "description": "DPP reduction (v3_dpp) is 1.8-2x slower than v3_t16 due to WG count overhead. The kernel is kept for reference but not the default. This is documented and the right decision.",
+      "suggestedFix": "No action needed - already documented."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "Benchmark results can vary with GPU warmup state (35-67us range). Mitigated with 10 warmup iterations in test code.",
+      "suggestedFix": "Already handled in tests."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "observation": "For optimization-only features, TDD approach should start with benchmark capturing baseline numbers before optimizing, not failing tests.",
+      "target": "skill",
+      "suggestedContent": "Skill kernel-optimization-worker step 3 (TDD): For optimization-only features where a kernel already exists and tests would pass from the start, TDD means writing the benchmark first and capturing baseline numbers before optimizing. The 'failing test' is the performance test that doesn't meet the target TFLOPS/bandwidth."
+    }
+  ],
+  "summary": "Feature fully satisfies VAL-INT4-001/002/003/004. INT4 GEMV optimized with ubfe nibble extraction and power-of-2 shift. v3_t16 cooperative reduction is 1.24x faster for primary decode shape and correctly wired into engine. DPP explored but correctly identified as slower. No blocking issues."
+}
