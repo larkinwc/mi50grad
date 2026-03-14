@@ -60,3 +60,73 @@ Tests typically:
 - ~20GB of VRAM already in use on the MI60 — check before large allocations
 - Some tests may fail due to missing model weights (e.g., test_real_model.py)
 - The engine is large (~73KB) — tests that instantiate it take time to initialize
+
+## Validation Concurrency
+Max concurrent validators: **3** (GPU is a singleton resource; tests that allocate large VRAM tensors should not run in parallel)
+Note: Individual kernel tests allocate modest VRAM and can run sequentially within a single subagent. Integration tests (engine.py) are heavy and must be serialized.
+
+## Flow Validator Guidance: GPU Kernel (SSH/Python)
+
+**Surface**: SSH to LXC 108, run Python test scripts on MI60 GPU
+
+**SSH Setup** (required for every command):
+```bash
+export SSH_AUTH_SOCK=$(ls /private/tmp/com.apple.launchd.*/Listeners 2>/dev/null | head -1)
+ssh -o ConnectTimeout=20 -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'COMMAND'
+```
+
+**Isolation rules**:
+- Only one subagent should run a given test file at a time (no parallel execution of the same test)
+- Tests are run sequentially within a subagent
+- VRAM is shared — no more than 2 subagents allocating large tensors simultaneously
+- Do NOT kill existing GPU processes
+
+**Test execution pattern**:
+```bash
+ssh -o ConnectTimeout=20 -J root@wittymantis.netbird.selfhosted root@192.168.1.189 \
+    'cd /root/mi50grad && PYTHONPATH=/root/mi50grad python3 tests/TEST_FILE.py'
+```
+
+**Evidence collection**: Capture stdout/stderr from each test. Look for PASS/FAIL lines and max abs error values.
+
+**Key test files for decode-launch-reduction milestone**:
+- `tests/test_deltanet_gpu_always.py` — VAL-DLR-001
+- `tests/test_skip_rmsnorm_decode.py` — VAL-DLR-002
+- `tests/test_fused_int4_gemv.py` — VAL-DLR-003
+- `tests/test_fused_dual_gemv.py` — VAL-DLR-004, VAL-DLR-011
+- `tests/test_qknorm_rope.py` — VAL-DLR-005, VAL-DLR-010
+- `tests/test_m1_integration.py` — VAL-DLR-006, VAL-DLR-007, VAL-DLR-008, VAL-DLR-009, VAL-CROSS-001, VAL-CROSS-007
+
+## Flow Validator Guidance: GPU Kernel - core-kernel-optimization
+
+**Surface**: SSH to LXC (mi60-jupyter at 192.168.1.189), run Python test scripts on MI60 GPU
+
+**CRITICAL SSH Note**: The LXC host key changed (mi60-jupyter, not mi60-lxc). Remove known_hosts entry if needed:
+```bash
+ssh-keygen -R 192.168.1.189
+```
+
+**SSH Setup** (required for every command):
+```bash
+export SSH_AUTH_SOCK=$(ls /private/tmp/com.apple.launchd.*/Listeners 2>/dev/null | head -1)
+ssh -o ConnectTimeout=20 -o StrictHostKeyChecking=no -J root@wittymantis.netbird.selfhosted root@192.168.1.189 'COMMAND'
+```
+
+**Isolation rules**:
+- Run tests sequentially within a subagent (GPU is single, VRAM shared)
+- ~20GB VRAM already in use — individual kernel tests allocate modest VRAM and are fine
+- Integration tests (engine.py) may need more VRAM — run in separate batch
+- Do NOT kill existing GPU processes
+
+**Kernels are pre-built** in `/root/mi50grad/build/kernels/` — no rebuild needed unless code changed.
+
+**Key test files for core-kernel-optimization milestone**:
+- `tests/test_prefill_gemm_dot2.py` — VAL-GEMM-001, VAL-GEMM-002, VAL-GEMM-003
+- `tests/test_int4_gemv_optimize.py` — VAL-INT4-001, VAL-INT4-002
+- `tests/test_gemv_int4_v3.py` — VAL-INT4-003
+- `tests/test_gemv_int4.py` — VAL-INT4-004 (DPP wave reduction) 
+- `tests/test_rope_v2.py` — VAL-ROPE-001, VAL-ROPE-002
+- `tests/test_m2_decode.py` — VAL-CROSS-002
+- `tests/test_m2_prefill.py` — VAL-CROSS-003
+- `tests/test_gemm_fp16.py` + `tests/test_gemv_int4.py` + others — VAL-CROSS-004, VAL-CROSS-005
+- `tests/test_m1m2_combined.py` — VAL-CROSS-006

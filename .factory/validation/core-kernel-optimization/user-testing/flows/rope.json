@@ -1,0 +1,40 @@
+{
+  "groupId": "rope",
+  "testedAt": "2026-03-13T00:00:00Z",
+  "isolation": {
+    "host": "root@192.168.1.189 via ProxyJump root@wittymantis.netbird.selfhosted",
+    "gpu": "MI60 32GB gfx906",
+    "codeDir": "/root/mi50grad"
+  },
+  "toolsUsed": ["ssh", "python3"],
+  "assertions": [
+    {
+      "id": "VAL-ROPE-001",
+      "title": "HIP RoPE kernel correctness",
+      "status": "pass",
+      "steps": [
+        { "action": "Run test_rope_v2.py comparing HIP vs assembly vs reference", "expected": "max abs error < 1e-3 vs reference for head_dim=128 and head_dim=256", "observed": "HIP vs REF: max_err=0.000000 for head_dim=128 and head_dim=256 (all test cases). All PASS." }
+      ],
+      "evidence": {
+        "output": "head_dim=128 8 Q heads: HIP vs REF max_err=0.000000 PASS; head_dim=256 8 Q heads: HIP vs REF max_err=0.000000 PASS; head_dim=128 full rotary: HIP vs REF max_err=0.000000 PASS; head_dim=256 full rotary: HIP vs REF max_err=0.000000 PASS. ALL TESTS PASSED."
+      },
+      "issues": null
+    },
+    {
+      "id": "VAL-ROPE-002",
+      "title": "HIP RoPE replaces assembly in engine",
+      "status": "pass",
+      "steps": [
+        { "action": "Engine wiring check in test_rope_v2.py", "expected": "Engine uses HIP RoPE (rope_v2.hip)", "observed": "OK: _init_rope_hip function defined; OK: _rope_hip flag used; OK: rope_fp16_v2 referenced; OK: rope_v2.hip referenced; PASS: Engine wired to use HIP RoPE kernel" },
+        { "action": "Runtime verification in test_m1m2_combined.py", "expected": "HIP RoPE active in decode", "observed": "HIP RoPE kernel (rope_v2.hip) loaded — replaces assembly rope.s. PASS: HIP RoPE (rope_v2.hip) active in decode, output is finite (VAL-ROPE-002)" }
+      ],
+      "evidence": {
+        "output": "Test: Engine wiring - HIP RoPE replaces assembly. PASS: Engine wired to use HIP RoPE kernel. VAL-ROPE-001 and VAL-ROPE-002 confirmed."
+      },
+      "issues": null
+    }
+  ],
+  "frictions": [],
+  "blockers": [],
+  "summary": "Tested 2 assertions: 2 passed, 0 failed. HIP RoPE kernel (rope_v2.hip) achieves max_err=0.000000 vs reference for both head_dim=128 and 256. Engine wired to use HIP RoPE replacing assembly rope.s."
+}

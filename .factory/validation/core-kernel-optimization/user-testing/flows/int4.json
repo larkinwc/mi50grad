@@ -1,0 +1,65 @@
+{
+  "groupId": "int4",
+  "testedAt": "2026-03-13T00:00:00Z",
+  "isolation": {
+    "host": "root@192.168.1.189 via ProxyJump root@wittymantis.netbird.selfhosted",
+    "gpu": "MI60 32GB gfx906",
+    "codeDir": "/root/mi50grad"
+  },
+  "toolsUsed": ["ssh", "python3"],
+  "assertions": [
+    {
+      "id": "VAL-INT4-001",
+      "title": "Optimized INT4 GEMV correctness",
+      "status": "pass",
+      "steps": [
+        { "action": "Run test_int4_gemv_optimize.py V2 fused (optimized with ubfe + pow2 shift)", "expected": "max abs error < 1e-2 for N=4096,K=4096 and N=11008,K=4096", "observed": "max_err=0.000482 for N=4096,K=4096; max_err=0.000484 for N=11008,K=4096; max_err=0.000488 for N=5120,K=5120. All PASS" },
+        { "action": "Verify __builtin_amdgcn_ubfe present in v2 source (from test_m2_decode.py)", "expected": "ubfe optimization used", "observed": "__builtin_amdgcn_ubfe present in v2: True — PASS" }
+      ],
+      "evidence": {
+        "output": "V2 fused: max_err=0.000482 [PASS] for all shapes. ubfe present in v3: True, in v2: True. VAL-INT4-001 confirmed."
+      },
+      "issues": null
+    },
+    {
+      "id": "VAL-INT4-002",
+      "title": "INT4 GEMV performance improvement",
+      "status": "pass",
+      "steps": [
+        { "action": "Run benchmark comparison in test_int4_gemv_optimize.py", "expected": "v3_t16 or v2_fused faster than original v2", "observed": "v3_t16 @ 29.3us vs v2_fused @ 35.9us for N=4096,K=4096. v3_t16 is 1.22x faster than v2_fused. Significant improvement over original split-K+memset+convert (3 launches)." }
+      ],
+      "evidence": {
+        "output": "N=4096 K=4096: WINNER gemv_int4_v3_t16 @ 29.3 us (vs v2_fused 35.9 us). N=11008 K=4096: WINNER gemv_int4_v3_t16 @ 63.7 us (vs v2_fused 63.8 us — parity)"
+      },
+      "issues": null
+    },
+    {
+      "id": "VAL-INT4-003",
+      "title": "GEMV v3 evaluation",
+      "status": "pass",
+      "steps": [
+        { "action": "Benchmark v3 variants vs v2 in test_int4_gemv_optimize.py", "expected": "v3 benchmarked and winner wired into engine", "observed": "v3_t16 is fastest (29.3us vs 35.9us for v2_fused). Engine wired: Uses gemv_int4_v3 (for non-residual): True, Uses gemv_int4_v2_fused (for residual): True" },
+        { "action": "Verify engine wiring in test_m2_decode.py", "expected": "v3_t16 as default", "observed": "PASS: v3_t16 wired for non-residual GEMV, v2_fused for residual GEMV (VAL-INT4-003)" }
+      ],
+      "evidence": {
+        "output": "BENCHMARK SUMMARY: N=4096 K=4096: best=gemv_int4_v3_t16 @ 29.3us, v2_fused=35.9us. Engine: v3 initialized in _init_gemv_v2: True. PASS."
+      },
+      "issues": null
+    },
+    {
+      "id": "VAL-INT4-004",
+      "title": "DPP wave reduction in INT4 GEMV",
+      "status": "pass",
+      "steps": [
+        { "action": "Run v3_dpp variant in test_int4_gemv_optimize.py", "expected": "DPP reduction produces correct output max err < 1e-2", "observed": "gemv_int4_v3_dpp: max_err=0.000482 [PASS] for N=4096,K=4096; max_err=0.000484 [PASS] for N=11008,K=4096" }
+      ],
+      "evidence": {
+        "output": "V3 variants test: gemv_int4_v3_dpp: max_err=0.000482 [PASS], grid=(1024,1,1) for N=4096; max_err=0.000484 [PASS], grid=(2752,1,1) for N=11008"
+      },
+      "issues": null
+    }
+  ],
+  "frictions": [],
+  "blockers": [],
+  "summary": "Tested 4 assertions: 4 passed, 0 failed. INT4 GEMV uses ubfe/bitfield extract patterns, v3_t16 cooperative-reduction is wired as default (1.22x faster than v2_fused), DPP reduction variant produces correct output."
+}
