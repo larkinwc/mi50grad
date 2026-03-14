@@ -99,9 +99,12 @@ If build fails, fix compilation errors and retry. Do NOT proceed to testing with
 ssh root@192.168.1.198 "docker stop vllm-mobydick 2>/dev/null || true"
 ```
 
+**CRITICAL: For TP=4 testing, add `-e HIP_VISIBLE_DEVICES=0,1,2,3` to Docker run (Dockerfile defaults to only 3 GPUs).**
+
 **Run test:**
 ```bash
 ssh root@192.168.1.198 "docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+    -e HIP_VISIBLE_DEVICES=0,1,2,3 \
     -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models \
     mi50grad bash -c 'cd /opt/mi50grad && python3 tests/test_<feature>.py'"
 ```
