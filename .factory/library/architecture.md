@@ -176,6 +176,67 @@ Engine wiring:
 - hidden_size=5120, num_heads=48, num_kv_heads=8
 - FFN: gate+up (fused) → SiLU → down, with INT4 quantized weights (GPTQ)
 
+## Activation Quantization (activation_quant.hip — m3-activation-quantization)
+**Dynamic per-tensor INT8 quantization of FP16 activations. Foundation for W8A8 and W4A8 kernels.**
+
+Two-kernel pipeline:
+1. `activation_quant_reduce`: Finds max|x| across full tensor using DPP 6-step butterfly reduction (64-lane gfx906 wavefronts) + cross-warp LDS reduction + atomicMax via IEEE 754 bit trick (non-negative floats have monotonic bit ordering).
+2. `activation_quant_quant`: Computes scale = max_abs / 127.0, quantizes: clamp(round(x/scale), -128, 127) via `__builtin_amdgcn_fmed3f` for combined round+clamp.
+
+**IMPORTANT**: `d_max` buffer MUST be pre-zeroed before each reduce kernel launch. Engine does this via `hip.memset(d_act_maxabs, 0, 4)` in `_launch_activation_quant`. Forgetting this causes scale=0 (all-zeros input case or carry-over from prior invocation).
+
+Correctness:
+- scale matches reference exactly (zero relative error in scale computation)
+- round-trip error within expected INT8 noise budget (max_err ≤ 0.5 × scale ≈ 0.03)
+- Edge cases handled: all-zeros (scale=1.0), spike values (max element→127), negative-only inputs
+
+Performance: ~38-49us for n=4096-11008 (two-kernel launch overhead dominated). Bandwidth: 0.3-1.2 GB/s (activation sizes are small; latency dominated by kernel launch overhead, not HBM bandwidth).
+
+## W8A8 GEMV and GEMM (gemv_w8a8.hip, gemm_w8a8.hip — m3-w8a8-gemv, m3-w8a8-gemm)
+**W8A8 = INT8 weights + INT8 activations → INT32 accumulation → FP32 scale epilogue → FP16 output.**
+
+**GEMV** (decode, M=1):
+- 4 rows per WG, 64-thread wavefront per row, K/64 groups of 4 INT8 elements per lane
+- `__builtin_amdgcn_sdot4` (v_dot4_i32_i8) = 4 signed INT8 × INT8 products → INT32 accumulator
+- 6-step butterfly DPP reduction via `__shfl_xor` for full 64-lane wavefront
+- Epilogue: `(int32_acc as float32) × scale_w[row] × scale_a` → FP16 output
+
+**GEMM** (prefill, M>1):
+- 64×64 output tiles, TILE_K=16 INT8 elements per K-iteration, 256 threads (16×16 per-thread 4×4 outputs)
+- LDS staging: A[64×16] + B[64×16] = 2048 bytes LDS per WG
+- **REQUIREMENT: K must be a multiple of TILE_K=16** (satisfied for all Qwen shapes K=4096)
+- Performance: 4096×4096×4096 = 12.1 TFLOPS, 128×4096×4096 = 3.4 TFLOPS
+
+**Performance vs W4A16 for decode (M=1)**:
+- N=4096, K=4096: W8A8 = 78us/213GB/s; W4A16-v3t16 = 30us/295GB/s → W4A16 **2.4x faster**
+- N=11008, K=4096: W8A8 = 139us/325GB/s; W4A16-v3t16 = 64us/377GB/s → W4A16 **1.8x faster**
+- Root cause: W8A8 reads 2× weight bytes vs W4A16 (INT8 vs INT4), so decode is 2× more bandwidth-bound
+- **W8A8 is recommended for prefill (M>1), not decode (M=1)** where bandwidth dominates
+
+**Scale API**: `gemv_w8a8(x_int8, W_int8, scale_w_fp32[N], scale_a_fp32_scalar, out_fp16, K, N)`
+- scale_a is passed as by-value float (requires a D2H sync of 4 bytes in engine). Future improvement: pass as device pointer.
+
+## Engine Quantization Format Selection (m3-engine-integration)
+Engine `quant_format` parameter: `'w4a16'` (default) | `'w8a8'` | `'w4a8'`
+
+- **Hard error at init** if kernel files not found (not silent fallback)
+- `_init_quant_kernels()` loads appropriate kernels at engine init
+- W8A8/W4A8 paths both require activation_quant.hip (two-kernel pipeline)
+
+**FFN dispatch in decode_step**:
+```python
+if self.quant_format in ('w8a8', 'w4a8'):
+    self._decode_ffn_quantized(lw, h)  # handles gate+up+silu+down+residual
+else:
+    # W4A16 path (default, uses fused INT4 GEMV with residual epilogue)
+```
+
+**Weight loader formats**:
+- `gptq_to_w8a8(qweight, scales, qzeros)` → `(W_int8[N,K], scale_w[N])`: converts GPTQ INT4 → dequantize → quantize to INT8 per-channel
+- `gptq_to_w4a8(qweight, scales, qzeros, group_size)` → `(W_packed[N,K/8], scale_grp[K/group_size,N])`: repack GPTQ INT4 nibbles into N-major layout for W4A8 kernel
+
+**D2H sync limitation**: `_launch_gemv_w8a8` and `_launch_gemv_w4a8` download scale_a (4 bytes) from GPU after activation quantization to pass it as a by-value float to the GEMV kernel. Adds ~1-2us per FFN projection. Future fix: change kernel signature to accept `const float* scale_a` (pointer).
+
 ## FlashAttention-256 Tuning (m3-flashattn-tune)
 
 **Tuned kernel**: `flash_attn_256_tuned.hip` contains `flash_attn_256_decode` and `flash_attn_256_prefill`.

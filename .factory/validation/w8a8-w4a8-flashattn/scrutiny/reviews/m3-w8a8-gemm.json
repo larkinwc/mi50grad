@@ -1,0 +1,35 @@
+{
+  "featureId": "m3-w8a8-gemm",
+  "milestone": "w8a8-w4a8-flashattn",
+  "workerSession": "04ceda7e-d179-4d7f-8e13-aa568fe78443",
+  "commitId": "ba4c4d8",
+  "status": "pass",
+  "assertionsCovered": ["VAL-W8A8-002"],
+  "assertionResults": {
+    "VAL-W8A8-002": {
+      "status": "pass",
+      "evidence": "test_w8a8_gemm.py: ALL TESTS PASSED. 128x4096x4096: max_abs=0.00781 max_rel=0.05% PASS. 4096x4096x4096: max_abs=0.01548 max_rel=0.05% PASS. 11 test cases including tile boundary (M=65,N=65), non-aligned M (7x64x128), GEMV via GEMM (M=1), K alignment (32/48/64). Unit scale exactness: max_abs=0.0000. Per-channel scale applied correctly. Performance: 128x4096x4096=3.4 TFLOPS, 4096x4096x4096=12.1 TFLOPS."
+    }
+  },
+  "codeQualityIssues": [],
+  "nonBlockingIssues": [
+    {
+      "severity": "non_blocking",
+      "description": "W8A8 GEMM performance at 12.1 TFLOPS (45% of peak 26.8 TFLOPS FP16, or ~24% of peak INT8 TOPS on gfx906) is not exceptional. The LDS staging with TILE_K=16 INT8 elements per iteration may be too small, leading to high LDS bandwidth pressure relative to compute.",
+      "suggestedFix": "Could explore TILE_K=32 (32 INT8 elements = 8 int32 per thread per K-step). Larger tile sizes reduce loop overhead and may improve occupancy utilization. Non-blocking since correctness is proven."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "The kernel K must be a multiple of TILE_K=16. This is satisfied for all Qwen shapes (K=4096 is divisible by 16) but is not checked at runtime. A K value like K=6 or K=10 would produce incorrect results due to out-of-bounds LDS loads.",
+      "suggestedFix": "Add a runtime assertion: assert K % 16 == 0, or handle non-multiples with boundary masking. For production deployment with fixed Qwen shapes this is low priority."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "observation": "W8A8 GEMM tile layout: 64x64 output tiles, TILE_K=16, 256 threads (16x16 per-thread 4x4 outputs). Uses LDS for A[64x16]+B[64x16] tiles = 2048 bytes LDS. K must be multiple of TILE_K=16. Performance 3.4-12.1 TFLOPS for Qwen prefill shapes.",
+      "target": "library",
+      "suggestedContent": "Document in architecture.md: W8A8 GEMM requires K % 16 == 0 (satisfied for all Qwen shapes). Tiling: M_TILE=N_TILE=64, K_TILE=16. Performance dominated by LDS bandwidth for small M (prefill token-by-token). For large M batch prefill, W8A8 GEMM may exceed W4A16 GEMM despite 2x weight bytes due to INT32 accumulation precision."
+    }
+  ],
+  "summary": "Feature fully satisfies VAL-W8A8-002. W8A8 tiled GEMM uses v_dot4_i32_i8 inner loop, INT32 accumulators, FP32 scale epilogue, and handles all representative Qwen shapes and tile boundary conditions. Correctness verified for 11 shapes including edge cases. No blocking issues."
+}

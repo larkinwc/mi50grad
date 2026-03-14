@@ -1,0 +1,44 @@
+{
+  "featureId": "m3-flashattn-tune",
+  "milestone": "w8a8-w4a8-flashattn",
+  "workerSession": "1128d89c-60d6-46f0-a106-2c3b64d0cd2e",
+  "commitId": "e6a596282fcda6ba5676808d5b8bd51cb0492643",
+  "status": "pass",
+  "assertionsCovered": ["VAL-FA-001", "VAL-FA-002"],
+  "assertionResults": {
+    "VAL-FA-001": {
+      "status": "pass",
+      "evidence": "test_flashattn_tune.py: Decode correctness: 7 test cases passed (max_err=0.00000 for all decode configs — exact match vs naive reference). Prefill correctness: 6 test cases passed (max_err=0.00006-0.00012 for seq=128/512 — well within 1e-3 threshold). Tested: decode h=4 kv=4 kv_len=256/1024/4096, h=48 kv=8 kv_len=256/1024/4096; prefill seq=4/16/32/128/512, causal and non-causal. All correctness tests PASSED."
+    },
+    "VAL-FA-002": {
+      "status": "pass",
+      "evidence": "test_flashattn_tune.py benchmark: Decode speedup vs original: 3.54x at kv=256, 5.18x at kv=512, 5.57x at kv=1024, 5.68x at kv=2048, 5.78x at kv=4096. All exceed the 'measurably lower latency' threshold. Latencies: 64us at kv=256, 113us at kv=512, 223us at kv=1024, 436us at kv=2048, 860us at kv=4096 (vs original 227us/585us/1241us/2473us/4975us). Prefill: 1.04-1.07x speedup."
+    }
+  },
+  "codeQualityIssues": [],
+  "nonBlockingIssues": [
+    {
+      "severity": "non_blocking",
+      "description": "The Schraudolph fast exp approximation is defined in flash_attn_256_tuned.hip but commented out in favor of __expf. The comment notes 3.5% max error. Given the correctness test passes with __expf (max_err=0.00000), the Schraudolph path is dead code. If performance pressure demands it, the ~5-7% potential speedup would need re-evaluation against the 3.5% approximation error impact on generated token quality.",
+      "suggestedFix": "Keep __expf as default (correct behavior). The fast_exp_schraudolph path can remain as an explicit opt-in for latency-critical scenarios where approximate softmax is acceptable."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "The tuned kernel flash_attn_256_decode uses 256 threads (4 wavefronts, each handling kv_len/4 KV positions). However, when kv_len < 4, some wavefronts would process 0 positions. The LDS merge formula with all-zero partial softmax states should handle this correctly (online softmax with max=-inf handles empty ranges), but this edge case with kv_len=1/2/3 is not explicitly tested.",
+      "suggestedFix": "Add correctness test for kv_len < 4 (e.g., kv_len=1, 2, 3). Current behavior likely correct given online softmax initialization with -inf, but explicit testing would confirm."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "Pre-existing: original flash_attn_256.hip uses k_offset for both K and V loads. The tuned version inherits this naming convention. This can confuse readers who expect separate offsets for K and V. Noted by the worker as a pre-existing issue.",
+      "suggestedFix": "Rename k_offset to kv_offset in flash_attn_256.hip (pre-existing issue, not introduced by this feature)."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "observation": "flash_attn_256_tuned.hip decode kernel: 4 wavefronts split KV range (each processes kv_len/4 positions). Partial online softmax states merged via LDS at end. Decode speedup 3.5-5.8x vs original (which had 3/4 wavefronts mostly idle during decode). Prefill improvement: 1.04-1.07x via cooperative K/V loading (Bc=4 KV rows, shared across 4 Q rows).",
+      "target": "library",
+      "suggestedContent": "Document in architecture.md: flash_attn_256_tuned decode strategy: 4-wavefront KV-parallel split. Each WF sweeps kv_len/4 positions independently, then merges partial softmax states via LDS reduction (max+sum merge formula). Original kernel had 3/4 wavefronts exit immediately for decode — this was the primary bottleneck. Decode speedup: 3.5x at kv=256, 5.8x at kv=4096. Prefill speedup marginal (~5-7%) because prefill is compute-bound."
+    }
+  ],
+  "summary": "Feature fully satisfies VAL-FA-001 and VAL-FA-002. Tuned FlashAttention decode kernel achieves 3.5-5.8x speedup by exploiting KV-parallel wavefront decomposition. Correctness verified for 7 decode configs (exact match) and 6 prefill configs (max_err < 1.3e-4). Original kernel's non-regression confirmed (6/6 original tests pass). Architecture insight: original kernel had 3/4 wavefronts idle during decode — the fix was to split KV range across all 4 wavefronts and merge online softmax states. No blocking issues."
+}

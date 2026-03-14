@@ -1,0 +1,44 @@
+{
+  "featureId": "m3-engine-integration",
+  "milestone": "w8a8-w4a8-flashattn",
+  "workerSession": "412d5b1c-6823-4dbe-a78b-279c611f6659",
+  "commitId": "b1e576c",
+  "status": "pass",
+  "assertionsCovered": ["VAL-ENG-001", "VAL-ENG-002"],
+  "assertionResults": {
+    "VAL-ENG-001": {
+      "status": "pass",
+      "evidence": "test_engine_w8a8_w4a8.py: 10/10 tests passed. test_engine_init_w8a8: w8a8_ready=True, act_quant_ready=True PASS. test_engine_init_w4a8: w4a8_ready=True, act_quant_ready=True PASS. test_decode_step_w8a8: output shape=(256,), finite=True, max_abs=3.2715 PASS. test_decode_step_w4a8: output shape=(256,), finite=True, max_abs=3.2871 PASS. Single decode step completes successfully with both W8A8 and W4A8 configs. Engine raises ValueError for invalid quant_format."
+    },
+    "VAL-ENG-002": {
+      "status": "pass",
+      "evidence": "test_engine_w8a8_w4a8.py: test_weight_loader_w8a8 PASS — gptq_to_w8a8 produces correct INT8 weights (shape (512,256), dtype int8, range [-127,111], round-trip rel error 0.0039 < 0.1). test_weight_loader_w4a8 PASS — gptq_to_w4a8 produces correct W4A8 packed layout (shape (512,32), dtype uint32, nibble range [-8,7]). Weight loader correctly populates device memory with both packed formats."
+    }
+  },
+  "codeQualityIssues": [],
+  "nonBlockingIssues": [
+    {
+      "severity": "non_blocking",
+      "description": "Both _launch_gemv_w8a8 and _launch_gemv_w4a8 require a D2H sync (4 bytes) to read scale_a after activation quantization, before passing it as a by-value float to the GEMV kernel. This is clearly documented in comments. For high-throughput decode, this adds ~1-2us per FFN projection (3 projections per FFN = ~3-6us overhead per layer).",
+      "suggestedFix": "Modify gemv_w8a8 and gemv_w4a8 kernel signatures to accept scale_a as a device pointer (const float*). This eliminates D2H sync. Medium priority improvement."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "Pre-existing: test_m2_prefill.py::test_prefill_correctness_typical_shapes fails with prefill(seq=1) vs decode max_err=1.619e-02 > 0.001. This pre-dated M3 changes and is unrelated to engine integration. 9/10 tests pass in test_m2_prefill.py.",
+      "suggestedFix": "Orchestrator: document this as a pre-existing issue in AGENTS.md Known Pre-Existing Issues. The test expectation is too strict for prefill(seq=1) vs decode comparison since they use different code paths."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "The _decode_ffn_quantized helper for W8A8/W4A8 uses separate _launch_residual_add after down_proj, unlike the W4A16 path which uses residual epilogue fused into INT4 GEMV. This means the W8A8/W4A8 path has one extra kernel launch per FFN layer vs W4A16 optimal path.",
+      "suggestedFix": "Add optional residual pointer support to gemv_w8a8 and gemv_w4a8 kernels (similar to INT4 residual epilogue). Would save 1 launch per FFN layer. Low priority given W8A8/W4A8 are alternative paths."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "observation": "Engine quant_format parameter added: 'w4a16' (default), 'w8a8', 'w4a8'. _init_quant_kernels() loads appropriate kernels at init time (hard error if kernel missing). _decode_ffn_quantized() dispatches FFN to quantized path. M1 (12/12) and M2 decode (8/8) non-regression confirmed. Pre-existing: test_m2_prefill.py has 1 failure unrelated to M3.",
+      "target": "library",
+      "suggestedContent": "Document in architecture.md: Engine quantization format selection via quant_format='w4a16'|'w8a8'|'w4a8'. W8A8/W4A8 paths: activation quantization pipeline (activation_quant.hip two-kernel), then GEMV. D2H sync of scale_a (4 bytes) is unavoidable with current kernel signatures. Weight loader: gptq_to_w8a8 for W8A8, gptq_to_w4a8 for W4A8 packed format. Both pass correctness tests."
+    }
+  ],
+  "summary": "Feature fully satisfies VAL-ENG-001 and VAL-ENG-002. Engine correctly configures W8A8 and W4A8 quantization paths with hard error on kernel load failure. Weight loader correctly converts GPTQ format to W8A8/W4A8 packed layouts. Decode steps complete successfully for both formats. Non-regression confirmed for M1 and M2 optimization paths. Pre-existing test_m2_prefill.py failure is unrelated. No blocking issues."
+}

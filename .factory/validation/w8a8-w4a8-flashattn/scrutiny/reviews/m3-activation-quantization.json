@@ -1,0 +1,35 @@
+{
+  "featureId": "m3-activation-quantization",
+  "milestone": "w8a8-w4a8-flashattn",
+  "workerSession": "524887bc-c34a-4d9c-9f18-3f8b4b681b99",
+  "commitId": "f84a1c2",
+  "status": "pass",
+  "assertionsCovered": ["VAL-W8A8-003"],
+  "assertionResults": {
+    "VAL-W8A8-003": {
+      "status": "pass",
+      "evidence": "test_activation_quant.py: ALL TESTS PASSED. 9/9 correctness tests pass on MI60 LXC. Scale matches reference exactly (scale_ref=scale_gpu for all inputs). q_match=YES for all n=64..11008. Round-trip error within INT8 noise budget (max_err=0.030..0.032 vs budget=0.036..0.038). All-zeros handled (scale=1.0, all q=0). Spike test: max element quantizes to 127. Negative-only inputs handled correctly."
+    }
+  },
+  "codeQualityIssues": [],
+  "nonBlockingIssues": [
+    {
+      "severity": "non_blocking",
+      "description": "The activation_quant_quant kernel computes scale locally in each non-block-0 workgroup (reads max_abs_in, recomputes scale), but only block 0 writes scale_out via shared memory. For block 0 itself, scale is computed via s_scale LDS broadcast; for all other blocks it is recomputed from max_abs_in. This is correct but slightly redundant — scale computation is replicated across all blocks.",
+      "suggestedFix": "Acceptable as-is: the redundant scale computation is very cheap (1 division), and the correctness is sound. Could be cleaned up by simply computing scale from max_abs_in in every block without the s_scale path for block 0, but this is a minor code simplification not a bug."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "The two-kernel pipeline requires a separate memset of d_max to 0 before each invocation (host-side in the test). The engine does this via hip.memset(d_act_maxabs, 0, 4) in _launch_activation_quant. This is a necessary but easily-forgotten step.",
+      "suggestedFix": "Consider adding an assert or sentinel value check in the reduce kernel to catch accidentally un-zeroed buffers during testing. Current approach is correct."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "observation": "Two-kernel activation quantization pipeline: (1) activation_quant_reduce with atomicMax using IEEE 754 bit trick, then (2) activation_quant_quant. Requires d_max buffer pre-zeroed before each call. Performance: ~38-49us for n=4096-11008 (two-kernel launch overhead dominated).",
+      "target": "library",
+      "suggestedContent": "Document in architecture.md under W8A8/W4A8 section: activation quantization is a two-kernel pipeline requiring d_max pre-zeroed before invocation. Scale = max_abs / 127.0. DPP 6-step butterfly reduction handles full 64-lane gfx906 wavefront. IEEE 754 atomicMax trick works because max_abs >= 0 guarantees monotonic bit ordering."
+    }
+  ],
+  "summary": "Feature fully satisfies VAL-W8A8-003. DPP wave reduction correctly uses 6 __shfl_xor steps for gfx906 64-lane wavefronts. IEEE 754 atomicMax trick is sound for non-negative floats. Edge cases (all-zeros, spike, negative-only) all handled correctly. Round-trip error well within INT8 noise budget. No blocking issues."
+}
