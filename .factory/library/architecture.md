@@ -273,6 +273,53 @@ else:
 
 **D2H sync limitation**: `_launch_gemv_w8a8` and `_launch_gemv_w4a8` download scale_a (4 bytes) from GPU after activation quantization to pass it as a by-value float to the GEMV kernel. Adds ~1-2us per FFN projection. Future fix: change kernel signature to accept `const float* scale_a` (pointer).
 
+## FlashAttention v3 Block-Tiled (block-tiled-flash-attention)
+
+**File:** `src/kernels/flash_attn_256_v3.hip`
+**Test:** `tests/test_flash_attn_v3.py`
+
+**Key difference vs flash_attn_256_tuned.hip prefill:**
+- BLOCK_N (Bc): 4 → 16 (4× larger KV tile)
+- Score computation: scalar FMA → `__builtin_amdgcn_fdot2` (v_dot2_f32_f16), 2× arithmetic throughput
+- Q rows per WG: 4 (1/wavefront) → 16 (4/wavefront)
+
+**Final tile sizes chosen (BLOCK_M=16, not 64):**
+- Feature requested Br=64 but this is infeasible on gfx906 without tensor cores:
+  - Br=64 with 4-thread reduction → each thread needs 64 Q-dims in registers (too many VGPRs)
+  - Br=16 with 16-thread reduction → each thread holds 16 Q-dims = ~50 VGPRs (healthy occupancy)
+- BLOCK_N=16: K+V in LDS = 16×256×2×2 = 16 KB per WG (32 KB budget allows 2 WGs/CU)
+
+**Thread layout (256 threads = 4 wavefronts × 64 lanes):**
+- wf_id = tid/64 (0..3)
+- lane = tid%64 (0..63)
+- q_in_wf = lane/16 (0..3): Q row within wavefront
+- part = lane%16 (0..15): which 16-dim chunk
+- dim_base = part × 16 (0,16,...,240)
+- q_row = wf_id×4 + q_in_wf (0..15)
+
+**Score computation (v_dot2_f32_f16):**
+- Each thread computes partial dot over 16 dims (8 fdot2 calls)
+- 16-way intra-wavefront reduction using shfl_down(8/4/2/1)
+- Broadcast via shfl to all 16 threads in q_in_wf group
+
+**Cooperative K/V load:**
+- 256 threads load BLOCK_N=16 rows × 256 dims = 4096 halfs
+- Each thread: load_row=tid/16, load_dim=(tid%16)×16, loads 16 halfs via 2×float4
+
+**Performance on MI60 gfx906 (heads=48, kv_heads=8, causal=1):**
+- seq=64:   tuned=0.117ms → v3=0.074ms (1.59x faster)
+- seq=128:  tuned=0.362ms → v3=0.223ms (1.62x faster)
+- seq=256:  tuned=1.238ms → v3=0.682ms (1.81x faster)
+- seq=512:  tuned=4.829ms → v3=2.559ms (1.89x faster)
+
+**Correctness:** max_err < 5e-3 (< 1e-2 threshold) at all tested seq_lens.
+**Decode kernel:** Unchanged copy of flash_attn_256_tuned.hip decode kernel.
+
+**Grid:** (num_heads, ceil(num_q_rows/16), 1), Block=(256,1,1)
+**Softmax:** Online per KV block (FlashAttention-2 style), FP32 accumulators throughout.
+
+---
+
 ## FlashAttention-256 Tuning (m3-flashattn-tune)
 
 **Tuned kernel**: `flash_attn_256_tuned.hip` contains `flash_attn_256_decode` and `flash_attn_256_prefill`.
