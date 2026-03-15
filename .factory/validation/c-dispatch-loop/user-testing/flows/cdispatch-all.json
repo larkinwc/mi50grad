@@ -1,0 +1,68 @@
+{
+  "groupId": "cdispatch-all",
+  "milestone": "c-dispatch-loop",
+  "assertionsTested": [
+    "VAL-CDISPATCH-001",
+    "VAL-CDISPATCH-002",
+    "VAL-CDISPATCH-003",
+    "VAL-CDISPATCH-004",
+    "VAL-CDISPATCH-005",
+    "VAL-CDISPATCH-006",
+    "VAL-CDISPATCH-007",
+    "VAL-CDISPATCH-008",
+    "VAL-CDISPATCH-009",
+    "VAL-CDISPATCH-010"
+  ],
+  "results": {
+    "VAL-CDISPATCH-001": {
+      "status": "pass",
+      "evidence": "C extension compiled with 'gcc -O3 -shared -fPIC -I/opt/rocm/include -L/opt/rocm/lib -lamdhip64' exit code 0. Loaded via ctypes. Struct sizes: CKernelSpec=56 bytes, CEngineLayerSpec=920 bytes, CAllreduceSpec=272 bytes, CDispatchPlan=104 bytes. test_c_dispatch.py Test 1: PASS"
+    },
+    "VAL-CDISPATCH-002": {
+      "status": "pass",
+      "evidence": "10-step correctness test vs cached+stream: all steps >= 0.99. Min cosine sim = 0.999983. Steps: 0.999992, 0.999996, 0.999991, 0.999995, 0.999992, 0.999994, 0.999993, 0.999995, 0.999992, 0.999983. test_c_dispatch.py Test 2: PASS"
+    },
+    "VAL-CDISPATCH-003": {
+      "status": "pass",
+      "evidence": "10-step correctness test vs single-GPU reference: all steps >= 0.99. Min cosine sim = 0.999986. Steps: 0.999994, 0.999994, 0.999989, 0.999993, 0.999989, 0.999991, 0.999986, 0.999991, 0.999990, 0.999991. test_c_dispatch_e2e.py Test 1: PASS"
+    },
+    "VAL-CDISPATCH-004": {
+      "status": "pass",
+      "evidence": "C dispatch: 34.8 tok/s (28.76 ms/tok) vs cached+stream: 33.9 tok/s (29.48 ms/tok). Speedup: 1.03x. Exceeds 25.5 tok/s baseline. test_c_dispatch_e2e.py Test 2: PASS"
+    },
+    "VAL-CDISPATCH-005": {
+      "status": "pass",
+      "evidence": "Position-dependent params checked at positions 0, 10, 50, 100. All cosine sim >= 0.99: pos0=0.999996, pos10=0.999996, pos50=0.999997, pos100=0.999996. test_c_dispatch.py Test 4: PASS"
+    },
+    "VAL-CDISPATCH-006": {
+      "status": "pass",
+      "evidence": "Async allreduce integration validated implicitly through 10-step correctness test with all cosine sims >= 0.999983. C dispatch plan built for 64 layers × 4 engines with allreduce event recording. The C dispatch loop dispatches attention, records compute events, submits allreduce on dedicated stream, records done events, and dispatches FFN — all within the C loop. Correctness at all positions confirms allreduce events fire correctly."
+    },
+    "VAL-CDISPATCH-007": {
+      "status": "pass",
+      "evidence": "Single-GPU regression: 20.5 tok/s (48.81 ms/tok). Allowed range: 18.3-22.3 tok/s. Within ±10% of 20.3 tok/s baseline. test_c_dispatch_e2e.py Test 3: PASS"
+    },
+    "VAL-CDISPATCH-008": {
+      "status": "pass",
+      "evidence": "C dispatch correctly handles both 16 full GQA attention layers and 48 DeltaNet linear attention layers in all correctness tests (10 steps at positions 0-9, plus positions 10, 50, 100). Model has 16 full-attn + 48 DeltaNet = 64 total. 'C dispatch plan built: 64 layers × 4 engines'. Min cosine sim across all correctness checks: 0.999983."
+    },
+    "VAL-CDISPATCH-009": {
+      "status": "pass",
+      "evidence": "KV cache operations validated through correctness at multiple positions (0, 10, 50, 100) with cosine sim >= 0.999996 at all positions. Sequence position tracking works correctly — position 100 test shows KV cache state is consistent (kv_cache.current_len=100 set before decode step). test_c_dispatch.py Test 4: PASS"
+    },
+    "VAL-CDISPATCH-010": {
+      "status": "pass",
+      "evidence": "Dispatch priority verified: C dispatch enabled → _c_dispatch_enabled=True. Fallback test: C dispatch disabled → cached_dispatch=True, stream_overlap_dispatch=True, p2p_ar available=True, would use cached+stream=True. Fallback correctness: min cosine sim 0.999992. set_c_dispatch(False) correctly reverts to cached+stream. test_c_dispatch_e2e.py Test 4: PASS"
+    }
+  },
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "docker", "rsync"],
+  "testScriptsRun": [
+    "tests/test_c_dispatch.py",
+    "tests/test_c_dispatch_e2e.py"
+  ],
+  "buildCommands": [
+    "gcc -O3 -shared -fPIC -I/opt/rocm/include -L/opt/rocm/lib -lamdhip64 -o src/runtime/c_dispatch.so src/runtime/c_dispatch.c"
+  ]
+}

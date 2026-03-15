@@ -1,0 +1,57 @@
+{
+  "milestone": "c-dispatch-loop",
+  "round": 1,
+  "status": "pass",
+  "assertionsSummary": {
+    "total": 10,
+    "passed": 10,
+    "failed": 0,
+    "blocked": 0
+  },
+  "passedAssertions": [
+    "VAL-CDISPATCH-001",
+    "VAL-CDISPATCH-002",
+    "VAL-CDISPATCH-003",
+    "VAL-CDISPATCH-004",
+    "VAL-CDISPATCH-005",
+    "VAL-CDISPATCH-006",
+    "VAL-CDISPATCH-007",
+    "VAL-CDISPATCH-008",
+    "VAL-CDISPATCH-009",
+    "VAL-CDISPATCH-010"
+  ],
+  "failedAssertions": [],
+  "blockedAssertions": [],
+  "appliedUpdates": [],
+  "previousRound": null,
+  "details": {
+    "testScripts": [
+      {
+        "script": "tests/test_c_dispatch.py",
+        "result": "ALL CRITICAL TESTS PASSED",
+        "highlights": {
+          "compilation": "PASS (gcc exit code 0, ctypes load OK)",
+          "correctness_vs_cached_stream": "PASS (min cos sim=0.999983, 10 steps)",
+          "benchmark": "C=34.7 tok/s, ref=32.0 tok/s, 1.09x speedup",
+          "position_dependent_params": "PASS (pos 0,10,50,100 all cos sim >= 0.999996)"
+        }
+      },
+      {
+        "script": "tests/test_c_dispatch_e2e.py",
+        "result": "ALL CRITICAL TESTS PASSED",
+        "highlights": {
+          "vs_single_gpu_reference": "PASS (min cos sim=0.999986, 10 steps)",
+          "throughput": "C dispatch 34.8 tok/s vs 33.9 cached+stream (1.03x), exceeds 25.5 baseline",
+          "single_gpu_regression": "PASS (20.5 tok/s, within ±10% of 20.3 baseline)",
+          "fallback": "PASS (cached+stream active when C dispatch disabled, min cos sim=0.999992)"
+        }
+      }
+    ],
+    "serverInfo": {
+      "host": "root@192.168.1.198",
+      "container": "mi50grad",
+      "gpus": "HIP_VISIBLE_DEVICES=0,1,2,3 (4x MI50 gfx906)",
+      "model": "/opt/models/Qwen3.5-27B-GPTQ-Int4"
+    }
+  }
+}
