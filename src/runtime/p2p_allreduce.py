@@ -190,6 +190,13 @@ class P2PAllreduce:
         stream0 = self._streams[0]
         stream0_ptr = ctypes.c_void_p(stream0)
 
+        # Step 0: Synchronize all GPUs to ensure compute kernels have completed
+        # and their partial results are ready for P2P gather.
+        # Without this, the P2P copy might read stale/unfinished data.
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            hip.synchronize()
+
         # Step 1: Gather remote partials to GPU0 (async P2P)
         hip.set_device(dev0_id)
         for i in range(1, tp):
@@ -270,6 +277,11 @@ class P2PAllreduce:
         dev0_id = self._device_ids[0]
         stream0 = self._streams[0]
         stream0_ptr = ctypes.c_void_p(stream0)
+
+        # Synchronize all GPUs to ensure compute kernels have completed
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            hip.synchronize()
 
         # Gather remote partials to GPU0
         hip.set_device(dev0_id)
