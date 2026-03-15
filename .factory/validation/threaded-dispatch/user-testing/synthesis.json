@@ -1,0 +1,43 @@
+{
+  "milestone": "threaded-dispatch",
+  "round": 1,
+  "status": "pass",
+  "assertionsSummary": {
+    "total": 2,
+    "passed": 2,
+    "failed": 0,
+    "blocked": 0
+  },
+  "passedAssertions": ["VAL-THR-001", "VAL-THR-002"],
+  "failedAssertions": [],
+  "blockedAssertions": [],
+  "appliedUpdates": [],
+  "previousRound": null,
+  "details": {
+    "VAL-THR-001": {
+      "test": "tests/test_threaded_dispatch.py",
+      "description": "Cached dispatch (pre-built LaunchSpec arrays) vs serial dispatch",
+      "serial_tps": 9.76,
+      "cached_tps": 19.12,
+      "speedup": 1.958,
+      "min_cosine_sim": 0.999984,
+      "exitCode": 0
+    },
+    "VAL-THR-002": {
+      "test": "tests/test_stream_overlap.py",
+      "description": "Stream overlap (async allreduce on dedicated HIP streams) vs serial",
+      "serial_tps": 13.14,
+      "overlap_tps": 14.26,
+      "speedup": 1.085,
+      "profiling": {
+        "total_ms_per_tok": 74.99,
+        "allreduce_ms_per_tok": 22.88,
+        "allreduce_pct": 30.5,
+        "compute_ms_per_tok": 52.11,
+        "compute_pct": 69.5
+      },
+      "min_cosine_sim": 0.995241,
+      "exitCode": 0
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "assertionIds": ["VAL-THR-001", "VAL-THR-002"],
+  "results": {
+    "VAL-THR-001": {
+      "status": "pass",
+      "evidence": "test_threaded_dispatch.py exited 0. Cached dispatch: 19.12 tok/s (52.31 ms/tok) vs serial: 9.76 tok/s (102.42 ms/tok). Speedup: 1.958x. Min cosine sim: 0.999984 (threshold 0.999). RESULT: PASS.",
+      "exitCode": 0,
+      "details": {
+        "serial_tps": 9.76,
+        "serial_ms_per_tok": 102.42,
+        "cached_tps": 19.12,
+        "cached_ms_per_tok": 52.31,
+        "speedup": 1.958,
+        "min_cosine_sim": 0.999984,
+        "cosine_threshold": 0.999,
+        "bench_steps": 10,
+        "warmup_steps": 3
+      }
+    },
+    "VAL-THR-002": {
+      "status": "pass",
+      "evidence": "test_stream_overlap.py exited 0. Stream overlap: 14.26 tok/s (70.15 ms/tok) vs serial: 13.14 tok/s (76.08 ms/tok). Speedup 1.085x. Serial profiling: total 74.99 ms/tok, allreduce 22.88 ms/tok (30.5%), compute 52.11 ms/tok (69.5%). Min cosine sim: 0.995241 (threshold 0.99). RESULT: PASS.",
+      "exitCode": 0,
+      "details": {
+        "serial_tps": 13.14,
+        "serial_ms_per_tok": 76.08,
+        "overlap_tps": 14.26,
+        "overlap_ms_per_tok": 70.15,
+        "speedup": 1.085,
+        "min_cosine_sim": 0.995241,
+        "cosine_threshold": 0.99,
+        "profiling": {
+          "total_ms_per_tok": 74.99,
+          "allreduce_ms_per_tok": 22.88,
+          "allreduce_pct": 30.5,
+          "compute_ms_per_tok": 52.11,
+          "compute_pct": 69.5
+        },
+        "bench_steps": 20,
+        "warmup_steps": 3
+      }
+    }
+  },
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "docker"]
+}
