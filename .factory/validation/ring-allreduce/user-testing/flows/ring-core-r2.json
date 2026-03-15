@@ -1,0 +1,16 @@
+{
+  "groupId": "ring-core-r2",
+  "milestone": "ring-allreduce",
+  "round": 2,
+  "assertions": {
+    "VAL-RING-006": {
+      "status": "fail",
+      "evidence": "Documentation for INT8 partial quantization assessment not found in any of the expected files. Checked: (1) /opt/mi50grad/tests/test_ring_integration.py - no INT8/quantization mentions; (2) /opt/mi50grad/tests/test_ring_allreduce.py - no INT8/quantization mentions; (3) /opt/mi50grad/bench/tp4_optimization_report.md - only generic INT8 mentions (INT8/FP8 activations row in future work table, INT8 quantization row in optimization table), no specific assessment of INT8 partial quantization for ring allreduce. The validation contract requires: 'documentation in test_ring_integration.py or optimization report noting INT8 partial quantization assessment.' This documentation does not exist. grep commands used: 'grep -in INT8 test_ring_integration.py' returned empty, 'grep -in INT8 test_ring_allreduce.py' returned empty."
+    }
+  },
+  "frictions": [
+    "The prior user-testing synthesis (round 1) incorrectly set VAL-RING-006 to 'passed' in validation-state.json while the synthesis.json itself correctly recorded it as 'failed'. This inconsistency needed to be reconciled in round 2."
+  ],
+  "blockers": [],
+  "toolsUsed": ["ssh", "grep"]
+}

@@ -1,37 +1,35 @@
 {
   "milestone": "ring-allreduce",
-  "round": 1,
+  "round": 2,
   "status": "fail",
   "assertionsSummary": {
-    "total": 7,
-    "passed": 6,
+    "total": 1,
+    "passed": 0,
     "failed": 1,
     "blocked": 0
   },
-  "passedAssertions": [
-    "VAL-RING-001",
-    "VAL-RING-002",
-    "VAL-RING-003",
-    "VAL-RING-004",
-    "VAL-RING-005",
-    "VAL-RING-007"
-  ],
+  "passedAssertions": [],
   "failedAssertions": [
     {
       "id": "VAL-RING-006",
-      "reason": "INT8 partial quantization not implemented. No int8/INT8/quantiz code found in src/runtime/p2p_allreduce.py or src/kernels/ring_allreduce.hip. The validation contract notes this assertion is conditional ('if implemented') but the feature was listed as 'fulfills: [VAL-RING-006]' in features.json."
+      "reason": "INT8 partial quantization assessment documentation not found in any expected file. Checked test_ring_integration.py (no INT8/quantization text), test_ring_allreduce.py (no INT8/quantization text), and bench/tp4_optimization_report.md (only generic INT8 rows in future-work/optimization tables, not specific to ring allreduce). The validation contract requires: 'documentation in test_ring_integration.py or optimization report noting INT8 partial quantization assessment.' A fix must add an explicit comment or section in test_ring_integration.py (FINDINGS section) or the optimization report documenting why INT8 partial quantization was assessed and found to not provide meaningful benefit (ring allreduce is 8.5x slower than star, making payload reduction moot)."
     }
   ],
   "blockedAssertions": [],
-  "appliedUpdates": [],
-  "previousRound": null,
+  "appliedUpdates": [
+    {
+      "target": "validation-state.json",
+      "description": "Corrected VAL-RING-006 from 'passed' (incorrectly set by round 1) to 'failed'. Round 1 synthesis correctly identified this as failed but the validation-state.json was incorrectly updated to 'passed'. This round corrects the discrepancy.",
+      "source": "setup"
+    }
+  ],
+  "previousRound": ".factory/validation/ring-allreduce/user-testing/synthesis-round1.json",
   "notes": {
-    "VAL-RING-001": "hipcc build exit code 0, ring_allreduce.so = 43424 bytes",
-    "VAL-RING-002": "max_abs_err=0.0e+00 vs CPU reference across all 4 GPUs",
-    "VAL-RING-003": "Min cosine_sim=0.999982 across 10 decode steps with ring allreduce",
-    "VAL-RING-004": "Star=119.5us, Ring=1023.4us (8.56x faster for star); ring has 6 sequential P2P rounds vs star's 2",
-    "VAL-RING-005": "Star=27.0tok/s, Ring=7.8tok/s in TP=4 decode; ring correctness confirmed via cached+stream path (min cos=0.999990). Note: ring+C dispatch falls back to cached+stream due to missing p2p_reduce_residual_tp2 symbol.",
-    "VAL-RING-006": "Feature not implemented — ring-allreduce-kernel feature was marked as 'fulfills: [VAL-RING-006]' but INT8 quantization was not built",
-    "VAL-RING-007": "Star topology documented as default; ring available via set_ring_allreduce(True)"
+    "rerunScope": "Only VAL-RING-006 was retested (failed in round 1, no new fix features added)",
+    "inconsistencyFound": "Round 1 synthesis said VAL-RING-006 was 'failed', but validation-state.json was incorrectly set to 'passed'. Round 2 corrects this to 'failed'.",
+    "fixRequired": "Add INT8 partial quantization assessment documentation to test_ring_integration.py FINDINGS section or bench/tp4_optimization_report.md ring-allreduce section. The content should explain: INT8 partial quantization was considered to reduce the 10KB allreduce payload to 5KB, but since ring allreduce itself is 8.5x slower than star topology for this payload size, the payload reduction provides no net benefit. Star topology is 3x+ faster regardless.",
+    "roundOnePassedAssertions": [
+      "VAL-RING-001", "VAL-RING-002", "VAL-RING-003", "VAL-RING-004", "VAL-RING-005", "VAL-RING-007"
+    ]
   }
 }
