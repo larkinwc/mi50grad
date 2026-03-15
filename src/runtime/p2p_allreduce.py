@@ -169,7 +169,7 @@ class P2PAllreduce:
         return ctypes.c_void_p(stream) if stream else None
 
     def allreduce_residual(self, partial_ptrs: list, hidden_ptrs: list,
-                           num_elems: int):
+                           num_elems: int, skip_device_sync: bool = False):
         """P2P allreduce + residual add.
 
         Computes: hidden[i] = hidden[0] + partial[0] + partial[1] + ...
@@ -179,6 +179,10 @@ class P2PAllreduce:
             partial_ptrs: list of device ptrs, partial_ptrs[i] on device i
             hidden_ptrs:  list of device ptrs, hidden_ptrs[i] on device i
             num_elems:    number of FP16 elements
+            skip_device_sync: if True, skip hipDeviceSynchronize() (caller
+                              guarantees all GPU work has already completed).
+                              Used with threaded dispatch where workers call
+                              hipDeviceSynchronize() in parallel before allreduce.
         """
         tp = self._tp_size
         if tp == 1:
@@ -193,9 +197,12 @@ class P2PAllreduce:
         # Step 0: Synchronize all GPUs to ensure compute kernels have completed
         # and their partial results are ready for P2P gather.
         # Without this, the P2P copy might read stale/unfinished data.
-        for i in range(tp):
-            hip.set_device(self._device_ids[i])
-            hip.synchronize()
+        # skip_device_sync=True: caller has already synchronized (e.g., via
+        # parallel hipDeviceSynchronize() calls in worker threads).
+        if not skip_device_sync:
+            for i in range(tp):
+                hip.set_device(self._device_ids[i])
+                hip.synchronize()
 
         # Step 1: Gather remote partials to GPU0 (async P2P)
         hip.set_device(dev0_id)

@@ -1,12 +1,13 @@
 """
-TP=4 decode benchmark with P2P allreduce profiling.
+TP=4 decode benchmark with P2P allreduce and threaded dispatch profiling.
 
-Establishes the TP=4 baseline with P2P allreduce (milestone 1 result).
-Subsequent milestones will improve upon these numbers.
+Establishes the TP=4 baseline with P2P allreduce (milestone 1 result)
+and measures improvement from multi-threaded kernel dispatch (milestone 2).
 
 Measures:
   - Overall tok/s and ms/tok (100 decode steps)
   - Allreduce time vs compute time breakdown
+  - Comparison: serial dispatch vs threaded dispatch
   - Total elapsed time
 
 USAGE:
@@ -97,9 +98,57 @@ class AllreduceProfiler:
 # Main benchmark
 # ---------------------------------------------------------------------------
 
+def run_benchmark(engine, emb, warmup_steps, bench_steps, threaded: bool, label: str):
+    """Run a benchmark with the given mode (serial or threaded).
+
+    Returns (tok_per_sec, ms_per_tok, mean_ar_ms, mean_compute_ms).
+    """
+    engine.set_threaded_dispatch(threaded)
+
+    profiler = AllreduceProfiler(engine)
+    profiler.install()
+
+    # Warmup
+    for e in engine.engines:
+        e.kv_cache.current_len = 0
+        e.deltanet_state.reset()
+    for i in range(warmup_steps):
+        engine.decode_step(emb, i)
+    engine.synchronize()
+    profiler.allreduce_times.clear()
+
+    # Timed run
+    for e in engine.engines:
+        e.kv_cache.current_len = 0
+        e.deltanet_state.reset()
+
+    t0 = time.perf_counter()
+    for i in range(bench_steps):
+        engine.decode_step(emb, warmup_steps + i)
+    engine.synchronize()
+    total_elapsed = time.perf_counter() - t0
+
+    profiler.uninstall()
+
+    tok_per_sec = bench_steps / total_elapsed
+    ms_per_tok = total_elapsed / bench_steps * 1000
+    mean_total_ms, mean_ar_ms, mean_compute_ms = profiler.get_stats()
+    ar_pct = (mean_ar_ms / mean_total_ms * 100) if mean_total_ms > 0 else 0.0
+    compute_pct = (mean_compute_ms / mean_total_ms * 100) if mean_total_ms > 0 else 0.0
+
+    print(f"\n[{label}] Results:")
+    print(f"  Throughput:         {tok_per_sec:.1f} tok/s")
+    print(f"  Latency:            {ms_per_tok:.1f} ms/tok")
+    print(f"  Total elapsed:      {total_elapsed:.2f}s ({bench_steps} steps)")
+    print(f"  Allreduce time:     {mean_ar_ms:.2f} ms/tok  ({ar_pct:.1f}%)")
+    print(f"  Compute time:       {mean_compute_ms:.2f} ms/tok  ({compute_pct:.1f}%)")
+
+    return tok_per_sec, ms_per_tok, mean_ar_ms, mean_compute_ms
+
+
 def main():
     print("=" * 70)
-    print("TP=4 Decode Benchmark — P2P Allreduce Baseline")
+    print("TP=4 Decode Benchmark — P2P Allreduce + Threaded Dispatch")
     print("=" * 70)
     print(f"Model:        {MODEL_DIR}")
     print(f"GPUs:         {DEVICE_IDS}")
@@ -147,67 +196,45 @@ def main():
     np.random.seed(42)
     emb = np.random.randn(config.hidden_size).astype(np.float16)
 
-    # ----------- Install allreduce profiler -----------
-    profiler = AllreduceProfiler(engine)
-    profiler.install()
+    # ----------- Serial benchmark -----------
+    print(f"\n{'=' * 70}")
+    print("SERIAL DISPATCH (baseline)")
+    print("=" * 70)
+    serial_tps, serial_ms, serial_ar_ms, serial_compute_ms = run_benchmark(
+        engine, emb, WARMUP_STEPS, BENCH_STEPS, threaded=False,
+        label="SERIAL")
 
-    # ----------- Warmup -----------
-    print(f"\nRunning {WARMUP_STEPS} warmup steps...")
-    for e in engine.engines:
-        e.kv_cache.current_len = 0
-        e.deltanet_state.reset()
+    # ----------- Threaded benchmark -----------
+    print(f"\n{'=' * 70}")
+    print("THREADED DISPATCH (multi-threaded, one thread per GPU)")
+    print("=" * 70)
+    threaded_tps, threaded_ms, threaded_ar_ms, threaded_compute_ms = run_benchmark(
+        engine, emb, WARMUP_STEPS, BENCH_STEPS, threaded=True,
+        label="THREADED")
 
-    for i in range(WARMUP_STEPS):
-        engine.decode_step(emb, i)
-    engine.synchronize()
-    profiler.allreduce_times.clear()  # discard warmup measurements
-    print("Warmup complete.")
-
-    # ----------- Timed benchmark -----------
-    print(f"\nRunning {BENCH_STEPS} timed decode steps...")
-
-    # Reset KV cache and state
-    for e in engine.engines:
-        e.kv_cache.current_len = 0
-        e.deltanet_state.reset()
-
-    t0 = time.perf_counter()
-    for i in range(BENCH_STEPS):
-        engine.decode_step(emb, WARMUP_STEPS + i)
-    engine.synchronize()
-    total_elapsed = time.perf_counter() - t0
-
-    # ----------- Uninstall profiler -----------
-    profiler.uninstall()
-
-    # ----------- Results -----------
-    tok_per_sec = BENCH_STEPS / total_elapsed
-    ms_per_tok = total_elapsed / BENCH_STEPS * 1000
-
-    mean_total_ms, mean_ar_ms, mean_compute_ms = profiler.get_stats()
-    ar_pct = (mean_ar_ms / mean_total_ms * 100) if mean_total_ms > 0 else 0.0
-    compute_pct = (mean_compute_ms / mean_total_ms * 100) if mean_total_ms > 0 else 0.0
+    # ----------- Summary -----------
+    speedup = serial_ms / threaded_ms if threaded_ms > 0 else float('nan')
 
     print()
     print("=" * 70)
-    print("BENCHMARK RESULTS")
+    print("BENCHMARK SUMMARY")
     print("=" * 70)
-    print(f"  Throughput:         {tok_per_sec:.1f} tok/s")
-    print(f"  Latency:            {ms_per_tok:.1f} ms/tok")
-    print(f"  Total elapsed:      {total_elapsed:.2f}s ({BENCH_STEPS} steps)")
-    print()
-    print("ALLREDUCE PROFILING BREAKDOWN (mean per decode step):")
-    print(f"  Total step time:    {mean_total_ms:.2f} ms/tok")
-    print(f"  Allreduce time:     {mean_ar_ms:.2f} ms/tok  ({ar_pct:.1f}% of total)")
-    print(f"  Compute time:       {mean_compute_ms:.2f} ms/tok  ({compute_pct:.1f}% of total)")
+    print(f"{'Mode':<20} {'tok/s':>10} {'ms/tok':>10} {'AR ms':>10} {'Compute ms':>12}")
+    print("-" * 65)
+    print(f"{'Serial':<20} {serial_tps:>10.1f} {serial_ms:>10.1f} "
+          f"{serial_ar_ms:>10.2f} {serial_compute_ms:>12.2f}")
+    print(f"{'Threaded':<20} {threaded_tps:>10.1f} {threaded_ms:>10.1f} "
+          f"{threaded_ar_ms:>10.2f} {threaded_compute_ms:>12.2f}")
+    print("-" * 65)
+    print(f"  Speedup (threaded/serial): {speedup:.3f}x")
     print()
     print("BASELINES FOR COMPARISON:")
     print(f"  Single-GPU:         20.3 tok/s  (49.3 ms/tok)")
     print(f"  vLLM TP=4:          46.9 tok/s")
     print(f"  Theoretical TP=4:  ~81.2 tok/s  (20.3 * 4)")
-    if tok_per_sec > 20.3:
-        speedup = tok_per_sec / 20.3
-        print(f"  Speedup vs single: {speedup:.2f}x")
+    if threaded_tps > 20.3:
+        vs_single = threaded_tps / 20.3
+        print(f"  Threaded vs single: {vs_single:.2f}x")
     print("=" * 70)
 
     # Cleanup
@@ -216,3 +243,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

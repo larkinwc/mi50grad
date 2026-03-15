@@ -699,3 +699,49 @@ doesn't produce measurable improvement.
 - Falls back to `fast_allreduce.c` path if P2P allreduce unavailable
 - `_allreduce_residual` and `_allreduce_sum` check `self._p2p_ar is not None` first
 
+---
+
+## Python Threading Limitations for GPU Dispatch (threaded-kernel-dispatch investigation, 2026-03-14)
+
+**Investigation finding**: Python threading for GPU kernel dispatch does NOT provide speedup on this platform. All approaches tried were 2-11x SLOWER than serial dispatch.
+
+**Root cause analysis**:
+1. `hipDeviceSynchronize()` on an idle GPU takes only **~0.6μs** (near-zero), not 50-100μs as assumed
+2. `hipModuleLaunchKernel` is asynchronous and non-blocking — serial Python dispatch already achieves parallel GPU execution
+3. Python threading Event overhead: **~490μs per round** for 4 threads (vs 31.5μs for 1 thread)
+4. GIL contention causes 15x scaling penalty going from 1 to 4 threads
+
+**Actual bottleneck**: Python kernel launch overhead (~10μs per launch × 5120 launches/decode-step = ~51ms)
+NOT GPU execution time (GPUs run in parallel since hipModuleLaunchKernel is async)
+
+**What was tried**:
+- Event-based dispatch (workers launch kernels): 6x slower (Python overhead > GPU launch benefit)
+- Parallel device sync before allreduce (workers call hipDeviceSynchronize): 2.3x slower  
+  (0.6μs sync × 4 = 2.4μs serial, threading adds 490μs overhead)
+- Queue-based dispatch: 5x slower
+
+**Threading round overhead benchmarks** (empty work, 4 threads):
+- `threading.Event`: 488μs per round
+- `threading.Barrier`: 1215μs per round
+- `threading.Semaphore`: 304μs per round
+- 1 worker (Event): 31.5μs per round (for comparison)
+
+**Why ctypes "GIL-free" doesn't help here**:
+- ctypes calls DO release GIL during the C call
+- But the C call (hipDeviceSynchronize on idle GPU) takes only 0.6μs
+- The Python Event set/wait takes ~130μs per thread pair (including OS wake-up cost)
+- Net: threading overhead >> benefit for fast C calls
+
+**What WOULD help** (not threading):
+1. Pre-cache ctypes parameter arrays (avoid rebuilding params per launch): ~5x less Python overhead
+2. Use HIP events instead of hipDeviceSynchronize (stream-based sync, milestone 2 target)
+3. Fuse multiple kernel launches into a single C extension call (reduce Python round-trips)
+4. Write a Python C extension for batch kernel dispatch (bypasses GIL completely)
+
+**Implementation status**: Threading infrastructure is implemented and CORRECT (cosine sim > 0.9999).
+Set `engine.set_threaded_dispatch(True/False)` to toggle. Performance is slightly WORSE with threading.
+
+**Recommendation for future workers**: Do NOT use Python threading for GPU kernel dispatch. 
+Focus on reducing Python overhead per launch or using HIP stream-based async operations.
+
+
