@@ -6,6 +6,37 @@ Architectural decisions, patterns discovered, and kernel design notes.
 
 ---
 
+## Stream Overlap with HIP Events (Milestone 2: stream-compute-overlap)
+
+**Implemented:** Async P2P allreduce on dedicated non-blocking HIP streams with GPU-side event synchronization.
+
+**Key design decisions:**
+1. **Non-blocking streams for allreduce**: Created with `hipStreamCreateWithFlags(HIP_STREAM_NON_BLOCKING=1)` to avoid implicit null-stream serialization. Without this, allreduce streams would auto-synchronize with the default compute stream (null stream), eliminating the overlap.
+2. **Compute events on null stream**: `hipEventRecord(event, null_stream)` captures the completion of compute kernels. The allreduce stream waits on these via `hipStreamWaitEvent` — a GPU-side wait (no CPU blocking).
+3. **Allreduce completion events on allreduce stream**: `hipEventRecord(ar_done_event, allreduce_stream)` signals completion. The null compute stream waits on these before next RMSNorm via `hipStreamWaitEvent`.
+4. **Explicit event ordering replaces implicit sync**: Instead of `hipDeviceSynchronize()`, explicit events provide correct ordering without CPU blocking.
+
+**Implementation files:**
+- `src/runtime/hip_dispatch.py`: Added `stream_create_nonblocking()`, `stream_wait_event()`
+- `src/runtime/p2p_allreduce.py`: Added `_allreduce_streams` (non-blocking), `_compute_events`, `_ar_done_events`; new methods `allreduce_residual_async()`, `wait_for_allreduce_on_compute_stream()`
+- `src/inference/tp_engine.py`: Added `_decode_step_stream_overlap()`, `set_stream_overlap_dispatch()`
+
+**Measured results (4x MI50, 100 steps Qwen3.5-27B-GPTQ-Int4):**
+- Serial: 13.4 tok/s (74.4 ms/tok), allreduce 23.29 ms/tok (31.3%)
+- Stream overlap: 14.6 tok/s (68.6 ms/tok) — 1.085x vs serial
+- Cached dispatch: 23.7 tok/s (42.2 ms/tok) — best mode
+
+**Correctness:** Cosine similarity 0.996-0.9999 vs serial, threshold 0.99. All 20 steps pass.
+
+**Key insight:** The overlap benefit is modest (1.085x) because allreduce time is ~23ms and the P2P operations themselves are the bottleneck. The benefit comes from:
+- Eliminating CPU-blocking `hipDeviceSynchronize()` calls (128 per step)
+- Allowing Python to continue dispatching next-layer kernels while GPU runs allreduce
+- The GPU enforces correct ordering via events without CPU involvement
+
+**Stream overlap vs cached dispatch interaction:** They are currently separate modes. A future optimization could combine cached dispatch (reduced Python dispatch overhead) with stream overlap (async allreduce) for potential additive benefits.
+
+---
+
 ## P2P Allreduce Race Condition Fix (TP=4 Correctness Bug)
 
 **Critical bug found and fixed:** The P2P allreduce (`src/runtime/p2p_allreduce.py`) had a race condition where the P2P gather was copying stale/incomplete partial results from GPUs 1-3.
