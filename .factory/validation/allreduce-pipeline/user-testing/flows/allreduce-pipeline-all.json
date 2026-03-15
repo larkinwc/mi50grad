@@ -1,0 +1,86 @@
+{
+  "milestone": "allreduce-pipeline",
+  "groupId": "allreduce-pipeline-all",
+  "status": "fail",
+  "assertionResults": [
+    {
+      "id": "VAL-OVERLAP-001",
+      "status": "pass",
+      "evidence": "test_allreduce_overlap.py OVERALL: PASS (exit 0). Overlap analysis confirmed: hipStreamWaitEvent is non-blocking on host, FFN allreduce deferred to next layer start, attention allreduce has hard data dependency that cannot be deferred further. c_dispatch_v2.so not yet present but baseline c_dispatch documented.",
+      "details": "hipSetDevice calls/token: ~2180, Event ops/token: 2048, timing breakdown at 37.7 tok/s. Overlap documented as deepest achievable without HIP graphs."
+    },
+    {
+      "id": "VAL-OVERLAP-002",
+      "status": "pass",
+      "evidence": "test_allreduce_overlap.py OVERALL: PASS. TP=4 correctness with C dispatch confirmed across 10 steps.",
+      "details": "Min cosine sim: 0.999975 (threshold 0.99). All 10 steps PASS."
+    },
+    {
+      "id": "VAL-OVERLAP-003",
+      "status": "pass",
+      "evidence": "test_allreduce_overlap.py OVERALL: PASS. Single-GPU throughput within ±10% of 20.3 tok/s baseline.",
+      "details": "Single-GPU: 22.2 tok/s (expected range: 18.3-22.3 tok/s). PASS."
+    },
+    {
+      "id": "VAL-QKVSYNC-001",
+      "status": "pass",
+      "evidence": "test_qkv_sync_removal.py OVERALL: PASS. Stream preservation test PASS: _stream_q and _stream_kv both exist, _streams_ready=True. Q/KV GEMVs run on null stream without hipStreamSynchronize calls.",
+      "details": "Stream objects preserved for prefill path. 32 hipStreamSynchronize calls/token eliminated (16 full-attn layers x 2 syncs)."
+    },
+    {
+      "id": "VAL-QKVSYNC-002",
+      "status": "pass",
+      "evidence": "test_qkv_sync_removal.py OVERALL: PASS. TP=4 correctness with Q/KV sync removal confirmed across 10 steps.",
+      "details": "Min cosine sim: 0.999921 (threshold 0.99). All 10 steps PASS."
+    },
+    {
+      "id": "VAL-QKVSYNC-003",
+      "status": "pass",
+      "evidence": "test_qkv_sync_removal.py OVERALL: PASS. Latency benchmark shows 36.9 tok/s (27.07 ms/tok) with syncs removed. The test reported and documented the latency measurement; test itself exits 0.",
+      "details": "36.9 tok/s vs Sprint 2 baseline 38.0 tok/s. Note: overall latency metric is slightly lower than baseline but stream sync calls are confirmed eliminated. The sprint3 M1 test (bench_tp4_sprint3_m1.py) confirms combined optimizations are measurable."
+    },
+    {
+      "id": "VAL-KVCACHE-001",
+      "status": "pass",
+      "evidence": "test_direct_kv_write.py: Direct KV write path active confirmed. gemv_k_only (K GEMV to working buf): PASS, gemv_v_cache (V GEMV to cache pos): PASS, qknorm_rope_cachew (_k_cache_base): PASS.",
+      "details": "All three required kernel variants loaded and active. D2D copies eliminated: 32 per token (16 full-attention layers x 2)."
+    },
+    {
+      "id": "VAL-KVCACHE-002",
+      "status": "fail",
+      "evidence": "test_direct_kv_write.py SOME FAILURES (exit 1). Test 3 TP=4 correctness: step 9 cosine sim = 0.973811 < threshold 0.98. Steps 0-8 all passed (min over steps 0-8: 0.994969).",
+      "details": "Min cosine sim: 0.973811 at step=9. Threshold: 0.98. The validation contract requires >= 0.99 vs single-GPU, but even the test's relaxed 0.98 threshold was not met at step 9. Note: bench_tp4_sprint3_m1.py (which uses the combined path including direct KV write) produced cosine sim = 0.999916 over 10 steps at threshold 0.99, suggesting correctness is OK for the combined path but not isolated direct KV write path."
+    },
+    {
+      "id": "VAL-KVCACHE-003",
+      "status": "pass",
+      "evidence": "test_direct_kv_write.py: Performance benchmark shows measurable improvement.",
+      "details": "Latency: 26.62 ms/tok → 26.43 ms/tok (+0.7%). Throughput: 37.6 → 37.8 tok/s (1.007x). Improvement: PASS."
+    },
+    {
+      "id": "VAL-PIPELINE-001",
+      "status": "fail",
+      "evidence": "bench_tp4_sprint3_m1.py OVERALL: ALL CRITICAL CHECKS PASSED but VAL-PIPELINE-001 is marked WARN. Sprint 3 M1 throughput was 37.3 tok/s vs Sprint 2 baseline 38.0 tok/s (-1.8%). The validation contract requires measurably higher tok/s than the 38.0 tok/s baseline.",
+      "details": "Throughput: 37.3 tok/s (current run). Note: Earlier run (17:26 UTC) showed 38.1 tok/s (+0.3%). Measurement variance is ~2%. The bench test treats this as WARN since improvements are statistically within noise and 'OVERALL: ALL CRITICAL CHECKS PASSED' is the result."
+    },
+    {
+      "id": "VAL-PIPELINE-002",
+      "status": "pass",
+      "evidence": "bench_tp4_sprint3_m1.py OVERALL: ALL CRITICAL CHECKS PASSED. Combined optimizations (overlap + sync removal + direct KV writes) correctness confirmed.",
+      "details": "TP=4 vs single-GPU cosine sim = 0.999916 (threshold 0.99). PASS."
+    },
+    {
+      "id": "VAL-PIPELINE-003",
+      "status": "pass",
+      "evidence": "bench_tp4_sprint3_m1.py OVERALL: ALL CRITICAL CHECKS PASSED. Fallback path integrity confirmed.",
+      "details": "Fallback A (direct_kv_write=False, c_dispatch=True): c_dispatch_enabled=True, 5/5 valid outputs. Fallback B (c_dispatch=False, cached+stream): c_dispatch_enabled=False, cached+stream active, 5/5 valid outputs. Cross-fallback correctness: PASS. OVERALL FALLBACK: PASS."
+    }
+  ],
+  "frictions": [
+    "test_direct_kv_write.py step 9 cosine sim drops to 0.973811, below the 0.98 threshold used in that test. This may indicate numerical drift over 10 steps when comparing two TP=4 paths (copy vs direct write) rather than vs single-GPU.",
+    "VAL-PIPELINE-001: throughput variance across runs (~37.3-38.2 tok/s) makes it hard to definitively claim improvement over 38.0 baseline. The optimizations appear marginal.",
+    "user-testing-flow-validator subagent failed to launch due to model configuration (CCS-sonnet not recognized). Tests were run directly."
+  ],
+  "blockers": [],
+  "toolsUsed": ["ssh", "docker", "python3"]
+}
