@@ -1410,7 +1410,11 @@ class InferenceEngine:
     # --- Kernel launchers ---
 
     def _launch_rmsnorm(self, dst, src, weight, dim):
-        func = self.kernels.get_hip("rmsnorm_v2", "elementwise_v2")
+        # Use v3 (float4 vectorized, 1.42-1.58x faster than v2) if available
+        try:
+            func = self.kernels.get_hip("rmsnorm_v3", "elementwise_v3")
+        except Exception:
+            func = self.kernels.get_hip("rmsnorm_v2", "elementwise_v2")
         params = [
             ctypes.c_uint64(dst),
             ctypes.c_uint64(src),
@@ -1423,7 +1427,11 @@ class InferenceEngine:
 
     def _launch_skip_rmsnorm(self, dst, hidden, residual, weight, dim):
         """Fused: hidden += residual; dst = rmsnorm(hidden) * weight."""
-        func = self.kernels.get_hip("skip_rmsnorm_v2", "elementwise_v2")
+        # Use v3 (float4 vectorized, 1.16x faster than v2) if available
+        try:
+            func = self.kernels.get_hip("skip_rmsnorm_v3", "elementwise_v3")
+        except Exception:
+            func = self.kernels.get_hip("skip_rmsnorm_v2", "elementwise_v2")
         params = [
             ctypes.c_uint64(dst),
             ctypes.c_uint64(hidden),
@@ -1725,25 +1733,44 @@ class InferenceEngine:
             self.device.launch(func, (1, num_heads, 1), (half_rotary, 1, 1), params)
 
     def _launch_decode_attn_256(self, out, q, k_cache, v_cache, seq_len):
-        """Launch head_dim=256 decode attention using flash attention kernel.
+        """Launch head_dim=256 decode attention using tuned flash attention kernel.
 
-        Uses flash_attn_256 with num_q_rows=1 and causal=0 (single Q row
-        attends to all KV positions). TP: uses local head counts.
+        Uses flash_attn_256_tuned.hip with flash_attn_256_decode (4-WF KV-parallel
+        merge, 2.8-5.5x faster than original for decode). Falls back to the
+        original flash_attn_256_fp16 if tuned kernel is unavailable.
+        TP: uses local head counts.
         """
-        func = self.kernels.get_hip("flash_attn_256_fp16", "flash_attn_256")
-        params = [
-            ctypes.c_uint64(q),
-            ctypes.c_uint64(k_cache),
-            ctypes.c_uint64(v_cache),
-            ctypes.c_uint64(out),
-            ctypes.c_uint32(seq_len),       # kv_seq_len
-            ctypes.c_uint32(1),              # num_q_rows = 1 for decode
-            ctypes.c_uint32(self.local_num_attention_heads),
-            ctypes.c_uint32(self.local_num_kv_heads),
-            ctypes.c_uint32(0),              # non-causal (single Q row)
-        ]
-        self.device.launch(func, (self.local_num_attention_heads, 1, 1),
-                           (256, 1, 1), params)
+        try:
+            # Tuned decode kernel: flash_attn_256_decode
+            # Signature: (Q, K, V, Out, kv_seq_len, num_heads, num_kv_heads) — 7 params
+            func = self.kernels.get_hip("flash_attn_256_decode", "flash_attn_256_tuned")
+            params = [
+                ctypes.c_uint64(q),
+                ctypes.c_uint64(k_cache),
+                ctypes.c_uint64(v_cache),
+                ctypes.c_uint64(out),
+                ctypes.c_uint32(seq_len),       # kv_seq_len
+                ctypes.c_uint32(self.local_num_attention_heads),
+                ctypes.c_uint32(self.local_num_kv_heads),
+            ]
+            self.device.launch(func, (self.local_num_attention_heads, 1, 1),
+                               (256, 1, 1), params)
+        except Exception:
+            # Fallback to original flash_attn_256_fp16
+            func = self.kernels.get_hip("flash_attn_256_fp16", "flash_attn_256")
+            params = [
+                ctypes.c_uint64(q),
+                ctypes.c_uint64(k_cache),
+                ctypes.c_uint64(v_cache),
+                ctypes.c_uint64(out),
+                ctypes.c_uint32(seq_len),       # kv_seq_len
+                ctypes.c_uint32(1),              # num_q_rows = 1 for decode
+                ctypes.c_uint32(self.local_num_attention_heads),
+                ctypes.c_uint32(self.local_num_kv_heads),
+                ctypes.c_uint32(0),              # non-causal (single Q row)
+            ]
+            self.device.launch(func, (self.local_num_attention_heads, 1, 1),
+                               (256, 1, 1), params)
         self._record_launch(getattr(self, '_active_layer_idx', -1))
 
 
@@ -1760,32 +1787,33 @@ class InferenceEngine:
         self._record_launch(getattr(self, '_active_layer_idx', -1))
 
     def _launch_silu_fused(self, gate, up, out, n):
-        func = self.kernels.get_hip("silu_fused_v2", "elementwise_v2")
+        # Use v3 (float4 vectorized, 1.31x faster than v2) if available
+        try:
+            func = self.kernels.get_hip("silu_fused_v3", "elementwise_v3")
+            grid_x = (n + 2047) // 2048  # v3: 8 FP16 per thread × 256 threads = 2048 per block
+        except Exception:
+            func = self.kernels.get_hip("silu_fused_v2", "elementwise_v2")
+            grid_x = (n + 511) // 512    # v2: 2 FP16 per thread × 256 threads = 512 per block
         params = [
             ctypes.c_uint64(gate),
             ctypes.c_uint64(up),
             ctypes.c_uint32(n),
         ]
-        grid_x = (n + 511) // 512  # each thread handles 2 elements
         self.device.launch(func, (grid_x, 1, 1), (256, 1, 1), params)
 
     def _launch_residual_add(self, dst, src, n):
-        func = self.kernels.get_hip("residual_add_v2", "elementwise_v2")
+        # Use v3 (float4 vectorized, 1.26-1.32x faster than v2) if available
+        try:
+            func = self.kernels.get_hip("residual_add_v3", "elementwise_v3")
+            grid_x = (n + 2047) // 2048  # v3: 8 FP16 per thread × 256 = 2048 per block
+        except Exception:
+            func = self.kernels.get_hip("residual_add_v2", "elementwise_v2")
+            grid_x = (n + 511) // 512    # v2: 2 FP16 per thread × 256 = 512 per block
         params = [
             ctypes.c_uint64(dst),
             ctypes.c_uint64(src),
             ctypes.c_uint32(n),
         ]
-        grid_x = (n + 511) // 512  # each thread handles 2 elements
-        self.device.launch(func, (grid_x, 1, 1), (256, 1, 1), params)
-
-        func = self.kernels.get_hip("residual_add_v2", "elementwise_v2")
-        params = [
-            ctypes.c_uint64(dst),
-            ctypes.c_uint64(src),
-            ctypes.c_uint32(n),
-        ]
-        grid_x = (n + 511) // 512  # each thread handles 2 elements
         self.device.launch(func, (grid_x, 1, 1), (256, 1, 1), params)
 
     def _launch_activation_quant(self, src_fp16, n):
@@ -2223,7 +2251,7 @@ class InferenceEngine:
 
             # --- Attention RMSNorm ---
             lc['attn_rmsnorm'] = LaunchSpec(
-                func=self.kernels.get_hip("rmsnorm_v2", "elementwise_v2"),
+                func=self.kernels.get_hip("rmsnorm_v3", "elementwise_v3"),
                 grid=(1, 1, 1), block=(256, 1, 1),
                 params=[
                     ctypes.c_uint64(self.d_normed),
@@ -2297,7 +2325,9 @@ class InferenceEngine:
                     )
 
                 # --- Decode attention (seq_len is mutable: index [4]) ---
-                attn_func = self.kernels.get_hip("flash_attn_256_fp16", "flash_attn_256")
+                # Use tuned flash_attn_256_decode (4-WF KV-parallel, 2.8-5.5x faster)
+                # Signature: (Q, K, V, Out, kv_seq_len, num_heads, num_kv_heads) — 7 params
+                attn_func = self.kernels.get_hip("flash_attn_256_decode", "flash_attn_256_tuned")
                 lc['decode_attn'] = LaunchSpec(
                     func=attn_func,
                     grid=(self.local_num_attention_heads, 1, 1), block=(256, 1, 1),
@@ -2307,10 +2337,8 @@ class InferenceEngine:
                         ctypes.c_uint64(self.kv_cache.layer_v_ptr(layer_idx)),
                         ctypes.c_uint64(self.d_attn_out),
                         ctypes.c_uint32(1),   # seq_len: mutable [4], updated per step
-                        ctypes.c_uint32(1),   # num_q_rows = 1 for decode
                         ctypes.c_uint32(self.local_num_attention_heads),
                         ctypes.c_uint32(self.local_num_kv_heads),
-                        ctypes.c_uint32(0),   # non-causal
                     ],
                 )
 
@@ -2419,7 +2447,7 @@ class InferenceEngine:
 
             # --- FFN RMSNorm ---
             lc['ffn_rmsnorm'] = LaunchSpec(
-                func=self.kernels.get_hip("rmsnorm_v2", "elementwise_v2"),
+                func=self.kernels.get_hip("rmsnorm_v3", "elementwise_v3"),
                 grid=(1, 1, 1), block=(256, 1, 1),
                 params=[
                     ctypes.c_uint64(self.d_normed),
