@@ -1,0 +1,39 @@
+{
+  "featureId": "tp4-baseline-benchmark",
+  "status": "pass",
+  "issues": [
+    {
+      "severity": "non_blocking",
+      "description": "The AllreduceProfiler uses monkey-patching (replacing engine._allreduce_residual and engine.decode_step) to measure allreduce time. The profiler replaces decode_step with timed_decode_step which calls the original decode_step. However, the AllreduceProfiler's `_timed_allreduce_residual` replaces `engine._allreduce_residual` but `engine.decode_step` internally calls `self._allreduce_residual` (via the instance). Since Python method lookup goes through the instance dict first, the monkey-patch on the instance works correctly. This is correct but fragile - any future refactoring that uses `TPInferenceEngine._allreduce_residual(self, ...)` (class method call) instead of `self._allreduce_residual(...)` would break the profiler.",
+      "location": "tests/bench_tp4.py, AllreduceProfiler"
+    },
+    {
+      "severity": "non_blocking",
+      "description": "The benchmark measures wall-clock allreduce time by timing the Python-side `_allreduce_residual` call, which includes the hipDeviceSynchronize overhead, P2P copies, kernel execution, and stream synchronization. This is a reasonable total allreduce latency measurement. However, since hipDeviceSynchronize() blocks all GPU work (not just allreduce), the 'compute time' (total - allreduce) may undercount true compute time if some compute overlaps in the wall-clock measurement. The profiling approach is good enough for milestone 1 baseline purposes.",
+      "location": "tests/bench_tp4.py, AllreduceProfiler.get_stats()"
+    },
+    {
+      "severity": "suggestion",
+      "description": "The benchmark results (12.8 tok/s) show TP=4 is slower than single-GPU (20.3 tok/s). The benchmark script's BASELINES section notes this comparison but doesn't flag it as unexpected or explain the root cause in the output. Adding a note like 'NOTE: P2P allreduce adds synchronization overhead; subsequent milestones target overlap and fusion' would make the output more informative for future reference.",
+      "location": "tests/bench_tp4.py, main() BASELINES output section"
+    },
+    {
+      "severity": "suggestion",
+      "description": "The benchmark uses np.random.seed(42) and a fixed embedding for all 100 steps, reusing the same input rather than simulating real token generation. This is acceptable for throughput measurement but doesn't reflect real decode behavior (KV cache growth, varying input distributions). The warmup of only 3 steps may be insufficient to reach steady-state GPU memory access patterns, though in practice this is common for GPU benchmarks.",
+      "location": "tests/bench_tp4.py, main()"
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "target": "library",
+      "observation": "TP=4 baseline benchmark results (milestone 1, P2P allreduce with hipDeviceSynchronize): 12.8 tok/s (78.2 ms/tok) for 100 decode steps. Allreduce overhead: 23.55 ms/tok (30.1%), Compute: 54.62 ms/tok (69.9%). This is the baseline that subsequent milestones (threaded-dispatch, advanced-fusions) should improve. Single-GPU: 20.3-20.8 tok/s. TP=4 with P2P allreduce is currently 1.59x slower than single-GPU due to synchronization overhead.",
+      "rationale": "Performance baseline is essential knowledge for evaluating future optimization milestones."
+    },
+    {
+      "target": "library",
+      "observation": "For TP=4 benchmarks on the dev server: stop vLLM first (docker stop vllm-mobydick, uses 93% VRAM on all 4 GPUs), use -e HIP_VISIBLE_DEVICES=0,1,2,3, and restart vLLM after (docker start vllm-mobydick). Model loading for Qwen3.5-27B-GPTQ-Int4 on 4 GPUs takes ~40-60s. Use QwenWeightLoader pattern: loader = QwenWeightLoader(MODEL_DIR, config); engine.load_layer_weights(i, loader.load_layer(i)).",
+      "rationale": "Operational knowledge needed for future benchmark workers in milestones 2 and 3."
+    }
+  ],
+  "summary": "The tp4-baseline-benchmark creates a well-structured benchmark that fulfills VAL-P2P-003 (TP=4 decode benchmark completes successfully with all 4 GPUs). The AllreduceProfiler monkey-patch approach correctly measures allreduce vs compute time. The benchmark results (12.8 tok/s, 30.1% allreduce overhead) accurately characterize the milestone 1 bottleneck and establish a clear starting point for subsequent optimizations. The benchmark is below the 50 tok/s target, but this is a baseline measurement by design - the target requires all three milestone optimizations. Overall: PASS."
+}

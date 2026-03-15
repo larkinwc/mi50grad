@@ -1,0 +1,44 @@
+{
+  "featureId": "p2p-allreduce-module",
+  "status": "pass",
+  "issues": [
+    {
+      "severity": "non_blocking",
+      "description": "The HIP kernel file (src/kernels/p2p_allreduce.hip) contains duplicate kernel definitions. The first half defines static (non-extern-C) kernels (p2p_reduce_sum_residual_tp2_kernel, etc.) launched via the extern-C wrappers. The second half of the file defines an additional set of extern-C __global__ kernels (p2p_reduce_sum_residual_tp2, etc.) with similar logic that are never called by the wrappers. This is dead code that adds compilation overhead and potential confusion.",
+      "location": "src/kernels/p2p_allreduce.hip (second half of file ~line 280 onwards)"
+    },
+    {
+      "severity": "non_blocking",
+      "description": "The `_load_lib` method in P2PAllreduce compiles the shared library at runtime using a hard-coded `/opt/rocm/bin/hipcc` path. If run outside Docker (e.g., from macOS dev machine), this will fail with FileNotFoundError. The error is caught and re-raised as RuntimeError, which is acceptable, but an earlier guard or cleaner fallback might help future debugging.",
+      "location": "src/runtime/p2p_allreduce.py, _load_lib()"
+    },
+    {
+      "severity": "non_blocking",
+      "description": "TP=4 correctness test (`test_correctness(4)` inside test_p2p_allreduce.py) was skipped during validation because only 3 GPUs were visible in the Docker environment during that run. The test code exists but was not exercised for TP=4. It was subsequently validated via test_tp4_correctness.py in the next feature, but a note in the test or handoff would have clarified this gap.",
+      "location": "tests/test_p2p_allreduce.py"
+    },
+    {
+      "severity": "suggestion",
+      "description": "The `allreduce_residual` and `allreduce_sum` methods could use consistent stream handling. Currently, the broadcast uses `self._streams[i]` for peer GPUs, but the gather uses only `stream0`. Adding a comment explaining the rationale for using separate streams for gather vs broadcast would improve maintainability.",
+      "location": "src/runtime/p2p_allreduce.py, allreduce_residual()"
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "target": "library",
+      "observation": "When compiling HIP kernels as a shared library for use from Python ctypes, always use `hipcc -shared -fPIC` + `hipLaunchKernelGGL` C wrappers. The `hipModuleLaunchKernel` approach (loading HSACO + module) fails with hipErrorInvalidDevice(101) in multi-GPU ctypes contexts due to device context mismatch. See src/kernels/p2p_allreduce.hip and src/runtime/p2p_allreduce.py for the working pattern.",
+      "rationale": "This is a discovered environment quirk critical for future kernel authors working on TP multi-GPU code."
+    },
+    {
+      "target": "library",
+      "observation": "Always call `(void)hipGetLastError()` at the start of host-callable C wrapper functions in HIP shared libraries. This clears stale error state (e.g., hipErrorPeerAccessAlreadyEnabled = 704) that can otherwise cause subsequent hipGetLastError() checks to return spurious non-zero values. See the extern-C wrappers in src/kernels/p2p_allreduce.hip.",
+      "rationale": "This pattern prevents false error reports in the Python caller and is needed for all P2P-adjacent GPU code."
+    },
+    {
+      "target": "AGENTS.md",
+      "observation": "The Docker image sets `ENV HIP_VISIBLE_DEVICES=0,1,2` limiting containers to 3 GPUs by default. For TP=4 testing, all Docker run commands MUST include `-e HIP_VISIBLE_DEVICES=0,1,2,3`. This is already documented in AGENTS.md but was also a practical blocker during p2p-allreduce-module validation (TP=4 test skipped due to this). The instruction should be in AGENTS.md which already has it.",
+      "rationale": "Already documented in AGENTS.md - no additional update needed. Confirming alignment."
+    }
+  ],
+  "summary": "P2P allreduce module is well-implemented and follows established patterns. Core correctness was validated for TP=2,3 (max_abs_err=0.0) with 1.64x speedup over host-mediated path. TP=4 was partially tested (correctness path validated in subsequent feature). The main non-blocking issue is duplicate kernel definitions in the .hip file (dead code). The shared lib + hipLaunchKernelGGL pattern is correctly established as the standard for multi-GPU kernels. Overall: PASS."
+}

@@ -1,0 +1,34 @@
+{
+  "featureId": "tp4-engine-integration",
+  "status": "pass",
+  "issues": [
+    {
+      "severity": "non_blocking",
+      "description": "The race condition fix uses `hipDeviceSynchronize()` (full device sync) before each P2P gather. While correct, this is a conservative approach that stalls all outstanding GPU work on every device. The fix is applied at the start of both `allreduce_residual()` and `allreduce_sum()`. For 128 allreduces per token, this adds 128 full device synchronization points per decode step, contributing to the measured 30% allreduce overhead in the subsequent benchmark. A future optimization would use hipEventRecord on the compute stream + hipStreamWaitEvent on the P2P stream to create fine-grained dependencies without a full device sync.",
+      "location": "src/runtime/p2p_allreduce.py, allreduce_residual() and allreduce_sum(), Step 0 comment"
+    },
+    {
+      "severity": "suggestion",
+      "description": "The test_tp4_correctness.py script frees the single-GPU engine before loading the TP=4 engine to reduce VRAM pressure. This is a good practice given the VRAM constraints on MI50 with a 27B model. However, this means the single-GPU reference outputs (single_outputs) are collected first, then compared against TP=4 outputs. If the model weights are non-deterministic at load time (e.g., different quantization de-packing order), this could hypothetically cause false failures. In practice, weights are deterministic so this is a minor concern.",
+      "location": "tests/test_tp4_correctness.py, main()"
+    },
+    {
+      "severity": "suggestion",
+      "description": "The test_tp4_correctness.py uses a fixed random seed (np.random.seed(42)) for the input embedding but then immediately overwrites with `emb = np.random.randn(config.hidden_size).astype(np.float16)`. Using the same embedding for all 10 steps (not iterating based on the token output) means each decode step uses the same token embedding rather than the actual next-token embedding. This is acceptable for a correctness test comparing TP=4 vs single-GPU (both see the same input), but the test doesn't validate autoregressive behavior where each step uses the previous step's output token.",
+      "location": "tests/test_tp4_correctness.py, main()"
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "target": "library",
+      "observation": "When mixing GPU computation streams (e.g., InferenceEngine's _stream_q, _stream_kv) with P2P transfer streams (TensorParallelGroup streams), you MUST synchronize all source devices before initiating peer-to-peer hipMemcpyPeerAsync. Without this, the P2P copy reads stale/incomplete GEMV results. hipMemcpyPeerAsync does NOT automatically track stream dependencies from other streams on the source device. Use hipDeviceSynchronize() for correctness, or hipEventRecord + hipStreamWaitEvent for fine-grained optimization. See src/runtime/p2p_allreduce.py.",
+      "rationale": "This is a confirmed correctness bug that was discovered and fixed. Critical knowledge for future TP optimizations."
+    },
+    {
+      "target": "AGENTS.md",
+      "observation": "Future workers implementing stream overlap (milestone 2: threaded-dispatch) should be aware that replacing hipDeviceSynchronize() with HIP events is the key optimization opportunity. The event-based approach: (1) hipEventRecord on each engine's compute stream after GEMV, (2) hipStreamWaitEvent on the P2P stream before gather. This was left as a future optimization by the tp4-engine-integration worker.",
+      "rationale": "This is a normative guidance recommendation for the orchestrator about what to tell milestone 2 workers."
+    }
+  ],
+  "summary": "TP=4 engine integration successfully fixed the race condition that caused cosine similarity of ~0.1 (stale partial reads) and achieved correctness of 0.999990-0.999995 cosine similarity across all 10 decode steps. Both allreduce_residual and allreduce_sum were correctly fixed. The hipDeviceSynchronize approach is conservative but correct. test_tp4_correctness.py is well-structured with proper cleanup and NaN detection. The VAL-P2P-002 assertion is clearly fulfilled. Overall: PASS."
+}

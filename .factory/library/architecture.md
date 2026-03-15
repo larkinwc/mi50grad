@@ -22,6 +22,25 @@ Architectural decisions, patterns discovered, and kernel design notes.
 
 ---
 
+## TP=4 Decode Performance Baselines (Milestone 1: p2p-allreduce, measured 2026-03-14)
+
+**Milestone 1 result (P2P allreduce with hipDeviceSynchronize correctness fix):**
+- TP=4 throughput: **12.8 tok/s** (78.2 ms/tok), 100 decode steps on Qwen3.5-27B-GPTQ-Int4
+- Allreduce overhead: **23.55 ms/tok (30.1%)** of total decode time
+- Compute time: 54.62 ms/tok (69.9%)
+- Single-GPU reference: 20.6 tok/s (no regression from 20.3 baseline)
+- TP=4 is currently 1.59x SLOWER than single-GPU due to synchronization overhead
+
+**Root cause of slowdown:** The hipDeviceSynchronize() before each P2P gather (added as race condition fix) serializes all GPU work 128 times per token (2 allreduces × 64 layers). This eliminates any parallelism gains from TP.
+
+**Target for future milestones:**
+- Milestone 2 (threaded-dispatch): Replace hipDeviceSynchronize with HIP events (hipEventRecord + hipStreamWaitEvent) for fine-grained dependency tracking, add multi-threaded kernel dispatch
+- Milestone 3 (advanced-fusions): Fuse P2P allreduce into GEMV epilogue, reduce allreduce count
+
+**Validation test:** `tests/bench_tp4.py` + `tests/test_tp4_correctness.py` (cosine sim 0.999990-0.999995)
+
+---
+
 ## Optimization Sprint Reference (kernel-optimization-sprint mission)
 
 ### FlashAttention Block-Tiling Design
