@@ -914,3 +914,47 @@ engine.set_cached_dispatch(True)
 - `src/inference/tp_engine.py`: `TPInferenceEngine.build_dispatch_cache()`, `set_cached_dispatch()`, `_decode_step_cached()`
 
 
+---
+
+## Deferred DeltaNet Allreduce — Infeasible (Milestone 3: deferred-deltanet-allreduce, 2026-03-14)
+
+**Feature goal:** For DeltaNet linear attention layers (48 of 64 layers), combine the attention and FFN
+allreduces into a single allreduce, halving the allreduce count for 75% of layers (from 128 to 80 per step).
+
+**Proposed mechanism:**
+1. Compute attention output (proj_out) using pre-attention hidden state
+2. Compute FFN output (ffn_out) using the SAME pre-attention hidden state (skip intermediate attn allreduce)
+3. Combine: combined = proj_out + ffn_out (on-GPU element-wise add)
+4. Single ALLREDUCE(combined) → d_hidden += combined_global
+
+**Critical finding: INFEASIBLE due to numerical divergence.**
+
+Measured results from `tests/test_deferred_allreduce.py`:
+- Standard flow: attn_allreduce updates d_hidden; FFN sees d_hidden + attn_result
+- Deferred flow: FFN sees d_hidden (WITHOUT attn_result)
+- Min cosine similarity across 10 decode steps: **0.589** (threshold: 0.99)
+- Max absolute difference: ~20-24 FP16 units per element
+
+**Why divergence is so large:**
+The attention residual is NOT negligible. The DeltaNet output proj (full hidden_size=5120) creates a 
+significant residual contribution that the pre-FFN RMSNorm normalizes. When the FFN sees hidden without 
+this contribution, it computes a completely different normalized input, resulting in fundamentally 
+different FFN outputs. The cumulative effect across 48 DeltaNet layers causes catastrophic output divergence.
+
+**Allreduce count (theoretical, if feasible):**
+- Standard: 128/step (2 × 64 layers)
+- Deferred: 80/step (1 × 48 DeltaNet + 2 × 16 full-attn) → 37.5% reduction
+
+**Decision:** Do NOT apply this optimization. Correctness takes priority over speed.
+
+**Alternative approaches (not explored, for future reference):**
+- Approximate layer norm (use the pre-attention hidden for ALL normalizations as an approx)
+  — would still have same divergence issue
+- Only apply to the first few DeltaNet layers where divergence is smaller
+  — overhead of selective application negates benefit
+- Use skip-connection arithmetic: maintain a running "deferred sum" across multiple layers
+  — much more complex, unknown numerical properties
+- The 80-allreduce path is correct in count but changes the math fundamentally — not acceptable
+
+
+
