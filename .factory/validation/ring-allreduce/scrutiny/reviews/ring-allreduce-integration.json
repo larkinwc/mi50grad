@@ -1,0 +1,46 @@
+{
+  "featureId": "ring-allreduce-integration",
+  "commitId": "9362c8f",
+  "status": "pass",
+  "issues": [
+    {
+      "severity": "non_blocking",
+      "description": "test_ring_vs_star_benchmark uses cached+stream path (not C dispatch) to measure throughput. The test comment says 'VAL-RING-005: Both ring and star allreduce work correctly within the C dispatch loop path' but the benchmark in Test 1 explicitly disables C dispatch (set_c_dispatch(False)). The benchmark correctly measures cached+stream, not C dispatch. The C dispatch correctness test (Test 2) does test C dispatch path correctly.",
+      "suggestedFix": "Document clearly that the throughput benchmark (Test 1) uses cached+stream path, not C dispatch. This is reasonable since the purpose is to measure allreduce topology overhead in isolation."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "In test_ring_correctness_c_dispatch, the implementation note says: 'C dispatch plan uses star topology allreduce kernels even when ring is enabled' — this is confusing. The test manually nulls out _c_dispatch_plan and calls set_c_dispatch(True) to rebuild with ring. This manual state manipulation could break if _build_c_dispatch_plan internals change.",
+      "suggestedFix": "Add a rebuild_c_dispatch_plan(ring_allreduce: bool) method to TPInferenceEngine to make this rebuild explicit and less brittle."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "The test_ring_fallback function (Test 5) only checks that star topology is restored as default after ring is disabled, but does NOT compare ring vs star output for correctness. The comparison is done at cos >= 0.95 threshold (not the 0.99 correctness threshold), and a mismatch only sets ring_matches_star=False but does NOT fail the test. The actual test pass/fail is only based on star_is_active.",
+      "suggestedFix": "Either raise the threshold to 0.99 and fail on mismatch, or rename the comparison to make it clear it is informational (not a pass/fail check). The current behavior means ring vs star divergence would not be detected."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "target": "AGENTS.md",
+      "observation": "Pattern observed: ring allreduce is slower than star for hidden_size=5120 (3.38x slower in benchmark, 8.5x in microbenchmark). Workers implementing allreduce alternatives for this project should document and justify the expected performance vs the baseline before implementation, since ring topology is only beneficial for large hidden dimensions.",
+      "isSystemic": false
+    },
+    {
+      "target": "library",
+      "observation": "Ring vs star allreduce benchmark results for Qwen3.5-27B TP=4 decode on MI50 PCIe: Star=26.0 tok/s (38.42 ms/tok), Ring=7.7 tok/s (129.74 ms/tok). Star is 3.38x faster for hidden_size=5120 (10KB) payloads. Ring allreduce is available via set_ring_allreduce(True) but star is the default and recommended topology for this model.",
+      "suggestedAction": "Add to library/architecture.md under ring allreduce results section"
+    }
+  ],
+  "keyMetrics": {
+    "starTokPerSec": "26.0 tok/s (38.42 ms/tok) — DEFAULT",
+    "ringTokPerSec": "7.7 tok/s (129.74 ms/tok) — AVAILABLE",
+    "starOverRingSpeedup": "3.38x (star is faster as expected)",
+    "ringCDispatchMinCosineSim": ">=0.9999 (PASS)",
+    "ringCachedStreamMinCosineSim": ">=0.9999 (PASS)",
+    "starIsDefault": "PASS — _ring_allreduce=False by default",
+    "fallbackWorks": "PASS — ring disabled reverts to star",
+    "val_ring_005": "PASS — both ring and star work in C dispatch; benchmark confirms star faster for 10KB",
+    "val_ring_007": "PASS — benchmark comparison complete, star documented as default"
+  },
+  "summary": "Ring allreduce integration test is well-structured and complete. All 5 test cases pass: benchmark confirms star is 3.38x faster than ring for 10KB payloads (expected, documented), ring correctness with C dispatch path passes (cosine sim >= 0.9999), ring correctness with cached+stream passes, star-is-default verified, fallback works. Minor issues: benchmark uses cached+stream instead of C dispatch (acceptable), manual plan rebuild is brittle, fallback ring vs star comparison threshold is too low. Feature is pass — VAL-RING-005 and VAL-RING-007 are satisfied."
+}

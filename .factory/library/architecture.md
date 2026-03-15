@@ -916,6 +916,50 @@ engine.set_cached_dispatch(True)
 
 ---
 
+## Ring Allreduce — Available but Slower than Star for 10KB Payloads (ring-allreduce milestone, 2026-03-15)
+
+**Implementation:** `src/kernels/ring_allreduce.hip` + `RingAllreduce` class in `src/runtime/p2p_allreduce.py`
+
+**Algorithm:** Ring topology with FP32 scratch buffers for precision:
+1. **Init:** Convert each GPU's FP16 partial → FP32 result buffer (full hidden_size)
+2. **Reduce-scatter** (TP-1 = 3 rounds): GPU[i] sends FP32 chunk[(i-r)%TP] to right neighbor; receiver accumulates via `ring_fp32_accumulate_fp32`. After 3 rounds: GPU[i] has fully-reduced FP32 chunk[(i+1)%TP].
+3. **All-gather** (TP-1 = 3 rounds): GPU[i] sends fully-reduced FP32 chunk to right neighbor directly into result buffer slot. After 3 rounds: all GPUs have complete FP32 result.
+4. **Residual add:** `ring_residual_add_fp32_to_fp16` adds FP32 result to FP16 hidden buffer.
+
+**Precision design:** FP32 accumulators throughout ring phases → max_abs_err=0.0 vs CPU FP32 reference (exact match). Better precision than star topology (which uses FP16 throughout). P2P transfers are FP32 (4 bytes/element vs 2 for FP16) — 20KB per round for 5120-element hidden.
+
+**Performance results (gfx906 MI50, TP=4, hidden_size=5120):**
+- Star allreduce (P2PAllreduce): ~119 us/call microbenchmark
+- Ring allreduce (RingAllreduce): ~1015 us/call microbenchmark (**8.5x SLOWER**)
+- TP=4 decode with star (cached+stream): 26.0 tok/s
+- TP=4 decode with ring (cached+stream): 7.7 tok/s (**3.38x SLOWER**)
+
+**Why ring is slower for 10KB payloads on PCIe:**
+- Ring has 6 sequential P2P rounds, each synchronized at the Python level (stream_synchronize())
+- For 5120 FP16 elements (10KB): bandwidth is NOT the bottleneck — P2P latency per round dominates
+- Each round: submit P2P copy, sync, submit accumulate kernel, sync = ~2 synchronizations × ~50-100us = ~100-200us per round
+- 6 rounds × ~170us ≈ 1015us vs star's 2 rounds ≈ 119us
+- Ring topology's bandwidth advantage only materializes for large payloads where:
+  `6 rounds × latency_per_round < 2 × (total_size / P2P_bandwidth)`
+  For PCIe ~12 GB/s: break-even at hidden_size ≈ 32768+ elements (64KB+ FP16)
+
+**API:**
+```python
+engine.set_ring_allreduce(True)   # Enable ring topology (SLOWER for small payloads)
+engine.set_ring_allreduce(False)  # Restore star topology (DEFAULT)
+# Ring allreduce loaded by default; star (P2PAllreduce) is the active default
+```
+
+**Critical note:** `RingAllreduce.allreduce_residual_async()` is NOT truly async despite its name. The ring allreduce calls `stream_synchronize()` 18 times internally (between each of 6 P2P rounds × 3 sync points). The CPU blocks during ring execution. Only `P2PAllreduce.allreduce_residual_async()` achieves true non-blocking behavior.
+
+**Correctness:**
+- max_abs_err = 0.0 vs CPU FP32 reference (exact, all 4 GPUs)
+- TP=4 decode cosine_sim = 0.999991 vs single-GPU reference (>= 0.99 threshold)
+
+**Decision:** Star topology (P2PAllreduce) remains the default for all Qwen3.5-27B decode paths. Ring allreduce is available via `set_ring_allreduce(True)` for models with larger hidden dimensions where ring would be beneficial (hidden_size ≥ 32768).
+
+---
+
 ## Deferred DeltaNet Allreduce — Infeasible (Milestone 3: deferred-deltanet-allreduce, 2026-03-14)
 
 **Feature goal:** For DeltaNet linear attention layers (48 of 64 layers), combine the attention and FFN
