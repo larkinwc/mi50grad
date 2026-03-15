@@ -1,0 +1,33 @@
+{
+  "featureId": "stream-compute-overlap",
+  "milestone": "threaded-dispatch",
+  "status": "pass",
+  "summary": "Async P2P allreduce on dedicated non-blocking HIP streams with GPU-side event synchronization implemented correctly. Stream overlap achieves 1.085x speedup vs serial (14.17 vs 13.06 tok/s), reducing allreduce from 24.96 ms/tok (24.6%) to effective overlap. All 20 correctness steps pass with cosine sim 0.999977-0.999994 >> threshold 0.99.",
+  "codeQualityIssues": [
+    {
+      "severity": "non_blocking",
+      "description": "allreduce_residual_async() only waits all compute events on ar_stream0 (GPU0's allreduce stream), but P2P copies are initiated on ar_stream0 only. The compute events from GPUs 1-3 ensure their GEMV is done before P2P reads their partials, which is correct since the P2P copy is the consumer. However, only GPU0's allreduce stream is used — GPU1-3's allreduce streams are created but mostly idle in this implementation.",
+      "suggestedFix": "This is a design choice: GPU0 coordinates all allreduce operations. The current approach is correct. If GPU1-3 allreduce streams are truly unused, remove them to simplify resource management."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "Stream overlap and cached dispatch are separate modes with no combination path. The cached dispatch path uses allreduce_residual() (synchronous), missing potential additive speedup.",
+      "suggestedFix": "A future feature (not in scope here) should add async allreduce to _decode_step_cached(). Expected benefit: starting from 42.2 ms/tok cached baseline and hiding ~28ms allreduce."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "wait_for_allreduce_on_compute_stream() iterates over all GPUs to insert stream wait events, but compute_stream is always 0 (null stream). This creates compute_stream wait for allreduce completion on ALL 4 GPUs, even though only GPU0 has the final result. GPUs 1-3 need to wait for broadcast completion (their data depends on GPU0's broadcast).",
+      "suggestedFix": "This is actually correct — each GPU needs to wait for the broadcast to complete before reading d_hidden. The implementation is sound, though the pattern could be better commented."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "observation": "The architecture.md library file documents stream overlap findings under 'Stream Overlap with HIP Events (Milestone 2: stream-compute-overlap)' with measured results (14.6 tok/s, 1.085x speedup, correctness 0.996-0.9999). This is already documented and up to date.",
+      "suggestedAction": "No update needed — already captured."
+    }
+  ],
+  "correctnessVerified": true,
+  "performanceVerified": true,
+  "testCoverage": "test_stream_overlap.py: 20 correctness steps (cosine sim all >= 0.99, min 0.999977), profiling breakdown showing allreduce 24.96 ms/tok (24.6%), stream overlap throughput 14.17 tok/s (1.085x vs serial 13.06 tok/s).",
+  "blockingIssues": []
+}

@@ -1,0 +1,77 @@
+{
+  "milestone": "threaded-dispatch",
+  "round": 1,
+  "status": "pass",
+  "validatorsRun": {
+    "test": {
+      "passed": true,
+      "command": "ssh root@192.168.1.198 docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c 'cd /opt/mi50grad && python3 tests/test_threaded_dispatch.py'",
+      "exitCode": 0,
+      "output": "RESULT: PASS — Correctness: cosine sim >= 0.999 for all 10 steps. Performance: cached 2.240x faster than serial (21.92 vs 9.78 tok/s)."
+    },
+    "test_stream_overlap": {
+      "passed": true,
+      "command": "ssh root@192.168.1.198 docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c 'cd /opt/mi50grad && python3 tests/test_stream_overlap.py'",
+      "exitCode": 0,
+      "output": "RESULT: PASS — Correctness: cosine sim >= 0.99 for all 20 steps (min 0.999977). Throughput: 14.17 tok/s (1.085x vs serial 13.06 tok/s)."
+    },
+    "typecheck": {
+      "passed": true,
+      "command": "N/A — no typecheck configured for this project",
+      "exitCode": 0
+    },
+    "lint": {
+      "passed": true,
+      "command": "N/A — no lint configured for this project",
+      "exitCode": 0
+    }
+  },
+  "reviewsSummary": {
+    "total": 2,
+    "passed": 2,
+    "failed": 0,
+    "failedFeatures": []
+  },
+  "blockingIssues": [],
+  "appliedUpdates": [],
+  "suggestedGuidanceUpdates": [
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add note: Python threading for GPU kernel dispatch is counter-productive on MI50. hipModuleLaunchKernel is async (returns immediately), so threading adds Python GIL + threading overhead (~490μs/round × 128 rounds = 63ms/tok penalty) without benefit. The correct approach is cached dispatch (pre-built ctypes parameter arrays) which yields 2x+ speedup.",
+      "evidence": "Feature threaded-kernel-dispatch: Python threading actually slowed decode from 9.78 → 6.9 tok/s (0.61x). Cached dispatch achieved 2.24x (21.92 tok/s). Architecture.md already documents this finding in detail.",
+      "isSystemic": false
+    }
+  ],
+  "rejectedObservations": [
+    {
+      "observation": "GPU1-3 allreduce streams created but mostly idle in stream-compute-overlap implementation",
+      "reason": "By design — GPU0 coordinates all allreduce operations on GPU0's allreduce stream. The stream_wait_event calls on non-GPU0 devices handle the broadcast dependency. The pattern is correct and the non-blocking nature is documented."
+    }
+  ],
+  "previousRound": null,
+  "featureResults": [
+    {
+      "featureId": "threaded-kernel-dispatch",
+      "status": "pass",
+      "keyMetrics": {
+        "serialThroughput": "9.78 tok/s",
+        "cachedThroughput": "21.92 tok/s",
+        "speedup": "2.240x",
+        "cosineSimilarityMin": 0.999972,
+        "cosineSimilarityThreshold": 0.999
+      }
+    },
+    {
+      "featureId": "stream-compute-overlap",
+      "status": "pass",
+      "keyMetrics": {
+        "serialThroughput": "13.06 tok/s",
+        "streamOverlapThroughput": "14.17 tok/s",
+        "speedup": "1.085x",
+        "cosineSimilarityMin": 0.999977,
+        "cosineSimilarityThreshold": 0.99,
+        "allreduceMs": 24.96
+      }
+    }
+  ]
+}
