@@ -1058,5 +1058,35 @@ different FFN outputs. The cumulative effect across 48 DeltaNet layers causes ca
 | TP=4 C dispatch + tuned kernels | **38.0** |
 | vLLM TP=4 (AWQ, reference) | 46.9 |
 
+---
+
+## Sprint 3: TP=4 Decode Pipeline Optimization (2026-03-15)
+
+**Goal:** Close the remaining 8.9 tok/s gap to vLLM (38.0 → target closer to 46.9 tok/s).
+
+### Remaining Bottleneck Analysis (Post-Sprint 2)
+1. **Allreduce overhead:** 128 allreduces × ~119 µs ≈ 15 ms/token (star topology, host-orchestrated)
+2. **Host launch overhead:** ~960 hipModuleLaunchKernel calls/token from C dispatch
+3. **Q/KV stream sync:** 32 hipStreamSynchronize calls/token (2 per full-attention layer × 16 layers)
+4. **KV cache D2D copies:** 32 hipMemcpyAsync D2D calls/token (2 per full-attention layer)
+
+### Sprint 3 Approach
+**Milestone 1 (allreduce-pipeline):** Remove sync barriers and eliminate redundant copies
+- Eliminate Q/KV stream syncs (run sequentially on default stream for decode)
+- Direct KV cache writes (fuse into QKNorm/RoPE or redirect GEMV output pointers)
+- Deepen allreduce overlap and reduce event overhead in C dispatch
+
+**Milestone 2 (hip-graph-decode):** Near-zero launch overhead via graph capture
+- Per-GPU compute graphs captured between allreduce points
+- Host-orchestrated allreduce between graph replay segments
+- Mutable param updates via hipGraphExecKernelNodeSetParams
+
+### Key Data Dependencies (Correctness Constraints)
+- Attention allreduce → d_hidden → FFN RMSNorm: HARD dependency, cannot defer attention AR wait
+- FFN allreduce → d_hidden → Next layer's attn RMSNorm: Already deferred to next layer start
+- Q/KV GEMV → d_q, d_k → QKNorm/RoPE: Sequential on same stream suffices (no explicit sync needed)
+- QKNorm/RoPE → d_k (post-RoPE) → KV cache: Must complete before decode attention reads cache
+- KV cache write → Decode attention read: Must complete before attention kernel launches
+
 
 
