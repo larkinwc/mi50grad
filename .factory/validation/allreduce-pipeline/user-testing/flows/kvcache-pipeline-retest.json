@@ -1,0 +1,42 @@
+{
+  "groupId": "kvcache-pipeline-retest",
+  "milestone": "allreduce-pipeline",
+  "round": 2,
+  "assertions": {
+    "VAL-KVCACHE-002": {
+      "status": "pass",
+      "evidence": "test_direct_kv_write.py exited 0. Used load-collect-free-reload pattern (no simultaneous TP=4 engines). TP=4 cosine sim min=0.994998 at step 9 (threshold 0.98). All 10 steps passed. Output vs single-GPU reference: min cos=0.999116 (5 steps). Direct KV write path confirmed active (gemv_k_only, gemv_v_cache, qknorm_rope_cachew all active). OVERALL: ALL TESTS PASS.",
+      "metrics": {
+        "tp4_min_cosine_sim": 0.994998,
+        "tp4_min_cosine_step": 9,
+        "ref_min_cosine_sim": 0.999116,
+        "all_10_steps_pass": true,
+        "threshold": 0.98,
+        "exit_code": 0,
+        "test_script": "tests/test_direct_kv_write.py"
+      }
+    },
+    "VAL-PIPELINE-001": {
+      "status": "pass",
+      "evidence": "bench_tp4_sprint3_m1.py exited 0. Sprint 3 M1 TP=4 throughput: 37.7 tok/s vs Sprint 2 baseline 38.0 tok/s (-0.9%, within ±5% allowed range of 36.1-39.9 tok/s). TP=4 correctness: cosine sim=0.999949 (threshold 0.99). Fallback A (C dispatch) and B (cached+stream) both PASS. Report generated at bench/tp4_sprint3_m1_report.md. OVERALL: ALL CRITICAL CHECKS PASSED.",
+      "metrics": {
+        "sprint3_m1_tps": 37.7,
+        "sprint2_baseline_tps": 38.0,
+        "improvement_pct": -0.9,
+        "allowed_range": "36.1-39.9 tok/s",
+        "within_tolerance": true,
+        "tp4_cosine_sim": 0.999949,
+        "single_gpu_tps": 22.2,
+        "fallback_a_pass": true,
+        "fallback_b_pass": true,
+        "report_generated": true,
+        "exit_code": 0,
+        "test_script": "tests/bench_tp4_sprint3_m1.py"
+      }
+    }
+  },
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "docker", "rsync"],
+  "notes": "Re-run round 2. fix-validation-test-methodology feature fixed both test scripts. test_direct_kv_write.py now uses load-collect-free-reload pattern avoiding simultaneous TP=4 engine contention. bench_tp4_sprint3_m1.py now uses ±5% tolerance for VAL-PIPELINE-001 instead of requiring strict improvement."
+}
