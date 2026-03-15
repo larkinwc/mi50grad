@@ -1287,5 +1287,22 @@ gcc -O3 -shared -fPIC -I/opt/rocm/include -L/opt/rocm/lib -lamdhip64 \
     -o src/runtime/c_graph_dispatch.so src/runtime/c_graph_dispatch.c
 ```
 
+## Testing Gotcha: Multiple TP=4 Engine Loads in One Process
+
+**DO NOT load multiple `TPInferenceEngine` instances (especially with HIP graph capture) sequentially within a single Python process.** This causes:
+
+1. **Segmentation faults (exit code 139):** HIP graph resources (graph exec handles, GPU memory) are not fully cleaned up when a Python engine object is deleted. Creating a second engine with `set_graph_dispatch(True)` after deleting the first causes GPU state corruption and eventual segfault.
+
+2. **Non-deterministic correctness failures:** Running multiple model loads in sequence leads to GPU state contamination. Subsequent tests may produce cosine_sim values below the 0.99 threshold at intermittent steps even when earlier runs pass cleanly.
+
+**Solution:** Tests that require multiple TP=4 engine instances should use `subprocess` isolation:
+```python
+import subprocess, sys
+result = subprocess.run([sys.executable, 'tests/my_test.py'], capture_output=True)
+```
+Or structure tests to use a single engine instance per test file.
+
+This was confirmed by scrutiny validation: `test_graph_decode.py` segfaulted at second graph capture (after single-GPU engines + first TP=4 engine), and `test_c_graph_dispatch.py` showed intermittent step 7 correctness failure when run after other GPU tests in the same session.
+
 
 

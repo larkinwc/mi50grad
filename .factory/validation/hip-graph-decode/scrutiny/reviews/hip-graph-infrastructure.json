@@ -1,0 +1,39 @@
+{
+  "featureId": "hip-graph-infrastructure",
+  "reviewedAt": "2026-03-15T22:00:00.000Z",
+  "commitId": "77d6c6f",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "The HIP graph infrastructure implementation is solid and well-structured. HIPGraphRuntime provides complete ctypes bindings for all required hipGraph* APIs. GraphSegment correctly manages the capture→instantiate→replay workflow. The struct layout (hipKernelNodeParams) is documented and matches the ROCm ABI. All 8 tests passed on actual gfx906 hardware with correct output and 5.16x speedup vs direct launch. The architecture.md documentation update is thorough and captures key findings including the HSACO vs .so distinction for graph capture, and the position-based node identification requirement.",
+    "issues": [
+      {
+        "file": "src/runtime/hip_graph_dispatch.py",
+        "line": 252,
+        "severity": "non_blocking",
+        "description": "find_kernel_nodes_by_func() uses func handle matching to identify mutable nodes. The docstring mentions this is used to identify RoPE/QKNorm and decode-attention nodes, but the graph-decode-path feature discovered that multiple kernels share the same func handle (e.g., gemv_fp16_v2 for Q, K, V, and O projections). This method can produce incorrect results for the real model and should be marked as deprecated or removed in favor of position-based matching."
+      },
+      {
+        "file": "src/runtime/hip_graph_dispatch.py",
+        "line": 380,
+        "severity": "non_blocking",
+        "description": "GraphDecodeStep.cleanup() is defined but there is no __del__ or context manager to ensure cleanup is called. If an exception occurs during capture, graph resources could leak. Consider adding __del__ or implementing __enter__/__exit__."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "library",
+      "observation": "architecture.md was updated with HIP graph infrastructure knowledge including the HSACO vs .so distinction for graph capture (critical: .so-loaded kernels cannot be captured, only hipModuleLoad/.hsaco handles). This is already documented.",
+      "evidence": "Commit 77d6c6f adds 78 lines to .factory/library/architecture.md"
+    },
+    {
+      "area": "skills",
+      "observation": "The kernel-optimization-worker skill may benefit from a note that when using HIP graph capture, only kernels loaded via hipModuleLoad (.hsaco files) can be captured — hipcc-compiled .so kernels cannot. Workers should check kernel loading mechanism before planning graph capture.",
+      "evidence": "Discovered during this feature implementation and documented in architecture.md. Not currently in the skill."
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS. The HIP graph infrastructure implementation is well-implemented, thoroughly tested (8 tests, all passed on hardware), and correctly handles the key complexity: position-based node identification is required because multiple kernels share the same function handle. The 5.16x speedup vs direct launch for an 8-kernel segment is confirmed. Minor issues: find_kernel_nodes_by_func() method is fragile and should be deprecated, and cleanup() should have defensive __del__ handling. Both are non-blocking."
+}
