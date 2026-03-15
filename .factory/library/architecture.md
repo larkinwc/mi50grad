@@ -1225,5 +1225,67 @@ different FFN outputs. The cumulative effect across 48 DeltaNet layers causes ca
 
 **OOM pattern for MI50 tests:** When testing TP=4 correctness vs single-GPU reference, use the load-free-reload pattern to avoid OOM on MI50 (16GB VRAM): load single-GPU engine → collect reference outputs → call `engine.cleanup()` + `del engine` → then load TP=4 engine. Loading both simultaneously causes OOM. Reference: `tests/test_qkv_sync_removal.py:collect_single_gpu_reference()`.
 
+---
+
+## C Graph Dispatch Extension (Milestone: hip-graph-decode, c-graph-replay-extension, 2026-03-15)
+
+**Implementation:** `src/runtime/c_graph_dispatch.c` + integration in `src/inference/tp_engine.py`
+
+**Purpose:** Eliminate Python ctypes overhead from graph replay loop. The Python graph replay adds ~8ms/token from 512 `hipGraphLaunch` + 256 `hipGraphExecKernelNodeSetParams` ctypes calls. The C extension does the same in a tight C loop.
+
+**Key design decisions:**
+1. **CGraphLayerSpec** (1056 bytes): per-GPU per-layer struct with attn_graph_exec, ffn_graph_exec, and up to 8 CMutableParam entries for mutable kernel params.
+2. **CMutableParam** (128 bytes): describes one mutable slot — node handle, graph_exec, params_array pointer, param index, mutable type (COS_PTR=1, SIN_PTR=2, SEQ_LEN=3, KV_K_PTR=4, KV_V_PTR=5), kparams copy, kv cache metadata.
+3. **HipKernelNodeParams** (64 bytes): C struct matching ROCm ABI (blockDim + 4-byte pad + extra + func + gridDim + 4-byte pad + kernelParams + sharedMemBytes + 4-byte pad).
+4. Same allreduce protocol as c_dispatch.c (do_graph_allreduce_async + wait_for_graph_allreduce).
+5. Plan built after graph capture; Python passes graph exec handles and node handles to C.
+
+**Python integration (`tp_engine.py`):**
+- `_load_c_graph_dispatch_lib()`: loads/builds `c_graph_dispatch.so` via gcc
+- `build_c_graph_dispatch_plan()`: serializes captured graph state into CGraphDispatchPlan ctypes struct
+- `_decode_step_graph()`: after capture, builds C plan and uses C replay instead of Python replay
+- Fallback: if C plan build fails or C dispatch errors, falls back to Python graph replay
+
+**Struct size verification:**
+- CGraphLayerSpec: 1056 bytes
+- CMutableParam: 128 bytes
+- CGraphAllreduceSpec: 272 bytes (same as CAllreduceSpec in c_dispatch.c)
+- CGraphDispatchPlan: 104 bytes
+- HipKernelNodeParams: 64 bytes (with padding)
+
+**Performance results (gfx906 MI50, TP=4, Qwen3.5-27B-GPTQ-Int4, 100 steps):**
+- C dispatch baseline: 35.6 tok/s
+- C graph dispatch: 35.9 tok/s (**1.01x** vs C dispatch)
+- Python graph dispatch would also use C replay loop (plan auto-built on first capture)
+- Note: bottleneck is allreduce (~15ms/token), not kernel launch overhead (~1ms). Graph replay gives ~1ms savings which is ~3% of 28ms total decode time.
+
+**Correctness:** All 10 decode steps pass cosine sim threshold (min=0.9969 >= 0.99)
+
+**Key implementation gotcha: HipKernelNodeParams padding.**
+The C struct `HipKernelNodeParams` has explicit padding fields to match ROCm ABI:
+```c
+typedef struct {
+    uint32_t blockDimX, blockDimY, blockDimZ;
+    uint32_t _pad1;   // 4-byte pad before 8-byte pointers
+    void *extra;
+    void *func;
+    uint32_t gridDimX, gridDimY, gridDimZ;
+    uint32_t _pad2;   // 4-byte pad before 8-byte pointer
+    void *kernelParams;
+    uint32_t sharedMemBytes;
+    uint32_t _pad3;   // trailing pad
+} HipKernelNodeParams;  // = 64 bytes total
+```
+The Python ctypes equivalent `CHipKernelNodeParams` must include the same padding fields.
+
+**kernelParams pointer in CMutableParam.kparams:**
+The `kparams.kernelParams` field must be set to `ct.addressof(spec.params_array)` (address of the ctypes void*[] array), NOT the address of the ctypes wrapper object. The C code writes new values into `params_array[param_index]` before calling `hipGraphExecKernelNodeSetParams`, so `kernelParams` always points to the (already-updated) params array.
+
+**c_graph_dispatch.so build command:**
+```bash
+gcc -O3 -shared -fPIC -I/opt/rocm/include -L/opt/rocm/lib -lamdhip64 \
+    -o src/runtime/c_graph_dispatch.so src/runtime/c_graph_dispatch.c
+```
+
 
 

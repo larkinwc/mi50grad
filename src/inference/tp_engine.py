@@ -583,6 +583,13 @@ class TPInferenceEngine:
         self._graph_dispatch_enabled = False
         self._graph_decode_step = None  # GraphDecodeStep instance (lazy init)
 
+        # C graph dispatch (tight C loop for HIP graph replay — eliminates Python overhead)
+        # Used inside _decode_step_graph() as the primary replay mechanism.
+        # Falls back to Python replay if C extension unavailable.
+        self._c_graph_dispatch_lib = None     # ctypes.CDLL for c_graph_dispatch.so
+        self._c_graph_dispatch_plan = None    # CGraphDispatchPlan ctypes structure
+        self._c_graph_dispatch_objects = {}   # keeps ctypes objects alive
+
     def load_layer_weights(self, layer_idx: int, weights: dict):
         import copy
         for engine in self.engines:
@@ -1862,6 +1869,440 @@ class TPInferenceEngine:
         self._c_dispatch_v2_enabled = enabled
 
     # ------------------------------------------------------------------
+    # C graph dispatch support
+    # ------------------------------------------------------------------
+
+    def _load_c_graph_dispatch_lib(self):
+        """Load the c_graph_dispatch.so shared library.
+
+        Builds it via gcc if the .so is missing or stale.
+        Returns the ctypes.CDLL handle, or None on failure.
+        """
+        src_dir = Path(__file__).parent.parent / "runtime"
+        c_path = src_dir / "c_graph_dispatch.c"
+        so_path = src_dir / "c_graph_dispatch.so"
+
+        if not c_path.exists():
+            return None
+
+        if not so_path.exists() or os.path.getmtime(c_path) > os.path.getmtime(so_path):
+            try:
+                subprocess.check_call([
+                    "gcc", "-O3", "-shared", "-fPIC",
+                    "-I/opt/rocm/include",
+                    "-L/opt/rocm/lib", "-lamdhip64",
+                    "-o", str(so_path), str(c_path),
+                ], stderr=subprocess.DEVNULL)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                return None
+
+        try:
+            lib = ctypes.CDLL(str(so_path))
+        except OSError:
+            return None
+
+        # Register function signatures
+        lib.c_graph_dispatch_step.argtypes = [
+            ctypes.c_uint64,  # plan_ptr
+            ctypes.c_uint64,  # cos_offset
+            ctypes.c_uint32,  # seq_len
+        ]
+        lib.c_graph_dispatch_step.restype = ctypes.c_int
+
+        lib.c_graph_dispatch_get_layer_spec_size.argtypes = []
+        lib.c_graph_dispatch_get_layer_spec_size.restype = ctypes.c_int
+        lib.c_graph_dispatch_get_mutable_param_size.argtypes = []
+        lib.c_graph_dispatch_get_mutable_param_size.restype = ctypes.c_int
+        lib.c_graph_dispatch_get_allreduce_spec_size.argtypes = []
+        lib.c_graph_dispatch_get_allreduce_spec_size.restype = ctypes.c_int
+        lib.c_graph_dispatch_get_plan_size.argtypes = []
+        lib.c_graph_dispatch_get_plan_size.restype = ctypes.c_int
+        lib.c_graph_dispatch_get_kparams_size.argtypes = []
+        lib.c_graph_dispatch_get_kparams_size.restype = ctypes.c_int
+
+        return lib
+
+    def build_c_graph_dispatch_plan(self):
+        """Build the CGraphDispatchPlan ctypes structure from captured graph state.
+
+        Must be called after graph capture (_GraphDecodeState.capture_all()).
+        The plan contains:
+        - CGraphLayerSpec[num_layers * num_engines]: graph exec handles + mutable params
+        - CGraphAllreduceSpec[num_layers]: for attention allreduce
+        - CGraphAllreduceSpec[num_layers]: for FFN allreduce
+
+        Returns the CGraphDispatchPlan ctypes structure (kept alive via
+        self._c_graph_dispatch_objects).
+        """
+        import ctypes as ct
+
+        if self._c_graph_dispatch_lib is None:
+            self._c_graph_dispatch_lib = self._load_c_graph_dispatch_lib()
+            if self._c_graph_dispatch_lib is None:
+                raise RuntimeError("c_graph_dispatch.so not available")
+
+        lib = self._c_graph_dispatch_lib
+        gds = self._graph_decode_step  # _GraphDecodeState instance
+
+        if gds is None or not gds.captured:
+            raise RuntimeError("Graph capture must be done before building C graph plan")
+
+        num_layers  = self.config.num_hidden_layers
+        num_engines = self.tp_size
+
+        if self._ring_allreduce and self._ring_ar is not None:
+            p2p_ar = self._ring_ar
+        else:
+            p2p_ar = self._p2p_ar
+
+        # --- Query struct sizes from C ---
+        layer_spec_size  = lib.c_graph_dispatch_get_layer_spec_size()
+        mutable_size     = lib.c_graph_dispatch_get_mutable_param_size()
+        ar_spec_size     = lib.c_graph_dispatch_get_allreduce_spec_size()
+        plan_size        = lib.c_graph_dispatch_get_plan_size()
+        kparams_size     = lib.c_graph_dispatch_get_kparams_size()
+
+        # --- Define Python ctypes structs matching C structs ---
+        from src.runtime.hip_graph_dispatch import hipKernelNodeParams
+
+        # hipKernelNodeParams layout (must match C HipKernelNodeParams with padding)
+        class CHipKernelNodeParams(ct.Structure):
+            _fields_ = [
+                ('blockDimX',     ct.c_uint),
+                ('blockDimY',     ct.c_uint),
+                ('blockDimZ',     ct.c_uint),
+                ('_pad1',         ct.c_uint),
+                ('extra',         ct.c_void_p),
+                ('func',          ct.c_void_p),
+                ('gridDimX',      ct.c_uint),
+                ('gridDimY',      ct.c_uint),
+                ('gridDimZ',      ct.c_uint),
+                ('_pad2',         ct.c_uint),
+                ('kernelParams',  ct.c_void_p),
+                ('sharedMemBytes', ct.c_uint),
+                ('_pad3',         ct.c_uint),
+            ]
+
+        MAX_MUTABLE_PARAMS = 8
+
+        class CMutableParam(ct.Structure):
+            _fields_ = [
+                ('node',          ct.c_uint64),
+                ('graph_exec',    ct.c_uint64),
+                ('params_array',  ct.c_uint64),
+                ('param_index',   ct.c_uint32),
+                ('mutable_type',  ct.c_uint32),
+                ('kparams',       CHipKernelNodeParams),
+                ('kv_cache_base', ct.c_uint64),
+                ('kv_stride',     ct.c_uint32),
+                ('_pad',          ct.c_uint32),
+                ('d_cos_base',    ct.c_uint64),
+                ('d_sin_base',    ct.c_uint64),
+            ]
+
+        class CGraphLayerSpec(ct.Structure):
+            _fields_ = [
+                ('attn_graph_exec',  ct.c_uint64),
+                ('ffn_graph_exec',   ct.c_uint64),
+                ('mutable_params',   CMutableParam * MAX_MUTABLE_PARAMS),
+                ('num_mutable',      ct.c_uint32),
+                ('layer_type',       ct.c_int),
+                ('_pad',             ct.c_uint32),
+            ]
+
+        # Allreduce function type signatures (same as c_dispatch.c)
+        ReduceTp2Func = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_void_p,
+                                      ct.c_void_p, ct.c_uint32, ct.c_void_p)
+        ReduceTp3Func = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_void_p,
+                                      ct.c_void_p, ct.c_void_p, ct.c_uint32,
+                                      ct.c_void_p)
+        ReduceTp4Func = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_void_p,
+                                      ct.c_void_p, ct.c_void_p, ct.c_void_p,
+                                      ct.c_uint32, ct.c_void_p)
+        HipSetDeviceFunc       = ct.CFUNCTYPE(ct.c_int, ct.c_int)
+        HipStreamSyncFunc      = ct.CFUNCTYPE(ct.c_int, ct.c_void_p)
+        HipEventRecordFunc     = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_void_p)
+        HipStreamWaitFunc      = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_void_p, ct.c_uint)
+        HipMemcpyPeerAsyncFunc = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_int,
+                                               ct.c_void_p, ct.c_int, ct.c_size_t,
+                                               ct.c_void_p)
+        HipMemcpyAsyncFunc     = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_void_p,
+                                               ct.c_size_t, ct.c_int, ct.c_void_p)
+        HipGetLastErrorFunc    = ct.CFUNCTYPE(ct.c_int)
+        HipGraphLaunchFunc     = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_void_p)
+        HipGraphExecKernelNodeSetParamsFunc = ct.CFUNCTYPE(
+            ct.c_int, ct.c_void_p, ct.c_void_p, ct.c_void_p)
+
+        class CGraphAllreduceSpec(ct.Structure):
+            _fields_ = [
+                ('reduce_tp2',        ReduceTp2Func),
+                ('reduce_tp3',        ReduceTp3Func),
+                ('reduce_tp4',        ReduceTp4Func),
+                ('tp_size',           ct.c_int),
+                ('device_ids',        ct.c_int * 4),
+                ('partial_ptrs',      ct.c_uint64 * 4),
+                ('hidden_ptrs',       ct.c_uint64 * 4),
+                ('gather_bufs',       ct.c_uint64 * 3),
+                ('allreduce_streams', ct.c_uint64 * 4),
+                ('compute_events',    ct.c_uint64 * 4),
+                ('ar_done_events',    ct.c_uint64 * 4),
+                ('compute_streams',   ct.c_uint64 * 4),
+                ('num_elems',         ct.c_uint32),
+                ('_pad',              ct.c_uint32),
+            ]
+
+        class CGraphDispatchPlan(ct.Structure):
+            _fields_ = [
+                ('num_layers',              ct.c_int),
+                ('num_engines',             ct.c_int),
+                ('graph_layer_specs',       ct.c_uint64),
+                ('attn_allreduce_specs',    ct.c_uint64),
+                ('ffn_allreduce_specs',     ct.c_uint64),
+                ('hipSetDevice_fn',         HipSetDeviceFunc),
+                ('hipStreamSynchronize_fn', HipStreamSyncFunc),
+                ('hipEventRecord_fn',       HipEventRecordFunc),
+                ('hipStreamWaitEvent_fn',   HipStreamWaitFunc),
+                ('hipMemcpyPeerAsync_fn',   HipMemcpyPeerAsyncFunc),
+                ('hipMemcpyAsync_fn',       HipMemcpyAsyncFunc),
+                ('hipGetLastError_fn',      HipGetLastErrorFunc),
+                ('hipGraphLaunch_fn',       HipGraphLaunchFunc),
+                ('hipGraphExecKernelNodeSetParams_fn',
+                                            HipGraphExecKernelNodeSetParamsFunc),
+            ]
+
+        # Verify sizes match C
+        assert ct.sizeof(CMutableParam) == mutable_size, \
+            f"CMutableParam size mismatch: Python={ct.sizeof(CMutableParam)}, C={mutable_size}"
+        assert ct.sizeof(CGraphLayerSpec) == layer_spec_size, \
+            f"CGraphLayerSpec size mismatch: Python={ct.sizeof(CGraphLayerSpec)}, C={layer_spec_size}"
+        assert ct.sizeof(CGraphAllreduceSpec) == ar_spec_size, \
+            f"CGraphAllreduceSpec size mismatch: Python={ct.sizeof(CGraphAllreduceSpec)}, C={ar_spec_size}"
+        assert ct.sizeof(CGraphDispatchPlan) == plan_size, \
+            f"CGraphDispatchPlan size mismatch: Python={ct.sizeof(CGraphDispatchPlan)}, C={plan_size}"
+        assert ct.sizeof(CHipKernelNodeParams) == kparams_size, \
+            f"CHipKernelNodeParams size mismatch: Python={ct.sizeof(CHipKernelNodeParams)}, C={kparams_size}"
+
+        # Mutable type constants (must match C header)
+        MUTABLE_TYPE_COS_PTR  = 1
+        MUTABLE_TYPE_SIN_PTR  = 2
+        MUTABLE_TYPE_SEQ_LEN  = 3
+        MUTABLE_TYPE_KV_K_PTR = 4
+        MUTABLE_TYPE_KV_V_PTR = 5
+
+        def py_kparams_to_c(py_kp):
+            """Convert Python hipKernelNodeParams to C CHipKernelNodeParams."""
+            c_kp = CHipKernelNodeParams()
+            c_kp.blockDimX = py_kp.blockDimX
+            c_kp.blockDimY = py_kp.blockDimY
+            c_kp.blockDimZ = py_kp.blockDimZ
+            c_kp.extra = py_kp.extra
+            c_kp.func  = py_kp.func
+            c_kp.gridDimX = py_kp.gridDimX
+            c_kp.gridDimY = py_kp.gridDimY
+            c_kp.gridDimZ = py_kp.gridDimZ
+            c_kp.kernelParams = py_kp.kernelParams
+            c_kp.sharedMemBytes = py_kp.sharedMemBytes
+            return c_kp
+
+        # --- Build CGraphLayerSpec array ---
+        GLSArray = CGraphLayerSpec * (num_layers * num_engines)
+        gls_array = GLSArray()
+
+        for layer_idx in range(num_layers):
+            for engine_idx, engine in enumerate(self.engines):
+                gs = gls_array[layer_idx * num_engines + engine_idx]
+                lw = engine.layers[layer_idx]
+                lc = self._engine_layer_caches[engine_idx][layer_idx]
+
+                # Graph exec handles from captured state
+                attn_seg = gds._attn_segs[engine_idx][layer_idx]
+                ffn_seg  = gds._ffn_segs[engine_idx][layer_idx]
+                gs.attn_graph_exec = attn_seg._graph_exec or 0
+                gs.ffn_graph_exec  = ffn_seg._graph_exec  or 0
+                gs.layer_type      = 0 if lw.layer_type == 'full_attention' else 1
+
+                # Build mutable param entries for full attention layers
+                mutable_count = 0
+                if lw.layer_type == 'full_attention':
+                    mutable_list = gds._mutable_attn[engine_idx][layer_idx]
+                    graph_exec_val = attn_seg._graph_exec or 0
+
+                    for m in mutable_list:
+                        key  = m['key']
+                        node = m['node']
+                        spec = m['spec']
+                        base = m['base_params']
+
+                        if mutable_count >= MAX_MUTABLE_PARAMS:
+                            break
+
+                        def add_mutable(mp, mtype, pidx, kv_base=0, kv_str=0,
+                                        cos_base=0, sin_base=0):
+                            mp.node          = node or 0
+                            mp.graph_exec    = graph_exec_val
+                            mp.params_array  = ct.addressof(spec.params_array)
+                            mp.param_index   = pidx
+                            mp.mutable_type  = mtype
+                            # Copy the base hipKernelNodeParams
+                            mp.kparams       = py_kparams_to_c(base)
+                            # Update kernelParams to point to the spec's params_array
+                            mp.kparams.kernelParams = ct.addressof(spec.params_array)
+                            mp.kv_cache_base = kv_base
+                            mp.kv_stride     = kv_str
+                            mp.d_cos_base    = cos_base
+                            mp.d_sin_base    = sin_base
+
+                        if key == 'qknorm_q':
+                            # cos (param[2]) and sin (param[3])
+                            add_mutable(gs.mutable_params[mutable_count],
+                                        MUTABLE_TYPE_COS_PTR, 2,
+                                        cos_base=engine.d_cos,
+                                        sin_base=engine.d_sin)
+                            mutable_count += 1
+                            if mutable_count < MAX_MUTABLE_PARAMS:
+                                add_mutable(gs.mutable_params[mutable_count],
+                                            MUTABLE_TYPE_SIN_PTR, 3,
+                                            cos_base=engine.d_cos,
+                                            sin_base=engine.d_sin)
+                                mutable_count += 1
+
+                        elif key == 'qknorm_k':
+                            add_mutable(gs.mutable_params[mutable_count],
+                                        MUTABLE_TYPE_COS_PTR, 2,
+                                        cos_base=engine.d_cos,
+                                        sin_base=engine.d_sin)
+                            mutable_count += 1
+                            if mutable_count < MAX_MUTABLE_PARAMS:
+                                add_mutable(gs.mutable_params[mutable_count],
+                                            MUTABLE_TYPE_SIN_PTR, 3,
+                                            cos_base=engine.d_cos,
+                                            sin_base=engine.d_sin)
+                                mutable_count += 1
+                            # KV cache K write ptr (param[4]) if present
+                            if '_k_cache_base' in lc and mutable_count < MAX_MUTABLE_PARAMS:
+                                kv_stride = lc['_kv_stride']
+                                add_mutable(gs.mutable_params[mutable_count],
+                                            MUTABLE_TYPE_KV_K_PTR, 4,
+                                            kv_base=lc['_k_cache_base'],
+                                            kv_str=kv_stride)
+                                mutable_count += 1
+
+                        elif key == 'decode_attn':
+                            add_mutable(gs.mutable_params[mutable_count],
+                                        MUTABLE_TYPE_SEQ_LEN, 4)
+                            mutable_count += 1
+
+                        elif key == 'gemv_v_cache':
+                            # V cache write ptr (param[2])
+                            if '_v_cache_base' in lc and mutable_count < MAX_MUTABLE_PARAMS:
+                                kv_stride = lc['_kv_stride']
+                                add_mutable(gs.mutable_params[mutable_count],
+                                            MUTABLE_TYPE_KV_V_PTR, 2,
+                                            kv_base=lc['_v_cache_base'],
+                                            kv_str=kv_stride)
+                                mutable_count += 1
+
+                gs.num_mutable = mutable_count
+
+        # --- Build allreduce spec arrays ---
+        AttnARArray = CGraphAllreduceSpec * num_layers
+        FfnARArray  = CGraphAllreduceSpec * num_layers
+        attn_ar_array = AttnARArray()
+        ffn_ar_array  = FfnARArray()
+
+        p2p_lib = p2p_ar._lib
+        reduce_tp2 = ReduceTp2Func(
+            ct.cast(p2p_lib.p2p_reduce_residual_tp2, ct.c_void_p).value)
+        reduce_tp3 = ReduceTp3Func(
+            ct.cast(p2p_lib.p2p_reduce_residual_tp3, ct.c_void_p).value)
+        reduce_tp4 = ReduceTp4Func(
+            ct.cast(p2p_lib.p2p_reduce_residual_tp4, ct.c_void_p).value)
+
+        def fill_ar_spec(c_ar, partial_attr):
+            c_ar.reduce_tp2 = reduce_tp2
+            c_ar.reduce_tp3 = reduce_tp3
+            c_ar.reduce_tp4 = reduce_tp4
+            c_ar.tp_size = self.tp_size
+            for i, engine in enumerate(self.engines):
+                c_ar.device_ids[i]    = engine.device.device_id
+                c_ar.partial_ptrs[i]  = getattr(engine, partial_attr)
+                c_ar.hidden_ptrs[i]   = engine.d_hidden
+                c_ar.compute_streams[i] = 0  # null stream (default)
+            for i, ptr in enumerate(p2p_ar._gather_bufs):
+                c_ar.gather_bufs[i] = ptr
+            for i in range(self.tp_size):
+                c_ar.allreduce_streams[i] = p2p_ar._allreduce_streams[i]
+                c_ar.compute_events[i]    = p2p_ar._compute_events[i]
+                c_ar.ar_done_events[i]    = p2p_ar._ar_done_events[i]
+            c_ar.num_elems = self.config.hidden_size
+
+        for layer_idx in range(num_layers):
+            fill_ar_spec(attn_ar_array[layer_idx], 'd_proj_out')
+            fill_ar_spec(ffn_ar_array[layer_idx],  'd_ffn_out')
+
+        # --- Build the CGraphDispatchPlan ---
+        plan = CGraphDispatchPlan()
+        plan.num_layers  = num_layers
+        plan.num_engines = num_engines
+        plan.graph_layer_specs    = ct.addressof(gls_array)
+        plan.attn_allreduce_specs = ct.addressof(attn_ar_array)
+        plan.ffn_allreduce_specs  = ct.addressof(ffn_ar_array)
+
+        hip_lib_handle = self._hip._lib
+        hip_set_device_fn = HipSetDeviceFunc(
+            ct.cast(hip_lib_handle.hipSetDevice, ct.c_void_p).value)
+        hip_stream_sync_fn = HipStreamSyncFunc(
+            ct.cast(hip_lib_handle.hipStreamSynchronize, ct.c_void_p).value)
+        hip_event_record_fn = HipEventRecordFunc(
+            ct.cast(hip_lib_handle.hipEventRecord, ct.c_void_p).value)
+        hip_stream_wait_fn = HipStreamWaitFunc(
+            ct.cast(hip_lib_handle.hipStreamWaitEvent, ct.c_void_p).value)
+        hip_memcpy_peer_async_fn = HipMemcpyPeerAsyncFunc(
+            ct.cast(hip_lib_handle.hipMemcpyPeerAsync, ct.c_void_p).value)
+        hip_memcpy_async_fn = HipMemcpyAsyncFunc(
+            ct.cast(hip_lib_handle.hipMemcpyAsync, ct.c_void_p).value)
+        hip_get_last_error_fn = HipGetLastErrorFunc(
+            ct.cast(hip_lib_handle.hipGetLastError, ct.c_void_p).value)
+        hip_graph_launch_fn = HipGraphLaunchFunc(
+            ct.cast(hip_lib_handle.hipGraphLaunch, ct.c_void_p).value)
+        hip_graph_exec_set_params_fn = HipGraphExecKernelNodeSetParamsFunc(
+            ct.cast(hip_lib_handle.hipGraphExecKernelNodeSetParams,
+                    ct.c_void_p).value)
+
+        plan.hipSetDevice_fn         = hip_set_device_fn
+        plan.hipStreamSynchronize_fn = hip_stream_sync_fn
+        plan.hipEventRecord_fn       = hip_event_record_fn
+        plan.hipStreamWaitEvent_fn   = hip_stream_wait_fn
+        plan.hipMemcpyPeerAsync_fn   = hip_memcpy_peer_async_fn
+        plan.hipMemcpyAsync_fn       = hip_memcpy_async_fn
+        plan.hipGetLastError_fn      = hip_get_last_error_fn
+        plan.hipGraphLaunch_fn       = hip_graph_launch_fn
+        plan.hipGraphExecKernelNodeSetParams_fn = hip_graph_exec_set_params_fn
+
+        # Store all objects to keep them alive
+        self._c_graph_dispatch_objects = {
+            'gls_array':     gls_array,
+            'attn_ar_array': attn_ar_array,
+            'ffn_ar_array':  ffn_ar_array,
+            'plan':          plan,
+            'reduce_tp2':    reduce_tp2,
+            'reduce_tp3':    reduce_tp3,
+            'reduce_tp4':    reduce_tp4,
+            'hip_set_device_fn':       hip_set_device_fn,
+            'hip_stream_sync_fn':      hip_stream_sync_fn,
+            'hip_event_record_fn':     hip_event_record_fn,
+            'hip_stream_wait_fn':      hip_stream_wait_fn,
+            'hip_memcpy_peer_async_fn': hip_memcpy_peer_async_fn,
+            'hip_memcpy_async_fn':     hip_memcpy_async_fn,
+            'hip_get_last_error_fn':   hip_get_last_error_fn,
+            'hip_graph_launch_fn':     hip_graph_launch_fn,
+            'hip_graph_exec_set_params_fn': hip_graph_exec_set_params_fn,
+        }
+
+        print(f"C graph dispatch plan built: {num_layers} layers × {num_engines} engines")
+        return plan
+
+    # ------------------------------------------------------------------
     # Graph dispatch support
     # ------------------------------------------------------------------
 
@@ -1956,16 +2397,55 @@ class TPInferenceEngine:
                 self._graph_decode_step = None
                 return self._decode_step_c_dispatch(token_embedding, position)
 
-        # Subsequent calls: update mutable params and replay graphs
-        try:
-            gds.replay_step(position)
-        except Exception as e:
-            print(f"WARNING: Graph replay failed at step position={position}: {e}. "
-                  "Falling back to C dispatch.")
-            self._graph_dispatch_enabled = False
-            gds.cleanup()
-            self._graph_decode_step = None
-            return self._decode_step_c_dispatch(token_embedding, position)
+            # After capture: try to build C graph dispatch plan (first-time-only)
+            if self._c_graph_dispatch_plan is None:
+                try:
+                    if self._c_graph_dispatch_lib is None:
+                        self._c_graph_dispatch_lib = self._load_c_graph_dispatch_lib()
+                    if self._c_graph_dispatch_lib is not None:
+                        self._c_graph_dispatch_plan = self.build_c_graph_dispatch_plan()
+                        print("C graph dispatch plan built; using C replay loop")
+                    else:
+                        print("c_graph_dispatch.so unavailable; using Python replay loop")
+                except Exception as e:
+                    print(f"WARNING: Failed to build C graph dispatch plan: {e}. "
+                          "Using Python replay loop.")
+                    self._c_graph_dispatch_plan = None
+                    self._c_graph_dispatch_objects = {}
+
+        # Replay graphs (prefer C graph dispatch, fall back to Python)
+        if self._c_graph_dispatch_plan is not None:
+            try:
+                half_rotary = self.engines[0].rotary_dim // 2
+                cos_offset  = position * half_rotary * 2
+                seq_len     = self.engines[0].kv_cache.current_len + 1
+                plan        = self._c_graph_dispatch_objects['plan']
+                plan_ptr    = ctypes.addressof(plan)
+                err = self._c_graph_dispatch_lib.c_graph_dispatch_step(
+                    ctypes.c_uint64(plan_ptr),
+                    ctypes.c_uint64(cos_offset),
+                    ctypes.c_uint32(seq_len),
+                )
+                if err:
+                    raise RuntimeError(f"c_graph_dispatch_step failed: HIP error {err}")
+            except Exception as e:
+                print(f"WARNING: C graph replay failed at position={position}: {e}. "
+                      "Falling back to Python graph replay.")
+                self._c_graph_dispatch_plan = None
+                self._c_graph_dispatch_objects = {}
+                # fall through to Python replay below
+
+        if self._c_graph_dispatch_plan is None:
+            # Python replay path (fallback)
+            try:
+                gds.replay_step(position)
+            except Exception as e:
+                print(f"WARNING: Graph replay failed at step position={position}: {e}. "
+                      "Falling back to C dispatch.")
+                self._graph_dispatch_enabled = False
+                gds.cleanup()
+                self._graph_decode_step = None
+                return self._decode_step_c_dispatch(token_embedding, position)
 
         # Synchronize all GPUs
         for dev_id in self.device_ids:
@@ -2452,6 +2932,9 @@ class TPInferenceEngine:
         if self._graph_decode_step is not None:
             self._graph_decode_step.cleanup()
             self._graph_decode_step = None
+        # Release C graph dispatch objects (ctypes keeps them alive)
+        self._c_graph_dispatch_plan = None
+        self._c_graph_dispatch_objects = {}
         if self._p2p_ar:
             self._p2p_ar.cleanup()
             self._p2p_ar = None
