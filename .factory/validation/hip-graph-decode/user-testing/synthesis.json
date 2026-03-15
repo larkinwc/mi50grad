@@ -1,0 +1,69 @@
+{
+  "milestone": "hip-graph-decode",
+  "round": 1,
+  "status": "fail",
+  "assertionsSummary": {
+    "total": 10,
+    "passed": 9,
+    "failed": 1,
+    "blocked": 0
+  },
+  "passedAssertions": [
+    "VAL-GRAPH-001",
+    "VAL-GRAPH-002",
+    "VAL-GRAPH-003",
+    "VAL-GRAPHDECODE-001",
+    "VAL-GRAPHDECODE-003",
+    "VAL-GRAPHDECODE-004",
+    "VAL-CROSS-001",
+    "VAL-CROSS-002",
+    "VAL-CROSS-003"
+  ],
+  "failedAssertions": [
+    {
+      "id": "VAL-GRAPHDECODE-002",
+      "reason": "Graph replay throughput is LOWER than C dispatch baseline: C graph dispatch=35.2 tok/s, Python graph dispatch=36.2 tok/s vs C dispatch=37.8 tok/s. Graph is ~7% slower. The overhead from 512 hipGraphExecKernelNodeSetParams calls per token (for mutable param updates: cos/sin, seq_len, KV cache ptrs) exceeds the savings from replacing ~960 hipModuleLaunchKernel calls with hipGraphLaunch calls. On gfx906/ROCm 7.1, hipGraphLaunch with per-step param updates does not outperform the C dispatch tight loop."
+    }
+  ],
+  "blockedAssertions": [],
+  "appliedUpdates": [],
+  "testScriptsRun": [
+    {
+      "script": "tests/test_hip_graph_infra.py",
+      "assertions": ["VAL-GRAPH-001", "VAL-GRAPH-002", "VAL-GRAPH-003"],
+      "result": "PASS (8/8 sub-tests)",
+      "exitCode": 0
+    },
+    {
+      "script": "tests/test_graph_decode.py",
+      "assertions": ["VAL-GRAPHDECODE-001", "VAL-GRAPHDECODE-003", "VAL-GRAPHDECODE-004"],
+      "result": "PARTIAL — segfault during graph correctness test (re-capture after disable/re-enable stale C plan issue). Key assertions VAL-GRAPHDECODE-001, 003, 004 confirmed PASS before crash.",
+      "exitCode": 139
+    },
+    {
+      "script": "tests/test_c_graph_dispatch.py",
+      "assertions": ["VAL-GRAPHDECODE-002", "VAL-GRAPH-003", "VAL-GRAPHDECODE-004"],
+      "result": "PARTIAL — compile/load PASS, single-GPU PASS (22.2 tok/s), correctness PASS (min cosine_sim=0.996823), throughput FAIL (35.2 tok/s < 37.8 tok/s)",
+      "exitCode": 1
+    },
+    {
+      "script": "tests/bench_tp4_sprint3.py",
+      "assertions": ["VAL-CROSS-001", "VAL-CROSS-002", "VAL-CROSS-003"],
+      "result": "PASS — all critical checks passed",
+      "exitCode": 0
+    }
+  ],
+  "discoveredIssues": [
+    {
+      "description": "test_graph_decode.py segfaults when graph dispatch is disabled then re-enabled: _c_graph_dispatch_plan is NOT reset in set_graph_dispatch(False), causing the old destroyed graph exec handles to be reused on the next capture. The C graph dispatch plan is built after capture and cached, but not invalidated when the underlying graphs are destroyed.",
+      "severity": "non_blocking",
+      "workaround": "Use a fresh engine instance per graph dispatch test, or fix set_graph_dispatch(False) to also reset _c_graph_dispatch_plan."
+    },
+    {
+      "description": "VAL-GRAPHDECODE-002 fails: hipGraphExecKernelNodeSetParams overhead (512 calls/token) dominates over graph replay savings on gfx906/ROCm 7.1. The mutable param update approach adds more overhead than it saves.",
+      "severity": "blocking",
+      "suggestedFix": "Consider pre-updating all mutable params via device-side parameter buffers (GPU-side update of cos/sin offsets) to avoid host-side hipGraphExecKernelNodeSetParams overhead per token."
+    }
+  ],
+  "previousRound": null
+}
