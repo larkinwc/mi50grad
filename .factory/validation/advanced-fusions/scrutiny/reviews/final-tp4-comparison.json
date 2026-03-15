@@ -1,0 +1,45 @@
+{
+  "featureId": "final-tp4-comparison",
+  "reviewedAt": "2026-03-15T03:58:00.000Z",
+  "commitId": "71a21a7",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "The final TP=4 comparison benchmark and report are well-implemented. bench_tp4_final.py correctly runs all 4 validation steps sequentially, uses the sequential single-GPU → TP=4 correctness approach to avoid OOM, and generates a comprehensive bench/tp4_optimization_report.md. All 4 VAL-FINAL assertions are satisfied. The reported throughput (25.5 tok/s in this run vs 33.5 tok/s in prior runs) is noted as run-to-run variation in both the handoff and the report itself.",
+    "issues": [
+      {
+        "file": "bench/tp4_optimization_report.md",
+        "line": null,
+        "severity": "non_blocking",
+        "description": "The report shows 'TP=4 measured (this run): 25.5 tok/s' in the comparison table, which is lower than the ~33.5 tok/s measured in previous milestone benchmarks. The report correctly acknowledges this as run-to-run variation due to ROCm JIT compilation or PCIe congestion, but for a 'final benchmark' report, the lower number at the top may understate actual performance. Running multiple benchmark runs and using the median would give a more reliable final figure."
+      },
+      {
+        "file": "tests/bench_tp4_final.py",
+        "line": null,
+        "severity": "non_blocking",
+        "description": "The benchmark uses only 3 warmup steps before the 100 timed steps. For ROCm JIT compilation, cold runs can take significantly longer. The first timed step may include compilation overhead if not properly warmed up. The prior handoff acknowledges 'run-to-run variation may be due to ROCm kernel JIT compilation timing'. A more robust warmup (5-10 steps) could improve consistency."
+      },
+      {
+        "file": "tests/bench_tp4_final.py",
+        "line": null,
+        "severity": "non_blocking",
+        "description": "The correctness check (Step 2) uses a sequential approach: load single-GPU model, run 10 steps, save outputs, cleanup, then load TP=4 and compare. This is correct for OOM avoidance but means both models run with the same random initial hidden state. The test doesn't verify multi-step KV cache evolution correctness across steps (only compares step N outputs independently). This is acceptable for the validation goal."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "library",
+      "observation": "bench/tp4_optimization_report.md is now committed and contains a comprehensive optimization breakdown. Future workers can reference this for the per-phase throughput numbers and gap analysis.",
+      "evidence": "Commit 71a21a7 adds bench/tp4_optimization_report.md with full per-optimization breakdown and vLLM gap analysis."
+    },
+    {
+      "area": "conventions",
+      "observation": "The benchmark correctly stops vLLM (docker stop vllm-mobydick) before running and restarts it after, following the AGENTS.md pattern. The sequential single-GPU → TP=4 approach for OOM avoidance is a useful technique that could be documented for future benchmark writers.",
+      "evidence": "Handoff shows: 'docker stop vllm-mobydick → bench_tp4_final.py → docker start vllm-mobydick', all exit code 0."
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS. The final benchmark correctly validates all 4 VAL-FINAL assertions: single-GPU regression (20.4 tok/s, PASS), TP=4 vs vLLM comparison (report generated, PASS), TP=4 throughput vs single-GPU (25.5 > 20.3 tok/s, PASS), and report generation (bench/tp4_optimization_report.md, PASS). Validator re-run confirmed 33.7 tok/s in the current scrutiny run. Three minor non-blocking issues: run-to-run variation in the committed report, warmup step count, and sequential OOM-avoidance approach. The comprehensive comparison report provides valuable documentation of all optimization phases."
+}

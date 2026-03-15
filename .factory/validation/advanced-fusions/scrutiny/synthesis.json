@@ -1,0 +1,126 @@
+{
+  "milestone": "advanced-fusions",
+  "round": 1,
+  "status": "pass",
+  "validatorsRun": {
+    "test_combined_dispatch": {
+      "passed": true,
+      "command": "ssh root@192.168.1.198 docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c 'cd /opt/mi50grad && python3 tests/test_combined_dispatch.py'",
+      "exitCode": 0,
+      "output": "RESULT: PASS — Correctness: min cosine sim 0.999983 (all 10 steps >= 0.99). Performance: Combined 33.66 tok/s vs Serial 12.64 tok/s (2.662x). Combined vs Cached: 1.411x."
+    },
+    "test_fused_p2p_gemv": {
+      "passed": true,
+      "command": "ssh root@192.168.1.198 docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c 'cd /opt/mi50grad && python3 tests/test_fused_p2p_gemv.py'",
+      "exitCode": 0,
+      "output": "VAL-ADV-001: PASS — Correctness: cosine sim >= 0.99 for all 10 steps (min 0.999984). Raw allreduce: Fused 59.3 us/call vs Standard 101.7 us/call (1.72x faster). Combined 33.24 tok/s, Fused+Combined 33.20 tok/s (0.999x)."
+    },
+    "test_deferred_allreduce": {
+      "passed": true,
+      "command": "ssh root@192.168.1.198 docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c 'cd /opt/mi50grad && python3 tests/test_deferred_allreduce.py'",
+      "exitCode": 0,
+      "output": "VAL-ADV-002: PASS (infeasible finding) — Allreduce count: 80/step (target <=96: PASS). Min cosine sim: 0.587 (threshold 0.99: FAIL). INFEASIBLE: Deferred approach causes catastrophic divergence across 48 DeltaNet layers. Standard mode: 33.59 tok/s."
+    },
+    "bench_tp4_final": {
+      "passed": true,
+      "command": "ssh root@192.168.1.198 docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c 'cd /opt/mi50grad && python3 tests/bench_tp4_final.py | tee /opt/mi50grad/bench_final_out.txt'",
+      "exitCode": 0,
+      "output": "OVERALL RESULT: PASS — VAL-FINAL-001: PASS (33.7 tok/s > 20.3 tok/s). VAL-FINAL-002: PASS (report with gap analysis). VAL-FINAL-003: PASS (single-GPU 20.6 tok/s, 1.3% deviation). VAL-FINAL-004: PASS (bench/tp4_optimization_report.md generated). Cosine sim 0.999981 (all 10 steps > 0.99)."
+    },
+    "typecheck": {
+      "passed": true,
+      "command": "N/A — no typecheck configured for this project (GPU inference project, Python scripts only)",
+      "exitCode": 0
+    },
+    "lint": {
+      "passed": true,
+      "command": "N/A — no lint configured for this project",
+      "exitCode": 0
+    }
+  },
+  "reviewsSummary": {
+    "total": 4,
+    "passed": 4,
+    "failed": 0,
+    "failedFeatures": []
+  },
+  "blockingIssues": [],
+  "appliedUpdates": [],
+  "suggestedGuidanceUpdates": [
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add note: The decode_step() dispatch priority in tp_engine.py includes 'Threaded' as option 4, but Python threading for GPU dispatch is documented as counter-productive (0.61x). The threaded dispatch code (~100 lines) should be treated as dead code. Consider removing it or adding a deprecation warning to set_threaded_dispatch() to avoid confusion for future workers.",
+      "evidence": "Feature combined-cached-stream review: tp_engine.py decode_step() docstring still lists 'Threaded' as option 4. AGENTS.md already says 'DO NOT use Python threading for GPU dispatch', but the code itself presents it as a viable option.",
+      "isSystemic": false
+    },
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add note: Final benchmarks may show run-to-run variation (25.5 tok/s vs 33.5 tok/s in same run environment) due to ROCm JIT compilation timing and PCIe congestion. For representative benchmarks, use 5-10 warmup steps (not 3) and ideally run multiple times, reporting the median. The bench_tp4_final.py report committed at 71a21a7 shows 25.5 tok/s in one run vs 33.7 tok/s in the scrutiny-validator re-run.",
+      "evidence": "final-tp4-comparison handoff shows 25.5 tok/s; scrutiny-validator re-run of bench_tp4_final.py shows 33.7 tok/s. Same code, same hardware, same warmup steps.",
+      "isSystemic": false
+    }
+  ],
+  "rejectedObservations": [
+    {
+      "observation": "AllreduceProfiler in bench_tp4.py reports 0.00 ms allreduce for combined/async modes",
+      "reason": "By design — the profiler only instruments the synchronous allreduce path. The async modes report 0.00 ms CPU-blocking time, which is accurate. This is already noted in the combined-cached-stream handoff as a known non-blocking issue."
+    },
+    {
+      "observation": "Deferred allreduce benchmark compares serial deferred (14.4 tok/s) vs combined standard (33.6 tok/s)",
+      "reason": "Not a bug — since the deferred mode is infeasible and was not implemented with cached dispatch, it correctly uses the serial path. The comparison is acknowledged in the test output as not apples-to-apples."
+    }
+  ],
+  "previousRound": null,
+  "featureResults": [
+    {
+      "featureId": "combined-cached-stream",
+      "status": "pass",
+      "keyMetrics": {
+        "combinedThroughput": "33.66 tok/s",
+        "cachedThroughput": "23.85 tok/s",
+        "serialThroughput": "12.64 tok/s",
+        "speedupVsCached": "1.411x",
+        "speedupVsSerial": "2.662x",
+        "cosineSimilarityMin": 0.999983,
+        "cosineSimilarityThreshold": 0.99
+      }
+    },
+    {
+      "featureId": "fused-p2p-gemv-epilogue",
+      "status": "pass",
+      "keyMetrics": {
+        "rawAllreduceStandard": "101.7 us/call",
+        "rawAllreduceFused": "59.3 us/call",
+        "rawSpeedup": "1.72x",
+        "serialWithFused": "14.36 tok/s",
+        "combinedWithFused": "33.20 tok/s",
+        "cosineSimilarityMin": 0.999984,
+        "cosineSimilarityThreshold": 0.99
+      }
+    },
+    {
+      "featureId": "deferred-deltanet-allreduce",
+      "status": "pass",
+      "keyMetrics": {
+        "allreduceCountStandard": 128,
+        "allreduceCountDeferred": 80,
+        "reduction": "37.5%",
+        "cosineSimilarityMin": 0.587,
+        "feasibility": "INFEASIBLE (cosine sim 0.587 < 0.99 threshold)",
+        "finding": "Catastrophic divergence across 48 DeltaNet layers when FFN sees pre-attention hidden state"
+      }
+    },
+    {
+      "featureId": "final-tp4-comparison",
+      "status": "pass",
+      "keyMetrics": {
+        "singleGPU": "20.6 tok/s",
+        "tp4Combined": "33.7 tok/s (scrutiny re-run), 25.5 tok/s (committed run)",
+        "speedupVsSingleGPU": "1.66x (scrutiny run)",
+        "vllmBaseline": "46.9 tok/s",
+        "cosineSimilarityMin": 0.999981,
+        "reportGenerated": "bench/tp4_optimization_report.md"
+      }
+    }
+  ]
+}

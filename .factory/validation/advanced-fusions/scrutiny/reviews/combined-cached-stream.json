@@ -1,0 +1,45 @@
+{
+  "featureId": "combined-cached-stream",
+  "reviewedAt": "2026-03-15T03:55:00.000Z",
+  "commitId": "610bb45",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "The combined cached dispatch + async stream overlap implementation is well-structured. It correctly merges _decode_step_cached() (pre-built ctypes parameter arrays) with the async allreduce approach from _decode_step_stream_overlap(). The code is correct, tested, and shows meaningful performance improvement (1.411x vs cached-only, 2.66x vs serial). No blocking issues found.",
+    "issues": [
+      {
+        "file": "src/inference/tp_engine.py",
+        "line": null,
+        "severity": "non_blocking",
+        "description": "AllreduceProfiler in bench_tp4.py only instruments _allreduce_residual(), which is not called in combined mode (uses allreduce_residual_async()). The profiler reports 0.00 ms allreduce for combined mode, which is technically correct but may confuse future workers who expect to see allreduce timing. A comment was noted in the handoff but no fix was applied."
+      },
+      {
+        "file": "src/inference/tp_engine.py",
+        "line": null,
+        "severity": "non_blocking",
+        "description": "The threaded dispatch infrastructure (~100 lines, set_threaded_dispatch(), worker threads, barriers) is kept but documented as counter-productive (0.61x slower). This dead code adds complexity. The docstring on decode_step() still mentions 'Threaded' as option 4. A cleanup pass would improve code clarity."
+      },
+      {
+        "file": "tests/test_combined_dispatch.py",
+        "line": null,
+        "severity": "non_blocking",
+        "description": "The profile_breakdown section uses estimated values (computed analytically from cached and overlap measurements) rather than measured GPU-side timing. This is reasonable given the lack of GPU profiling tooling, but could mislead if the estimates are inaccurate. The handoff correctly notes this as estimated."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "library",
+      "observation": "architecture.md was updated with combined mode findings including the ~33.5 tok/s result. This is already documented well.",
+      "evidence": "Commit 610bb45 adds 40 lines to .factory/library/architecture.md documenting combined mode behavior and performance numbers."
+    },
+    {
+      "area": "conventions",
+      "observation": "The decode_step() dispatch priority comment includes 'Threaded' as option 4, which is documented as counter-productive in AGENTS.md. It's confusing to list it as a valid dispatch option. AGENTS.md already documents 'DO NOT use Python threading for GPU dispatch' but the tp_engine.py docstring still presents it as a viable option.",
+      "evidence": "tp_engine.py decode_step() docstring: 'Priority order: ... 4. Threaded: _threaded_dispatch is True.' vs AGENTS.md: 'DO NOT use Python threading for GPU dispatch.'"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS. The combined cached+stream feature correctly implements and tests the merged optimization approach. Performance improvement is 1.411x over cached-only, 2.66x over serial, with cosine sim 0.999983 (all 10 steps pass threshold 0.99). Three minor non-blocking issues: (1) AllreduceProfiler doesn't measure async allreduce time (expected), (2) threaded dispatch dead code remains, (3) profile breakdown uses estimates. No blocking issues."
+}

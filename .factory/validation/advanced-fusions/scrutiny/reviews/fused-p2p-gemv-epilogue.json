@@ -1,0 +1,45 @@
+{
+  "featureId": "fused-p2p-gemv-epilogue",
+  "reviewedAt": "2026-03-15T03:56:00.000Z",
+  "commitId": "7cc024e",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "The fused P2P GEMV epilogue implementation is solid. The gemv_p2p_reduce.hip kernel correctly implements the simultaneous all-GPU reduce approach where each GPU reads peer GPU partials via P2P pointers. The FusedP2PReduce class in p2p_allreduce.py provides the same interface as P2PAllreduce (allreduce_residual, allreduce_residual_async, wait_for_allreduce_on_compute_stream). The performance findings are accurately documented: 1.72x raw allreduce speedup, but the combined mode benefits are minimal (0.999x) because async fused allreduce adds overhead from 4x compute event waits. No blocking issues.",
+    "issues": [
+      {
+        "file": "src/kernels/gemv_p2p_reduce.hip",
+        "line": 70,
+        "severity": "non_blocking",
+        "description": "The TP2 kernel (fused_p2p_reduce_residual_tp2_kernel) handles the odd-element edge case (idx < n but idx+1 >= n) but the TP4 kernel fused_p2p_reduce_residual_tp4_kernel should have the same boundary check. Review of the existing code confirms it does handle this, but it's worth noting both kernels have consistent half2 packing with fallback to scalar for the last element."
+      },
+      {
+        "file": "src/runtime/p2p_allreduce.py",
+        "line": null,
+        "severity": "non_blocking",
+        "description": "The FusedP2PReduce class has a fallback to P2PAllreduce if the fused kernel fails to load. This is good for robustness. However, the fallback condition (self._fused_lib is None) is checked per-call in allreduce_residual() rather than at init, which adds a small conditional overhead on the hot path."
+      },
+      {
+        "file": "src/inference/tp_engine.py",
+        "line": null,
+        "severity": "non_blocking",
+        "description": "The fused P2P path is initialized alongside the standard P2P allreduce, with the fused path being dispatched only when set_fused_p2p_reduce(True) is called. However, the _decode_step_cached_stream() method always uses standard P2PAllreduce (not FusedP2PReduce) — this is by design (documented in handoff) since the async fused allreduce underperforms in combined mode. The interaction is non-obvious for future workers."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "library",
+      "observation": "architecture.md was updated with the fused P2P finding (1.72x raw speedup, 0.999x in combined mode, 1.09x in serial mode). The key insight about why async fused allreduce underperforms in combined mode (4x compute events vs 1x for standard P2P) is documented.",
+      "evidence": "Commit 7cc024e adds 54 lines to .factory/library/architecture.md documenting the fused P2P findings."
+    },
+    {
+      "area": "conventions",
+      "observation": "The new gemv_p2p_reduce.hip kernel is placed in src/kernels/ following the project convention for versioned kernel files. It uses the correct hipcc attributes (extern C, __global__, amdgpu_flat_work_group_size) per AGENTS.md conventions. The file naming and placement follows the established pattern.",
+      "evidence": "Commit 7cc024e: src/kernels/gemv_p2p_reduce.hip added, uses __attribute__((amdgpu_flat_work_group_size(256, 256))) per convention."
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS. The fused P2P GEMV epilogue is correctly implemented and tested. The kernel correctly uses all-GPU simultaneous P2P reads to eliminate sequential gather→reduce→broadcast pipeline. Raw allreduce latency improved 1.72x (59.3 vs 101.7 us). The serial decode path sees 1.09x improvement; combined mode sees negligible benefit (+0.3%) due to the overhead of waiting for all 4 compute events in async mode. VAL-ADV-001 satisfied. Three minor non-blocking observations: boundary handling consistency, fallback overhead, and the subtle design decision to not use fused async in combined mode."
+}
