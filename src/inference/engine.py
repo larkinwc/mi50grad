@@ -350,11 +350,15 @@ class InferenceEngine:
         self._alloc_scratch()
         self._init_deltanet_gpu()
         self._init_qknorm_rope()
+        self._init_qknorm_rope_cachew()
         self._init_rope_hip()
         self._init_gemv_v2()
         self._init_gemm_prefill()
         self._init_quant_kernels()
         self._init_streams()
+
+        # Direct KV cache write flag (set via set_direct_kv_write())
+        self._direct_kv_write = False
 
         # Launch counting infrastructure: tracks kernel launches per layer.
         # Call reset_launch_counters() before a decode step, then read
@@ -427,6 +431,50 @@ class InferenceEngine:
         self.kernels.get_hip("qknorm_rope_fused", "qknorm_rope")
         self._qknorm_rope_fused = True
         print("Fused QK-norm+RoPE kernel loaded")
+
+    def _init_qknorm_rope_cachew(self):
+        """Load the fused QK-norm + RoPE + KV cache write kernel.
+
+        This is a variant of qknorm_rope_fused that additionally writes the
+        post-RoPE output directly to a KV cache position (cache_dst pointer).
+        When non-NULL, it writes to both the working buffer AND the cache,
+        eliminating the separate hipMemcpyAsync D2D for K.
+
+        Falls back gracefully if the kernel cannot be loaded (uses base
+        qknorm_rope_fused + separate memcpy instead).
+        """
+        self._qknorm_rope_cachew = False
+        hip_path = HIP_DIR / "qknorm_rope_cachew.hip"
+        if not hip_path.exists():
+            print("qknorm_rope_cachew.hip not found, using qknorm_rope_fused + memcpy")
+            return
+        try:
+            self.kernels.get_hip("qknorm_rope_cachew_fused", "qknorm_rope_cachew")
+            self._qknorm_rope_cachew = True
+            print("Fused QK-norm+RoPE+cache-write kernel loaded (qknorm_rope_cachew.hip)")
+        except Exception as e:
+            print(f"qknorm_rope_cachew kernel failed to load: {e}, "
+                  "using qknorm_rope_fused + memcpy fallback")
+
+    def set_direct_kv_write(self, enabled: bool):
+        """Enable or disable direct KV cache writes from QKNorm/RoPE kernel.
+
+        When enabled=True, the QKNorm/RoPE kernel (qknorm_rope_cachew_fused) writes
+        the post-RoPE K directly to the KV cache position, and V is written directly
+        from its GEMV to the cache position (splitting the KV fused GEMV into
+        separate K and V GEMVs).
+
+        This eliminates 2 hipMemcpyAsync D2D calls per full-attention layer
+        (16 layers × 2 copies = 32 D2D copies per token for TP=4).
+
+        Requires _qknorm_rope_cachew = True (loaded at init).
+        Requires build_dispatch_cache() to be rebuilt after enabling.
+        """
+        if enabled and not self._qknorm_rope_cachew:
+            print("WARNING: Direct KV write requires qknorm_rope_cachew kernel "
+                  "(unavailable). Keeping direct_kv_write disabled.")
+            enabled = False
+        self._direct_kv_write = enabled
 
     def _init_rope_hip(self):
         """Load the HIP RoPE kernel (rope_v2.hip), replacing assembly rope.s.
@@ -1125,6 +1173,12 @@ class InferenceEngine:
 
         With TP: each GPU handles local_num_attention_heads Q heads and
         local_num_kv_heads KV heads. O projection is row-parallel with allreduce.
+
+        When _direct_kv_write=True:
+        - K GEMV writes to d_k (working buffer for qknorm_rope)
+        - V GEMV writes directly to cache position (eliminates V D2D copy)
+        - qknorm_rope_cachew writes post-RoPE K directly to cache (eliminates K D2D copy)
+        - No separate append_kv_gpu call needed
         """
         cfg = self.config
         h = cfg.hidden_size
@@ -1138,9 +1192,21 @@ class InferenceEngine:
         self._launch_gemv_fp16(self.d_q_fused, self.d_normed, lw.q_fused_weight,
                                 h, 2 * self.q_dim)
 
-        # Fused K+V projection: normed_hidden → [K, V] [2*kv_dim]
-        self._launch_gemv_fp16(self.d_kv_fused, self.d_normed, lw.kv_fused_weight,
-                                h, 2 * self.kv_dim)
+        if self._direct_kv_write:
+            # Split KV GEMV into K GEMV (working buffer) + V GEMV (direct cache write)
+            # K GEMV: writes to d_k (working buffer, needed for qknorm_rope)
+            self._launch_gemv_fp16(self.d_k, self.d_normed, lw.k_weight,
+                                    h, self.kv_dim)
+            # V GEMV: writes directly to cache position (eliminates V D2D copy)
+            cache_v_ptr = self.kv_cache.layer_v_ptr(layer_idx) + \
+                self.kv_cache.current_len * self.kv_cache.local_num_kv_heads * \
+                self.config.head_dim * 2
+            self._launch_gemv_fp16(cache_v_ptr, self.d_normed, lw.v_weight,
+                                    h, self.kv_dim)
+        else:
+            # Fused K+V projection: normed_hidden → [K, V] [2*kv_dim]
+            self._launch_gemv_fp16(self.d_kv_fused, self.d_normed, lw.kv_fused_weight,
+                                    h, 2 * self.kv_dim)
 
         # No stream sync needed: both GEMVs now run on the default stream,
         # so QKNorm ordering is guaranteed by the null stream's serial execution.
@@ -1149,11 +1215,22 @@ class InferenceEngine:
         # Replaces 4 separate launches: qk_norm(Q) + qk_norm(K) + rope(Q) + rope(K)
         self._launch_qknorm_rope(self.d_q, lw.q_norm, position,
                                   self.local_num_attention_heads, cfg.head_dim)
-        self._launch_qknorm_rope(self.d_k, lw.k_norm, position,
-                                  self.local_num_kv_heads, cfg.head_dim)
 
-        # Update KV cache (GPU-to-GPU copy, no host roundtrip)
-        self.kv_cache.append_kv_gpu(layer_idx, self.d_k, self.d_v)
+        if self._direct_kv_write:
+            # Use cache-write variant: writes post-RoPE K to both d_k AND cache position
+            cache_k_ptr = self.kv_cache.layer_k_ptr(layer_idx) + \
+                self.kv_cache.current_len * self.kv_cache.local_num_kv_heads * \
+                self.config.head_dim * 2
+            self._launch_qknorm_rope_cachew(self.d_k, lw.k_norm, position,
+                                             self.local_num_kv_heads, cfg.head_dim,
+                                             cache_k_ptr)
+            # V was already written to cache above; K was written by qknorm_rope_cachew
+            # No separate append_kv_gpu call needed
+        else:
+            self._launch_qknorm_rope(self.d_k, lw.k_norm, position,
+                                      self.local_num_kv_heads, cfg.head_dim)
+            # Update KV cache (GPU-to-GPU copy, no host roundtrip)
+            self.kv_cache.append_kv_gpu(layer_idx, self.d_k, self.d_v)
 
         # Decode attention (head_dim=256 variant, local heads only)
         self._launch_decode_attn_256(
@@ -1482,6 +1559,39 @@ class InferenceEngine:
             ctypes.c_uint64(norm_weight),
             ctypes.c_uint64(self.d_cos + cos_offset),
             ctypes.c_uint64(self.d_sin + cos_offset),
+            ctypes.c_uint32(head_dim),
+            ctypes.c_uint32(half_rotary),
+            ctypes.c_float(self.config.rms_norm_eps),
+        ]
+        # One block per head; 256 threads per block
+        self.device.launch(func, (num_heads, 1, 1), (256, 1, 1), params)
+        self._record_launch(getattr(self, '_active_layer_idx', -1))
+
+    def _launch_qknorm_rope_cachew(self, x_ptr, norm_weight, position,
+                                    num_heads, head_dim, cache_dst):
+        """Fused per-head RMSNorm + partial RoPE + KV cache write.
+
+        Like _launch_qknorm_rope but also writes post-RoPE output to cache_dst
+        (the KV cache position for the current token), eliminating a separate
+        hipMemcpyAsync D2D copy.
+
+        Args:
+            x_ptr:       GPU pointer to [num_heads, head_dim] FP16 (modified in-place)
+            norm_weight: GPU pointer to [head_dim] FP16 norm weights
+            position:    Sequence position (for RoPE cos/sin table lookup)
+            num_heads:   Number of K heads
+            head_dim:    Dimension per head (e.g. 256)
+            cache_dst:   GPU pointer to KV cache position for this token (K channel)
+        """
+        func = self.kernels.get_hip("qknorm_rope_cachew_fused", "qknorm_rope_cachew")
+        half_rotary = self.rotary_dim // 2
+        cos_offset = position * half_rotary * 2  # byte offset into cos/sin tables
+        params = [
+            ctypes.c_uint64(x_ptr),
+            ctypes.c_uint64(norm_weight),
+            ctypes.c_uint64(self.d_cos + cos_offset),
+            ctypes.c_uint64(self.d_sin + cos_offset),
+            ctypes.c_uint64(cache_dst),        # cache write destination
             ctypes.c_uint32(head_dim),
             ctypes.c_uint32(half_rotary),
             ctypes.c_float(self.config.rms_norm_eps),
@@ -2278,19 +2388,54 @@ class InferenceEngine:
                             ctypes.c_uint64(0),  # no residual
                         ],
                     )
-                    kv_grid = (2 * self.kv_dim + 3) // 4
-                    lc['gemv_kv_fused'] = LaunchSpec(
-                        func=self.kernels.get_hip("gemv_fp16_v2", "gemv_fp16_v2"),
-                        grid=(kv_grid, 1, 1), block=(256, 1, 1),
-                        params=[
-                            ctypes.c_uint64(self.d_normed),
-                            ctypes.c_uint64(lw.kv_fused_weight),
-                            ctypes.c_uint64(self.d_kv_fused),
-                            ctypes.c_uint32(h),
-                            ctypes.c_uint32(2 * self.kv_dim),
-                            ctypes.c_uint64(0),  # no residual
-                        ],
-                    )
+                    if self._direct_kv_write and self._qknorm_rope_cachew:
+                        # Split KV GEMV into K-only and V-to-cache GEMVs
+                        k_grid = (self.kv_dim + 3) // 4
+                        lc['gemv_k_only'] = LaunchSpec(
+                            func=self.kernels.get_hip("gemv_fp16_v2", "gemv_fp16_v2"),
+                            grid=(k_grid, 1, 1), block=(256, 1, 1),
+                            params=[
+                                ctypes.c_uint64(self.d_normed),
+                                ctypes.c_uint64(lw.k_weight),
+                                ctypes.c_uint64(self.d_k),  # working buffer
+                                ctypes.c_uint32(h),
+                                ctypes.c_uint32(self.kv_dim),
+                                ctypes.c_uint64(0),  # no residual
+                            ],
+                        )
+                        # V GEMV writes directly to KV cache position (mutable output ptr)
+                        # Initial value: position 0 in the cache; updated per step at params[2]
+                        kv_stride = self.local_num_kv_heads * cfg.head_dim * 2
+                        v_cache_ptr_init = self.kv_cache.layer_v_ptr(layer_idx)
+                        lc['gemv_v_cache'] = LaunchSpec(
+                            func=self.kernels.get_hip("gemv_fp16_v2", "gemv_fp16_v2"),
+                            grid=(k_grid, 1, 1), block=(256, 1, 1),
+                            params=[
+                                ctypes.c_uint64(self.d_normed),
+                                ctypes.c_uint64(lw.v_weight),
+                                ctypes.c_uint64(v_cache_ptr_init),  # mutable: index [2]
+                                ctypes.c_uint32(h),
+                                ctypes.c_uint32(self.kv_dim),
+                                ctypes.c_uint64(0),  # no residual
+                            ],
+                        )
+                        # Store layer's V cache base pointer for offset computation
+                        lc['_v_cache_base'] = v_cache_ptr_init
+                        lc['_kv_stride'] = kv_stride
+                    else:
+                        kv_grid = (2 * self.kv_dim + 3) // 4
+                        lc['gemv_kv_fused'] = LaunchSpec(
+                            func=self.kernels.get_hip("gemv_fp16_v2", "gemv_fp16_v2"),
+                            grid=(kv_grid, 1, 1), block=(256, 1, 1),
+                            params=[
+                                ctypes.c_uint64(self.d_normed),
+                                ctypes.c_uint64(lw.kv_fused_weight),
+                                ctypes.c_uint64(self.d_kv_fused),
+                                ctypes.c_uint32(h),
+                                ctypes.c_uint32(2 * self.kv_dim),
+                                ctypes.c_uint64(0),  # no residual
+                            ],
+                        )
 
                 # --- QK-norm + RoPE (position-mutable) ---
                 # params[2] = cos ptr, params[3] = sin ptr — updated per step
@@ -2310,19 +2455,42 @@ class InferenceEngine:
                             ctypes.c_float(cfg.rms_norm_eps),
                         ],
                     )
-                    lc['qknorm_k'] = LaunchSpec(
-                        func=qknorm_func,
-                        grid=(self.local_num_kv_heads, 1, 1), block=(256, 1, 1),
-                        params=[
-                            ctypes.c_uint64(self.d_k),
-                            ctypes.c_uint64(lw.k_norm),
-                            ctypes.c_uint64(self.d_cos),  # mutable: index [2]
-                            ctypes.c_uint64(self.d_sin),  # mutable: index [3]
-                            ctypes.c_uint32(cfg.head_dim),
-                            ctypes.c_uint32(half_rotary),
-                            ctypes.c_float(cfg.rms_norm_eps),
-                        ],
-                    )
+                    if self._direct_kv_write and self._qknorm_rope_cachew:
+                        # Use cache-write variant for K: params[4] = cache_dst (mutable)
+                        cachew_func = self.kernels.get_hip("qknorm_rope_cachew_fused",
+                                                           "qknorm_rope_cachew")
+                        k_cache_ptr_init = self.kv_cache.layer_k_ptr(layer_idx)
+                        kv_stride = self.local_num_kv_heads * cfg.head_dim * 2
+                        lc['qknorm_k'] = LaunchSpec(
+                            func=cachew_func,
+                            grid=(self.local_num_kv_heads, 1, 1), block=(256, 1, 1),
+                            params=[
+                                ctypes.c_uint64(self.d_k),
+                                ctypes.c_uint64(lw.k_norm),
+                                ctypes.c_uint64(self.d_cos),  # mutable: index [2]
+                                ctypes.c_uint64(self.d_sin),  # mutable: index [3]
+                                ctypes.c_uint64(k_cache_ptr_init),  # mutable: index [4]
+                                ctypes.c_uint32(cfg.head_dim),
+                                ctypes.c_uint32(half_rotary),
+                                ctypes.c_float(cfg.rms_norm_eps),
+                            ],
+                        )
+                        # Store K cache base pointer for per-step offset computation
+                        lc['_k_cache_base'] = k_cache_ptr_init
+                    else:
+                        lc['qknorm_k'] = LaunchSpec(
+                            func=qknorm_func,
+                            grid=(self.local_num_kv_heads, 1, 1), block=(256, 1, 1),
+                            params=[
+                                ctypes.c_uint64(self.d_k),
+                                ctypes.c_uint64(lw.k_norm),
+                                ctypes.c_uint64(self.d_cos),  # mutable: index [2]
+                                ctypes.c_uint64(self.d_sin),  # mutable: index [3]
+                                ctypes.c_uint32(cfg.head_dim),
+                                ctypes.c_uint32(half_rotary),
+                                ctypes.c_float(cfg.rms_norm_eps),
+                            ],
+                        )
 
                 # --- Decode attention (seq_len is mutable: index [4]) ---
                 # Use tuned flash_attn_256_decode (4-WF KV-parallel, 2.8-5.5x faster)

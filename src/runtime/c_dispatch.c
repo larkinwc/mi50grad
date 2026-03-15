@@ -82,9 +82,11 @@ typedef struct {
 } CKernelSpec;
 
 /* Param indices for mutable values */
-#define QKNORM_COS_IDX      2
-#define QKNORM_SIN_IDX      3
-#define DECODE_ATTN_SEQ_IDX 4
+#define QKNORM_COS_IDX        2
+#define QKNORM_SIN_IDX        3
+#define DECODE_ATTN_SEQ_IDX   4
+#define QKNORM_CACHEW_DST_IDX 4   /* cache_dst in qknorm_rope_cachew (index 4) */
+#define GEMV_V_CACHE_OUT_IDX  2   /* output ptr for gemv_v_cache (index 2 in gemv_fp16_v2) */
 
 /*
  * CEngineLayerSpec: kernel specs for one engine on one layer.
@@ -93,9 +95,9 @@ typedef struct {
     /* Attention kernels */
     CKernelSpec attn_rmsnorm;
     CKernelSpec gemv_q_fused;
-    CKernelSpec gemv_kv_fused;
+    CKernelSpec gemv_kv_fused;   /* standard: fused [K,V] GEMV */
     CKernelSpec qknorm_q;
-    CKernelSpec qknorm_k;
+    CKernelSpec qknorm_k;        /* standard: qknorm_rope_fused; or cachew variant */
     CKernelSpec decode_attn;
     CKernelSpec sigmoid_mul;
     CKernelSpec gemv_o_proj;
@@ -108,23 +110,26 @@ typedef struct {
     CKernelSpec ffn_rmsnorm;
     CKernelSpec ffn_gate_up_silu;
     CKernelSpec ffn_down;
+    /* Direct KV write kernels (when use_direct_kv_write=1) */
+    CKernelSpec gemv_k_only;     /* K-only GEMV to working buffer */
+    CKernelSpec gemv_v_cache;    /* V GEMV writing directly to cache position (mutable out) */
 
-    int      layer_type;      /* 0=full_attention, 1=deltanet */
-    int      streams_ready;   /* 1 if Q/KV streams need sync before qknorm */
-    uint64_t stream_q;        /* HIP stream for Q projection (if streams_ready) */
-    uint64_t stream_kv;       /* HIP stream for KV projection (if streams_ready) */
+    int      layer_type;         /* 0=full_attention, 1=deltanet */
+    int      streams_ready;      /* 1 if Q/KV streams need sync before qknorm */
+    uint64_t stream_q;           /* HIP stream for Q projection (if streams_ready) */
+    uint64_t stream_kv;          /* HIP stream for KV projection (if streams_ready) */
 
     /* Position-dependent params: base pointers for cos/sin tables */
-    uint64_t d_cos_base;      /* engine->d_cos */
-    uint64_t d_sin_base;      /* engine->d_sin */
+    uint64_t d_cos_base;         /* engine->d_cos */
+    uint64_t d_sin_base;         /* engine->d_sin */
 
     /* KV cache append for full attention layers */
-    uint64_t d_k_src;         /* engine->d_k (source K buffer after GEMV) */
-    uint64_t d_v_src;         /* engine->d_v (source V buffer after GEMV) */
-    uint64_t kv_cache_k_base; /* kv_cache.layer_k_ptr(layer_idx) */
-    uint64_t kv_cache_v_base; /* kv_cache.layer_v_ptr(layer_idx) */
-    uint32_t kv_stride;       /* local_num_kv_heads * head_dim * 2 bytes */
-    uint32_t _pad;
+    uint64_t d_k_src;            /* engine->d_k (source K buffer after GEMV) */
+    uint64_t d_v_src;            /* engine->d_v (source V buffer after GEMV) */
+    uint64_t kv_cache_k_base;    /* kv_cache.layer_k_ptr(layer_idx); 0=skip D2D copy */
+    uint64_t kv_cache_v_base;    /* kv_cache.layer_v_ptr(layer_idx); 0=skip D2D copy */
+    uint32_t kv_stride;          /* local_num_kv_heads * head_dim * 2 bytes */
+    uint32_t use_direct_kv_write;/* 1=K and V written directly by kernels (no memcpy) */
 } CEngineLayerSpec;
 
 /*
@@ -201,6 +206,23 @@ static void update_cos_sin(CKernelSpec *spec, uint64_t cos_ptr, uint64_t sin_ptr
     void **params = (void **)(uintptr_t)spec->params_array;
     *((uint64_t *)params[QKNORM_COS_IDX]) = cos_ptr;
     *((uint64_t *)params[QKNORM_SIN_IDX]) = sin_ptr;
+}
+
+static void update_cos_sin_and_cache(CKernelSpec *spec, uint64_t cos_ptr, uint64_t sin_ptr,
+                                      uint64_t cache_dst_ptr)
+{
+    if (!spec->present || !spec->params_array) return;
+    void **params = (void **)(uintptr_t)spec->params_array;
+    *((uint64_t *)params[QKNORM_COS_IDX]) = cos_ptr;
+    *((uint64_t *)params[QKNORM_SIN_IDX]) = sin_ptr;
+    *((uint64_t *)params[QKNORM_CACHEW_DST_IDX]) = cache_dst_ptr;
+}
+
+static void update_v_cache_ptr(CKernelSpec *spec, uint64_t cache_dst_ptr)
+{
+    if (!spec->present || !spec->params_array) return;
+    void **params = (void **)(uintptr_t)spec->params_array;
+    *((uint64_t *)params[GEMV_V_CACHE_OUT_IDX]) = cache_dst_ptr;
 }
 
 static void update_seq_len(CKernelSpec *spec, uint32_t seq_len)
@@ -373,8 +395,21 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
                 /* ---- Full attention ---- */
                 err = launch_kernel(&es->gemv_q_fused, plan);
                 if (err) return err;
-                err = launch_kernel(&es->gemv_kv_fused, plan);
-                if (err) return err;
+
+                if (es->use_direct_kv_write) {
+                    /* Direct KV write mode: K to working buffer, V directly to cache */
+                    err = launch_kernel(&es->gemv_k_only, plan);
+                    if (err) return err;
+                    /* Update V GEMV output ptr to current cache position */
+                    uint64_t pos = (uint64_t)(seq_len - 1);
+                    uint64_t dst_v = es->kv_cache_v_base + pos * (uint64_t)es->kv_stride;
+                    update_v_cache_ptr(&es->gemv_v_cache, dst_v);
+                    err = launch_kernel(&es->gemv_v_cache, plan);
+                    if (err) return err;
+                } else {
+                    err = launch_kernel(&es->gemv_kv_fused, plan);
+                    if (err) return err;
+                }
 
                 /* No stream sync: Q/KV GEMVs now run on the default (null) stream.
                  * Sequential execution on the null stream guarantees ordering for
@@ -387,12 +422,20 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
                 err = launch_kernel(&es->qknorm_q, plan);
                 if (err) return err;
 
-                update_cos_sin(&es->qknorm_k, cos_ptr, sin_ptr);
+                if (es->use_direct_kv_write) {
+                    /* qknorm_k variant: also writes K to cache position */
+                    uint64_t pos = (uint64_t)(seq_len - 1);
+                    uint64_t dst_k = es->kv_cache_k_base + pos * (uint64_t)es->kv_stride;
+                    update_cos_sin_and_cache(&es->qknorm_k, cos_ptr, sin_ptr, dst_k);
+                } else {
+                    update_cos_sin(&es->qknorm_k, cos_ptr, sin_ptr);
+                }
                 err = launch_kernel(&es->qknorm_k, plan);
                 if (err) return err;
 
-                /* KV cache append (D2D) at position (seq_len - 1) */
-                if (es->kv_cache_k_base) {
+                /* KV cache append (D2D) at position (seq_len - 1)
+                 * Skipped when use_direct_kv_write=1 (kernels handle it directly) */
+                if (!es->use_direct_kv_write && es->kv_cache_k_base) {
                     uint64_t pos = (uint64_t)(seq_len - 1);
                     uint64_t dst_k = es->kv_cache_k_base + pos * (uint64_t)es->kv_stride;
                     uint64_t dst_v = es->kv_cache_v_base + pos * (uint64_t)es->kv_stride;

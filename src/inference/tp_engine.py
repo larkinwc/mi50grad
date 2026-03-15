@@ -604,7 +604,16 @@ class TPInferenceEngine:
                     # guaranteeing ordering for QKNorm without host-blocking sync calls.
                     if 'gemv_q_fused' in layer_cache:
                         engine.device.launch_cached(layer_cache['gemv_q_fused'])
-                    if 'gemv_kv_fused' in layer_cache:
+                    if 'gemv_k_only' in layer_cache:
+                        # Direct KV write mode: K to working buffer, V directly to cache
+                        engine.device.launch_cached(layer_cache['gemv_k_only'])
+                        # Update V GEMV output to current KV cache position
+                        cur_pos = engine.kv_cache.current_len
+                        kv_stride = layer_cache['_kv_stride']
+                        v_cache_ptr = layer_cache['_v_cache_base'] + cur_pos * kv_stride
+                        layer_cache['gemv_v_cache'].params[2].value = v_cache_ptr
+                        engine.device.launch_cached(layer_cache['gemv_v_cache'])
+                    elif 'gemv_kv_fused' in layer_cache:
                         engine.device.launch_cached(layer_cache['gemv_kv_fused'])
 
                     # --- QK-norm + RoPE: update position-dependent cos/sin ptrs ---
@@ -617,10 +626,18 @@ class TPInferenceEngine:
                         spec_k = layer_cache['qknorm_k']
                         spec_k.params[2].value = engine.d_cos + cos_offset
                         spec_k.params[3].value = engine.d_sin + cos_offset
+                        if '_k_cache_base' in layer_cache:
+                            # Direct KV write mode: also update K cache destination
+                            cur_pos = engine.kv_cache.current_len
+                            kv_stride = layer_cache['_kv_stride']
+                            k_cache_ptr = layer_cache['_k_cache_base'] + cur_pos * kv_stride
+                            spec_k.params[4].value = k_cache_ptr
                         engine.device.launch_cached(spec_k)
 
-                    # GPU-to-GPU KV cache update
-                    engine.kv_cache.append_kv_gpu(layer_idx, engine.d_k, engine.d_v)
+                    # KV cache update: skip if direct write mode (cache written above)
+                    if '_k_cache_base' not in layer_cache:
+                        # Standard path: GPU-to-GPU D2D copy to KV cache
+                        engine.kv_cache.append_kv_gpu(layer_idx, engine.d_k, engine.d_v)
 
                     # --- Decode attention: update seq_len ---
                     if 'decode_attn' in layer_cache:
@@ -771,7 +788,16 @@ class TPInferenceEngine:
                     # No explicit stream sync needed: null stream serializes execution.
                     if 'gemv_q_fused' in layer_cache:
                         engine.device.launch_cached(layer_cache['gemv_q_fused'])
-                    if 'gemv_kv_fused' in layer_cache:
+                    if 'gemv_k_only' in layer_cache:
+                        # Direct KV write mode: K to working buffer, V directly to cache
+                        engine.device.launch_cached(layer_cache['gemv_k_only'])
+                        # Update V GEMV output to current KV cache position
+                        cur_pos = engine.kv_cache.current_len
+                        kv_stride = layer_cache['_kv_stride']
+                        v_cache_ptr = layer_cache['_v_cache_base'] + cur_pos * kv_stride
+                        layer_cache['gemv_v_cache'].params[2].value = v_cache_ptr
+                        engine.device.launch_cached(layer_cache['gemv_v_cache'])
+                    elif 'gemv_kv_fused' in layer_cache:
                         engine.device.launch_cached(layer_cache['gemv_kv_fused'])
 
                     # --- QK-norm + RoPE: update position-dependent cos/sin ptrs ---
@@ -784,10 +810,18 @@ class TPInferenceEngine:
                         spec_k = layer_cache['qknorm_k']
                         spec_k.params[2].value = engine.d_cos + cos_offset
                         spec_k.params[3].value = engine.d_sin + cos_offset
+                        if '_k_cache_base' in layer_cache:
+                            # Direct KV write mode: also update K cache destination
+                            cur_pos = engine.kv_cache.current_len
+                            kv_stride = layer_cache['_kv_stride']
+                            k_cache_ptr = layer_cache['_k_cache_base'] + cur_pos * kv_stride
+                            spec_k.params[4].value = k_cache_ptr
                         engine.device.launch_cached(spec_k)
 
-                    # GPU-to-GPU KV cache update
-                    engine.kv_cache.append_kv_gpu(layer_idx, engine.d_k, engine.d_v)
+                    # KV cache update: skip if direct write mode (cache written above)
+                    if '_k_cache_base' not in layer_cache:
+                        # Standard path: GPU-to-GPU D2D copy to KV cache
+                        engine.kv_cache.append_kv_gpu(layer_idx, engine.d_k, engine.d_v)
 
                     # --- Decode attention: update seq_len ---
                     if 'decode_attn' in layer_cache:
@@ -1299,6 +1333,28 @@ class TPInferenceEngine:
 
         return lib
 
+    def set_direct_kv_write(self, enabled: bool):
+        """Enable or disable direct KV cache writes from QKNorm/RoPE kernel.
+
+        When enabled=True:
+        - The QKNorm/RoPE kernel (qknorm_rope_cachew_fused) writes post-RoPE K
+          directly to the KV cache position, eliminating the K D2D memcpy.
+        - V is written directly from a separate V GEMV to the cache position,
+          eliminating the V D2D memcpy.
+        - Total D2D copies eliminated: 2 per full-attention layer × 16 layers = 32/token.
+
+        Requires build_dispatch_cache() to be called after enabling to rebuild
+        the parameter arrays with the new kernel specs.
+
+        Falls back gracefully if qknorm_rope_cachew kernel is unavailable.
+        """
+        for engine in self.engines:
+            engine.set_direct_kv_write(enabled)
+        # Force rebuild of dispatch cache to use new kernel specs
+        if self._engine_layer_caches:
+            self._engine_layer_caches = []
+            self._c_dispatch_plan = None  # Invalidate C dispatch plan
+
     def set_c_dispatch(self, enabled: bool):
         """Enable or disable C dispatch loop.
 
@@ -1426,33 +1482,35 @@ class TPInferenceEngine:
 
         class CEngineLayerSpec(ct.Structure):
             _fields_ = [
-                ('attn_rmsnorm',      CKernelSpec),
-                ('gemv_q_fused',      CKernelSpec),
-                ('gemv_kv_fused',     CKernelSpec),
-                ('qknorm_q',          CKernelSpec),
-                ('qknorm_k',          CKernelSpec),
-                ('decode_attn',       CKernelSpec),
-                ('sigmoid_mul',       CKernelSpec),
-                ('gemv_o_proj',       CKernelSpec),
-                ('gemv_la_in_proj',   CKernelSpec),
-                ('deltanet_v3',       CKernelSpec),
-                ('deltanet_v3_shift', CKernelSpec),
-                ('gemv_la_out_proj',  CKernelSpec),
-                ('ffn_rmsnorm',       CKernelSpec),
-                ('ffn_gate_up_silu',  CKernelSpec),
-                ('ffn_down',          CKernelSpec),
-                ('layer_type',        ct.c_int),
-                ('streams_ready',     ct.c_int),
-                ('stream_q',          ct.c_uint64),
-                ('stream_kv',         ct.c_uint64),
-                ('d_cos_base',        ct.c_uint64),
-                ('d_sin_base',        ct.c_uint64),
-                ('d_k_src',           ct.c_uint64),
-                ('d_v_src',           ct.c_uint64),
-                ('kv_cache_k_base',   ct.c_uint64),
-                ('kv_cache_v_base',   ct.c_uint64),
-                ('kv_stride',         ct.c_uint32),
-                ('_pad',              ct.c_uint32),
+                ('attn_rmsnorm',        CKernelSpec),
+                ('gemv_q_fused',        CKernelSpec),
+                ('gemv_kv_fused',       CKernelSpec),
+                ('qknorm_q',            CKernelSpec),
+                ('qknorm_k',            CKernelSpec),
+                ('decode_attn',         CKernelSpec),
+                ('sigmoid_mul',         CKernelSpec),
+                ('gemv_o_proj',         CKernelSpec),
+                ('gemv_la_in_proj',     CKernelSpec),
+                ('deltanet_v3',         CKernelSpec),
+                ('deltanet_v3_shift',   CKernelSpec),
+                ('gemv_la_out_proj',    CKernelSpec),
+                ('ffn_rmsnorm',         CKernelSpec),
+                ('ffn_gate_up_silu',    CKernelSpec),
+                ('ffn_down',            CKernelSpec),
+                ('gemv_k_only',         CKernelSpec),  # Direct KV write: K-only GEMV
+                ('gemv_v_cache',        CKernelSpec),  # Direct KV write: V to cache
+                ('layer_type',          ct.c_int),
+                ('streams_ready',       ct.c_int),
+                ('stream_q',            ct.c_uint64),
+                ('stream_kv',           ct.c_uint64),
+                ('d_cos_base',          ct.c_uint64),
+                ('d_sin_base',          ct.c_uint64),
+                ('d_k_src',             ct.c_uint64),
+                ('d_v_src',             ct.c_uint64),
+                ('kv_cache_k_base',     ct.c_uint64),
+                ('kv_cache_v_base',     ct.c_uint64),
+                ('kv_stride',           ct.c_uint32),
+                ('use_direct_kv_write', ct.c_uint32),
             ]
 
         # Allreduce function type signatures
@@ -1569,6 +1627,9 @@ class TPInferenceEngine:
                 fill_kernel_spec(es.ffn_rmsnorm,       lc.get('ffn_rmsnorm'))
                 fill_kernel_spec(es.ffn_gate_up_silu,  lc.get('ffn_gate_up_silu'))
                 fill_kernel_spec(es.ffn_down,          lc.get('ffn_down'))
+                # Direct KV write kernels (populated when direct_kv_write is enabled)
+                fill_kernel_spec(es.gemv_k_only,       lc.get('gemv_k_only'))
+                fill_kernel_spec(es.gemv_v_cache,      lc.get('gemv_v_cache'))
 
                 es.layer_type = 0 if lw.layer_type == 'full_attention' else 1
                 # Q/KV stream sync eliminated: always set streams_ready=0 so C dispatch
@@ -1591,10 +1652,18 @@ class TPInferenceEngine:
                     es.kv_cache_k_base = engine.kv_cache.layer_k_ptr(layer_idx)
                     es.kv_cache_v_base = engine.kv_cache.layer_v_ptr(layer_idx)
                     es.kv_stride       = kv_stride
+                    # Enable direct KV write if engine has it enabled and kernels built
+                    es.use_direct_kv_write = (
+                        1 if (engine._direct_kv_write and
+                              lc.get('gemv_k_only') is not None and
+                              lc.get('gemv_v_cache') is not None)
+                        else 0
+                    )
                 else:
                     es.kv_cache_k_base = 0
                     es.kv_cache_v_base = 0
                     es.kv_stride       = 0
+                    es.use_direct_kv_write = 0
 
         # Build allreduce spec arrays
         AttnARArray = CAllreduceSpec * num_layers
