@@ -1,0 +1,32 @@
+{
+  "groupId": "kernel-tuning-2",
+  "assertions": {
+    "VAL-TUNE-004": {
+      "status": "pass",
+      "evidence": "Final comprehensive TP=4 benchmark run on 2026-03-15 07:45:36 UTC. C dispatch=37.0 tok/s (27.01 ms/tok). Cached+stream baseline=34.0 tok/s. Speedup vs cached+stream=1.09x. Speedup vs 25.5 combined baseline=1.45x. Full comparison table: serial=12.4, cached=23.7, combined=25.5, C dispatch+tuned=37.0 tok/s. Report generated at bench/tp4_optimization_report_v2.md."
+    },
+    "VAL-RING-006": {
+      "status": "pass",
+      "evidence": "INT8 partial quantization documented as not beneficial: bench_tp4_sprint2.py report documents assessment. Star topology handles 10KB efficiently at ~119us/call (vs ring 1015us/call). Star is 8.5x faster than ring for 10KB payloads. INT8 would halve payload (10KB->5KB) but star is PCIe-latency-bound not bandwidth-bound; adding quantize/dequantize kernels exceeds any bandwidth savings. Documented in bench/tp4_optimization_report_v2.md."
+    },
+    "VAL-CROSS-001": {
+      "status": "pass",
+      "evidence": "TP=4 (C dispatch + star allreduce + tuned kernels) vs single-GPU: 10 steps, cosine sims: 0.999993, 0.999994, 0.999993, 0.999996, 0.999993, 0.999986, 0.999985, 0.999973, 0.999973, 0.999956. Min cosine sim=0.999956, all >= 0.99 threshold. Result: PASS."
+    },
+    "VAL-CROSS-002": {
+      "status": "pass",
+      "evidence": "All optimizations combined: 37.0 tok/s (vs 25.5 tok/s combined baseline = 1.45x speedup). Exceeds prior combined baseline. C dispatch loop speedup vs cached+stream = 1.09x. Comparison: serial=12.4, cached=23.7, combined=25.5, NEW=37.0 tok/s. 1.82x vs single-GPU. 0.79x vs vLLM (46.9 tok/s). PASS."
+    },
+    "VAL-CROSS-003": {
+      "status": "pass",
+      "evidence": "Fallback test: set_c_dispatch(False) -> c_dispatch_enabled=False, cached_dispatch=True, stream_overlap_dispatch=True, p2p_ar=available. Mode selection: PASS. 5-step correctness vs C dispatch: min cosine sim=0.999989, all >= 0.99. OVERALL FALLBACK TEST: PASS."
+    },
+    "VAL-CROSS-004": {
+      "status": "pass",
+      "evidence": "Updated optimization report generated at bench/tp4_optimization_report_v2.md. Contains all optimization phases, ring vs star analysis (8.5x), INT8 allreduce assessment, kernel tuning results, gap analysis vs vLLM. Report written 2026-03-15 07:45:36 UTC. File exists on server at /opt/mi50grad/bench/tp4_optimization_report_v2.md."
+    }
+  },
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "docker"]
+}

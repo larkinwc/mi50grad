@@ -1,0 +1,24 @@
+{
+  "groupId": "kernel-tuning-1",
+  "assertions": {
+    "VAL-TUNE-001": {
+      "status": "pass",
+      "evidence": "INT4 GEMV tuning sweep completed for all 3 Qwen decode shapes. N=4096,K=5120: gemv_int4_v3_t16=82.4us (best, all variants pass max_err<1e-2). N=11008,K=5120: gemv_int4_v3_t16=105.7us (best). N=13696,K=5120: gemv_int4_v3_t16=122.1us (best). Speedup vs v3_t16 default=1.00x (already optimal). Confirmed default config achieves best performance among all tested variants."
+    },
+    "VAL-TUNE-002": {
+      "status": "pass",
+      "evidence": "FlashAttention decode tuning: tuned kernel (flash_attn_256_decode) vs original (flash_attn_256_fp16). kv=64: 41.3us vs 115.5us (2.80x). kv=128: 53.0us vs 182.9us (3.45x). kv=256: 76.9us vs 330.9us (4.31x). kv=512: 131.7us vs 627.6us (4.76x). kv=1024: 231.1us vs 1221.5us (5.28x). kv=2048: 434.4us vs 2408.2us (5.54x). Average speedup 4.36x. All tuned_err<5e-3 (actual max=1.53e-5). All PASS."
+    },
+    "VAL-TUNE-003": {
+      "status": "pass",
+      "evidence": "Elementwise kernel tuning (dim=5120): residual_add v2=88.0us, v3=66.5us (1.32x speedup, v3 faster). silu_fused v2=64.4us, v3=50.1us (1.29x speedup). rmsnorm v2=42.8us, v3=29.9us (1.43x speedup). skip_rmsnorm v2=59.2us, v3=51.0us (1.16x speedup). All v3 variants faster. All max_err=0 or 1.95e-3, all <5e-3 threshold. All PASS."
+    },
+    "VAL-TUNE-005": {
+      "status": "pass",
+      "evidence": "All kernel correctness thresholds met: GEMV max_err=3.91e-3 (threshold <1e-2). FlashAttn tuned max_err=1.53e-5 (threshold <5e-3). Elementwise all 0.0 to 1.95e-3 (threshold <5e-3). OVERALL: ALL PASS. No correctness regressions in any tuned variant."
+    }
+  },
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "docker", "hipcc"]
+}
