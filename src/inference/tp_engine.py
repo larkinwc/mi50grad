@@ -15,7 +15,7 @@ from typing import Optional
 
 from src.inference.engine import InferenceEngine
 from src.runtime.tensor_parallel import TensorParallelGroup
-from src.runtime.p2p_allreduce import P2PAllreduce, FusedP2PReduce
+from src.runtime.p2p_allreduce import P2PAllreduce, FusedP2PReduce, RingAllreduce
 from src.model.qwen import QwenConfig
 
 
@@ -147,6 +147,19 @@ class TPInferenceEngine:
                 print(f"Fused P2P reduce unavailable ({e}), using P2P allreduce fallback")
                 self._fused_p2p_ar = None
 
+        # Initialize ring allreduce (new path: ring topology for balanced PCIe bandwidth)
+        self._ring_ar = None
+        self._ring_allreduce = False  # flag to enable ring allreduce path
+        if self.tp_size in (2, 4):
+            try:
+                h = config.hidden_size
+                self._ring_ar = RingAllreduce(
+                    self._hip, device_ids, h, streams=self.tp_group.streams)
+                print(f"Ring allreduce loaded (TP={self.tp_size}, ring topology)")
+            except Exception as e:
+                print(f"Ring allreduce unavailable ({e}), using P2P allreduce fallback")
+                self._ring_ar = None
+
         # Fallback host buffers
         h = config.hidden_size
         self._host_bufs = [ctypes.create_string_buffer(h * 2)
@@ -253,6 +266,28 @@ class TPInferenceEngine:
             print("WARNING: Fused P2P reduce unavailable. Falling back to standard P2P allreduce.")
             fused = False
         self._fused_p2p_reduce = fused
+
+    def set_ring_allreduce(self, ring: bool):
+        """Enable or disable ring allreduce path.
+
+        When ring=True, allreduce operations use the ring topology where each
+        GPU only communicates with its neighbors (distributed PCIe bandwidth),
+        instead of the star topology where GPU0 does all gathering/broadcasting.
+
+        Ring allreduce has 6 P2P transfers total (same as star), but they are
+        distributed across all GPUs rather than all going through GPU0.
+
+        Requires RingAllreduce to be available (_ring_ar is not None).
+        Falls back to standard P2P allreduce if ring allreduce unavailable.
+        """
+        if ring and self._ring_ar is None:
+            print("WARNING: Ring allreduce unavailable. Falling back to standard P2P allreduce.")
+            ring = False
+        self._ring_allreduce = ring
+        if ring:
+            print(f"Ring allreduce enabled (TP={self.tp_size})")
+        else:
+            print(f"Ring allreduce disabled, using {'fused P2P' if self._fused_p2p_reduce else 'standard P2P'} allreduce")
 
     def set_cached_dispatch(self, cached: bool):
         """Enable or disable cached (pre-built parameter) dispatch.
@@ -696,12 +731,16 @@ class TPInferenceEngine:
         cfg = self.config
         num_layers = cfg.num_hidden_layers
         half_rotary = self.engines[0].rotary_dim // 2
-        # Stream overlap path always uses standard P2P allreduce (not fused).
+        # Stream overlap path: select active allreduce implementation.
+        # Ring allreduce has the same async interface as P2PAllreduce.
         # The fused kernel's async variant requires all 4 GPUs to sync with each
         # other's compute events, creating more overhead in the overlap path.
         # Standard P2P allreduce is better for streaming (1.41x slower in isolation
         # but faster overall due to better overlap with compute dispatch).
-        p2p_ar = self._p2p_ar
+        if self._ring_allreduce and self._ring_ar is not None:
+            p2p_ar = self._ring_ar
+        else:
+            p2p_ar = self._p2p_ar
         compute_streams = self._compute_streams  # [0] * tp_size (default null streams)
 
         # Upload embedding to all GPUs
@@ -869,7 +908,10 @@ class TPInferenceEngine:
         h = self.config.hidden_size
         cfg = self.config
         num_layers = cfg.num_hidden_layers
-        p2p_ar = self._p2p_ar
+        if self._ring_allreduce and self._ring_ar is not None:
+            p2p_ar = self._ring_ar
+        else:
+            p2p_ar = self._p2p_ar
         compute_streams = self._compute_streams  # [0] * tp_size (default streams)
 
         # Upload embedding to all GPUs
@@ -1074,9 +1116,16 @@ class TPInferenceEngine:
     def _allreduce_sum(self, buffer_name: str, hidden_size: int):
         """Allreduce partials only (no hidden download).
 
-        Tries P2P GPU allreduce first, falls back to fast_ar C extension,
-        then Python fallback.
+        Tries ring allreduce first (if enabled), then P2P GPU allreduce,
+        falls back to fast_ar C extension, then Python fallback.
         """
+        # Ring allreduce (new path)
+        if (self._ring_allreduce and self._ring_ar is not None
+                and self.tp_size in (2, 4)):
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            self._ring_ar.allreduce_sum(partial_ptrs, hidden_size)
+            return
+
         # P2P GPU allreduce (primary path): async P2P gather + on-device kernel + broadcast
         if self._p2p_ar is not None and 2 <= self.tp_size <= 4:
             partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
@@ -1127,6 +1176,14 @@ class TPInferenceEngine:
             partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
             hidden_ptrs = [e.d_hidden for e in self.engines]
             self._fused_p2p_ar.allreduce_residual(partial_ptrs, hidden_ptrs, hidden_size)
+            return
+
+        # Ring allreduce (new path): distributes PCIe bandwidth across all GPUs
+        if (self._ring_allreduce and self._ring_ar is not None
+                and self.tp_size in (2, 4)):
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            hidden_ptrs = [e.d_hidden for e in self.engines]
+            self._ring_ar.allreduce_residual(partial_ptrs, hidden_ptrs, hidden_size)
             return
 
         # P2P GPU allreduce (primary path): async P2P gather + on-device kernel + broadcast
@@ -1300,7 +1357,10 @@ class TPInferenceEngine:
 
         num_layers = self.config.num_hidden_layers
         num_engines = self.tp_size
-        p2p_ar = self._p2p_ar
+        if self._ring_allreduce and self._ring_ar is not None:
+            p2p_ar = self._ring_ar
+        else:
+            p2p_ar = self._p2p_ar
 
         # Kernel spec struct (must match c_dispatch.c exactly)
         # uint64 func, 3x uint32 grid, 3x uint32 block, uint32 shared_mem,
@@ -1726,6 +1786,9 @@ class TPInferenceEngine:
         if self._fused_p2p_ar:
             self._fused_p2p_ar.cleanup()
             self._fused_p2p_ar = None
+        if self._ring_ar:
+            self._ring_ar.cleanup()
+            self._ring_ar = None
         for engine in self.engines:
             engine.cleanup()
         self.tp_group.cleanup()

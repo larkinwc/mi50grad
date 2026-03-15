@@ -554,6 +554,537 @@ class P2PAllreduce:
         self._lib = None
 
 
+class RingAllreduce:
+    """Ring allreduce for TP=4 using P2P hipMemcpyPeerAsync.
+
+    Distributes PCIe bandwidth across all GPUs by forming a ring topology:
+        GPU0 → GPU1 → GPU2 → GPU3 → GPU0
+
+    This replaces the star topology (GPU0 gathers/broadcasts everything)
+    with a ring where each GPU only communicates with its neighbors.
+
+    Algorithm:
+    1. Reduce-scatter phase (TP-1 = 3 rounds):
+       - Each GPU sends one chunk to right neighbor, accumulates received chunk
+       - After 3 rounds: each GPU[i] has fully-reduced chunk[i]
+    2. All-gather phase (TP-1 = 3 rounds):
+       - Each GPU sends its fully-reduced chunk to right neighbor
+       - After 3 rounds: all GPUs have the complete result
+    3. Residual add: result is added to hidden buffer on all GPUs
+
+    For TP=4, hidden_size=5120: 4 chunks × 1280 FP16 elements each.
+
+    Usage:
+        ring = RingAllreduce(hip, device_ids, hidden_size)
+        ring.allreduce_residual(partial_ptrs, hidden_ptrs, num_elems)
+        ring.allreduce_sum(partial_ptrs, num_elems)
+        ring.allreduce_residual_async(partial_ptrs, hidden_ptrs, num_elems, compute_streams)
+        ring.wait_for_allreduce_on_compute_stream(compute_streams)
+        ring.cleanup()
+    """
+
+    def __init__(self, hip: HIPRuntime, device_ids: list, hidden_size: int,
+                 streams: Optional[list] = None):
+        """Initialize ring allreduce.
+
+        Args:
+            hip: HIPRuntime instance
+            device_ids: list of GPU device IDs forming the ring
+            hidden_size: max number of FP16 elements (buffer size)
+            streams: optional per-GPU compute streams
+        """
+        self._hip = hip
+        self._device_ids = list(device_ids)
+        self._tp_size = len(device_ids)
+        self._hidden_size = hidden_size
+        self._streams = streams if streams else [0] * len(device_ids)
+
+        if self._tp_size not in (2, 4):
+            raise ValueError(f"RingAllreduce only supports TP=2 or TP=4, got {self._tp_size}")
+
+        # Load kernel shared library
+        self._lib = None
+        self._load_lib()
+
+        # Chunk size for ring allreduce
+        # For TP=4, split hidden_size into 4 equal chunks
+        assert hidden_size % self._tp_size == 0, \
+            f"hidden_size={hidden_size} must be divisible by tp_size={self._tp_size}"
+        self._chunk_size = hidden_size // self._tp_size
+        self._chunk_bytes_fp16 = self._chunk_size * 2   # FP16 bytes per chunk
+        self._chunk_bytes_fp32 = self._chunk_size * 4   # FP32 bytes per chunk
+
+        # FP16 recv buffers: receive incoming FP16 chunks from P2P copies
+        # (chunk_size FP16 elements per GPU)
+        # FP32 scratch buffers: hold accumulated FP32 sum for each GPU's
+        # assigned chunk during reduce-scatter (avoids multi-round FP16 rounding)
+        # FP32 result buffers: assembled result (full hidden_size × FP32)
+        # FP16 result buffers: final FP16 result for output (full hidden_size × FP16)
+        fp16_chunk = self._chunk_bytes_fp16
+        fp32_chunk = self._chunk_bytes_fp32
+        fp32_full = hidden_size * 4   # full hidden_size × FP32
+        fp16_full = hidden_size * 2   # full hidden_size × FP16
+        # For all-gather phase: each GPU has TP chunks in FP32
+        fp32_total_chunks = fp32_chunk * self._tp_size  # = fp32_full
+
+        self._recv_bufs = []        # per-GPU FP16 recv buffer (one chunk)
+        self._fp32_acc_bufs = []    # per-GPU FP32 accumulator (one chunk, for reduce-scatter)
+        self._fp32_result_bufs = [] # per-GPU FP32 assembled result (full hidden)
+        self._fp16_send_bufs = []   # per-GPU FP16 send staging for all-gather
+
+        for dev_id in self._device_ids:
+            hip.set_device(dev_id)
+            self._recv_bufs.append(hip.malloc(fp16_chunk))
+            self._fp32_acc_bufs.append(hip.malloc(fp32_chunk))
+            self._fp32_result_bufs.append(hip.malloc(fp32_full))
+            self._fp16_send_bufs.append(hip.malloc(fp16_chunk))
+
+        # Dedicated allreduce streams (non-blocking) for async allreduce overlap.
+        self._allreduce_streams = []
+        for dev_id in self._device_ids:
+            hip.set_device(dev_id)
+            self._allreduce_streams.append(hip.stream_create_nonblocking())
+
+        # Compute completion events: recorded after GEMV, waited on by allreduce stream
+        self._compute_events = []
+        for dev_id in self._device_ids:
+            hip.set_device(dev_id)
+            self._compute_events.append(hip.event_create())
+
+        # Allreduce completion events: recorded after allreduce finishes
+        self._ar_done_events = []
+        for dev_id in self._device_ids:
+            hip.set_device(dev_id)
+            self._ar_done_events.append(hip.event_create())
+
+        # Enable P2P access between all GPU pairs
+        self._enable_p2p()
+
+    def _enable_p2p(self):
+        """Enable P2P access between all GPU pairs."""
+        hip = self._hip
+        for i, dev_i in enumerate(self._device_ids):
+            hip.set_device(dev_i)
+            for j, dev_j in enumerate(self._device_ids):
+                if i == j:
+                    continue
+                if hip.device_can_access_peer(dev_i, dev_j):
+                    try:
+                        hip.device_enable_peer_access(dev_j)
+                    except HIPError:
+                        pass  # Already enabled
+
+    def _load_lib(self):
+        """Build and load the ring_allreduce.hip kernel as shared library."""
+        src_dir = Path(__file__).parent.parent / "kernels"
+        hip_path = src_dir / "ring_allreduce.hip"
+        build_dir = Path(__file__).parent.parent.parent / "build" / "kernels"
+        so_path = build_dir / "ring_allreduce.so"
+
+        if not hip_path.exists():
+            raise FileNotFoundError(f"Kernel not found: {hip_path}")
+
+        # Build if missing or stale
+        build_dir.mkdir(parents=True, exist_ok=True)
+        if not so_path.exists() or (
+                os.path.getmtime(hip_path) > os.path.getmtime(so_path)):
+            try:
+                subprocess.check_call([
+                    "/opt/rocm/bin/hipcc",
+                    "-O3", "--offload-arch=gfx906", "-std=c++17",
+                    "-shared", "-fPIC",
+                    "-o", str(so_path),
+                    str(hip_path),
+                ])
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                raise RuntimeError(f"Failed to build ring_allreduce.hip: {e}")
+
+        lib = ctypes.CDLL(str(so_path))
+
+        # Common signature: (void* dst, void* src, uint n, hipStream_t stream) → int
+        _sig = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p]
+
+        lib.ring_fp16_to_fp32_chunk.argtypes = _sig
+        lib.ring_fp16_to_fp32_chunk.restype = ctypes.c_int
+
+        lib.ring_fp32_accumulate_fp16.argtypes = _sig
+        lib.ring_fp32_accumulate_fp16.restype = ctypes.c_int
+
+        lib.ring_fp32_to_fp16_chunk.argtypes = _sig
+        lib.ring_fp32_to_fp16_chunk.restype = ctypes.c_int
+
+        lib.ring_fp32_copy.argtypes = _sig
+        lib.ring_fp32_copy.restype = ctypes.c_int
+
+        lib.ring_residual_add_fp32_to_fp16.argtypes = _sig
+        lib.ring_residual_add_fp32_to_fp16.restype = ctypes.c_int
+
+        lib.ring_fp32_to_fp16_result.argtypes = _sig
+        lib.ring_fp32_to_fp16_result.restype = ctypes.c_int
+
+        lib.ring_fp32_accumulate_fp32.argtypes = _sig
+        lib.ring_fp32_accumulate_fp32.restype = ctypes.c_int
+
+        self._lib = lib
+
+    def _fp16_chunk_offset(self, chunk_idx: int) -> int:
+        """Return FP16 byte offset for chunk_idx in the full FP16 buffer."""
+        return chunk_idx * self._chunk_bytes_fp16
+
+    def _fp32_chunk_offset(self, chunk_idx: int) -> int:
+        """Return FP32 byte offset for chunk_idx in the full FP32 buffer."""
+        return chunk_idx * self._chunk_bytes_fp32
+
+    def _fp16_chunk_ptr(self, base_ptr: int, chunk_idx: int) -> int:
+        """Return pointer to FP16 chunk_idx within a full FP16 buffer."""
+        return base_ptr + self._fp16_chunk_offset(chunk_idx)
+
+    def _fp32_chunk_ptr(self, base_ptr: int, chunk_idx: int) -> int:
+        """Return pointer to FP32 chunk_idx within a full FP32 buffer."""
+        return base_ptr + self._fp32_chunk_offset(chunk_idx)
+
+    def _run_ring_allreduce(self, partial_ptrs: list, allreduce_streams: list,
+                            use_residual_add: bool, hidden_ptrs: list = None,
+                            num_elems: int = None):
+        """Core ring allreduce with FP32 scratch for correctness.
+
+        Algorithm overview:
+        1. Init: GPU[i] converts its chunk[(i-r_start)%TP from FP16 partial_ptrs
+                 into FP32 scratch buffer (fp32_acc_bufs[i])
+        2. Reduce-scatter (TP-1 rounds):
+           Round r: GPU[i] converts FP32 acc → FP16 send_buf, P2P to right neighbor,
+                    right neighbor accumulates FP16 recv into its FP32 acc (for recv_idx)
+           After TP-1 rounds: GPU[i] has fully-reduced FP32 acc for chunk[(i+1)%TP]
+        3. All-gather (TP-1 rounds):
+           GPU[i] converts FP32 acc → FP16 send, P2P to right neighbor,
+           receiver converts FP16 back to FP32 in its result buffer slot
+           After TP-1 rounds: each GPU has full FP32 result
+        4. Apply: residual_add (FP32+FP16→FP16) or convert result to FP16 partial
+
+        Key design: FP32 accumulators eliminate multi-round FP16 rounding error.
+        P2P transfers use FP16 (halves bandwidth vs FP32 intermediate).
+
+        Args:
+            partial_ptrs: per-GPU FP16 partial result buffers (read-only for init)
+            allreduce_streams: per-GPU streams to use for all operations
+            use_residual_add: if True, add result to hidden_ptrs at end
+            hidden_ptrs: per-GPU FP16 hidden buffers (for residual add)
+            num_elems: number of FP16 elements (defaults to hidden_size)
+        """
+        tp = self._tp_size
+        hip = self._hip
+        lib = self._lib
+        n = num_elems if num_elems is not None else self._hidden_size
+        chunk_n = self._chunk_size
+
+        # =================================================================
+        # Init: Convert full partial_ptrs[i] from FP16 → FP32 into fp32_result_bufs
+        # =================================================================
+        # Using a full FP32 accumulator buffer (hidden_size × FP32) per GPU avoids
+        # multi-round FP16 rounding. Reduce-scatter accumulates in FP32; only P2P
+        # transfers use FP16 (halves bandwidth vs pure FP32).
+
+        # Re-init: Convert FULL partial_ptrs[i] from FP16 to FP32 into fp32_result_bufs
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            stream_ptr = ctypes.c_void_p(allreduce_streams[i])
+            # Convert chunk by chunk to avoid a separate conversion kernel for full buffer
+            for c in range(tp):
+                src_fp16 = self._fp16_chunk_ptr(partial_ptrs[i], c)
+                dst_fp32 = self._fp32_chunk_ptr(self._fp32_result_bufs[i], c)
+                err = lib.ring_fp16_to_fp32_chunk(
+                    ctypes.c_void_p(dst_fp32),
+                    ctypes.c_void_p(src_fp16),
+                    ctypes.c_uint(chunk_n),
+                    stream_ptr)
+                if err != 0:
+                    raise HIPError(f"ring_fp16_to_fp32_chunk full init GPU {i}: err {err}")
+
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            hip.stream_synchronize(allreduce_streams[i])
+
+        # Reduce-scatter rounds (TP-1 rounds) - using FP32 P2P transfers
+        # In round r: GPU[i] sends chunk[(i-r+TP)%TP] from fp32_result_bufs[i] (FP32)
+        #             to right GPU's fp32_acc_bufs (temporary recv buffer)
+        #             GPU[(i+1)%TP] accumulates received FP32 into fp32_result_bufs[recv_chunk]
+        # All transfers are FP32, no rounding during reduce-scatter.
+        for r in range(tp - 1):
+            # P2P copy FP32 chunk from fp32_result_bufs[i] → right GPU's fp32_acc_bufs
+            # fp32_acc_bufs is used as temporary FP32 recv buffer (chunk_n × 4 bytes)
+            for i in range(tp):
+                right = (i + 1) % tp
+                send_chunk_idx = (i - r + tp) % tp
+                src_fp32 = self._fp32_chunk_ptr(self._fp32_result_bufs[i], send_chunk_idx)
+                hip.set_device(self._device_ids[right])
+                hip.memcpy_peer_async(
+                    self._fp32_acc_bufs[right], self._device_ids[right],
+                    src_fp32, self._device_ids[i],
+                    self._chunk_bytes_fp32, allreduce_streams[right])
+
+            # Sync P2P
+            for i in range(tp):
+                hip.set_device(self._device_ids[i])
+                hip.stream_synchronize(allreduce_streams[i])
+
+            # Accumulate received FP32 into fp32_result_buf for the recv_chunk_idx
+            # GPU[i] receives chunk[(i-r-1+TP)%TP] (what left neighbor sent)
+            for i in range(tp):
+                hip.set_device(self._device_ids[i])
+                stream_ptr = ctypes.c_void_p(allreduce_streams[i])
+                recv_chunk_idx = (i - r - 1 + tp) % tp
+                dst_fp32 = self._fp32_chunk_ptr(self._fp32_result_bufs[i], recv_chunk_idx)
+                err = lib.ring_fp32_accumulate_fp32(
+                    ctypes.c_void_p(dst_fp32),
+                    ctypes.c_void_p(self._fp32_acc_bufs[i]),
+                    ctypes.c_uint(chunk_n),
+                    stream_ptr)
+                if err != 0:
+                    raise HIPError(f"ring_fp32_accumulate_fp32 GPU {i}: err {err}")
+
+            # Sync accumulate kernels
+            for i in range(tp):
+                hip.set_device(self._device_ids[i])
+                hip.stream_synchronize(allreduce_streams[i])
+
+        # After reduce-scatter: GPU[i] has fully-reduced FP32 chunk at (i+1)%TP
+        # in fp32_result_bufs[i] at FP32 offset (i+1)*chunk_n*4
+
+        # =================================================================
+        # All-Gather Phase (TP-1 rounds) - using FP32 P2P transfers
+        # =================================================================
+        # Transfer FP32 directly to avoid FP32→FP16→FP32 rounding.
+        # P2P copies transfer 4 bytes/element vs 2 bytes for FP16.
+        # For 10KB FP16 payload → 20KB FP32, still small enough for latency-bound.
+        #
+        # GPU[i] starts with fp32_result_bufs[i][chunk_(i+1)%TP] fully reduced.
+        # Round r: GPU[i] sends chunk[(i+1-r+TP)%TP] (FP32) to GPU[(i+1)%TP]
+        #          directly into fp32_result_bufs[right][(i+1-r+TP)%TP]
+        # After TP-1 rounds: all GPUs have all chunks in fp32_result_bufs.
+
+        for r in range(tp - 1):
+            # P2P copy FP32 chunk from GPU[i] directly into right GPU's fp32_result_buf
+            for i in range(tp):
+                right = (i + 1) % tp
+                send_chunk_idx = (i + 1 - r + tp) % tp
+                src_fp32 = self._fp32_chunk_ptr(self._fp32_result_bufs[i], send_chunk_idx)
+                dst_fp32 = self._fp32_chunk_ptr(self._fp32_result_bufs[right], send_chunk_idx)
+                hip.set_device(self._device_ids[right])
+                hip.memcpy_peer_async(
+                    dst_fp32, self._device_ids[right],
+                    src_fp32, self._device_ids[i],
+                    self._chunk_bytes_fp32, allreduce_streams[right])
+
+            # Sync P2P
+            for i in range(tp):
+                hip.set_device(self._device_ids[i])
+                hip.stream_synchronize(allreduce_streams[i])
+
+        # =================================================================
+        # Final: Apply result
+        # =================================================================
+        if use_residual_add and hidden_ptrs is not None:
+            # hidden[i] += fp32_result_bufs[i] (FP32 sum added to FP16 hidden)
+            for i in range(tp):
+                hip.set_device(self._device_ids[i])
+                stream_ptr = ctypes.c_void_p(allreduce_streams[i])
+                err = lib.ring_residual_add_fp32_to_fp16(
+                    ctypes.c_void_p(hidden_ptrs[i]),
+                    ctypes.c_void_p(self._fp32_result_bufs[i]),
+                    ctypes.c_uint(n),
+                    stream_ptr)
+                if err != 0:
+                    raise HIPError(f"ring_residual_add_fp32_to_fp16 GPU {i}: err {err}")
+            for i in range(tp):
+                hip.set_device(self._device_ids[i])
+                hip.stream_synchronize(allreduce_streams[i])
+        else:
+            # Convert FP32 result → FP16 and write to partial_ptrs
+            for i in range(tp):
+                hip.set_device(self._device_ids[i])
+                stream_ptr = ctypes.c_void_p(allreduce_streams[i])
+                err = lib.ring_fp32_to_fp16_result(
+                    ctypes.c_void_p(partial_ptrs[i]),
+                    ctypes.c_void_p(self._fp32_result_bufs[i]),
+                    ctypes.c_uint(n),
+                    stream_ptr)
+                if err != 0:
+                    raise HIPError(f"ring_fp32_to_fp16_result GPU {i}: err {err}")
+            for i in range(tp):
+                hip.set_device(self._device_ids[i])
+                hip.stream_synchronize(allreduce_streams[i])
+
+    def allreduce_residual(self, partial_ptrs: list, hidden_ptrs: list,
+                           num_elems: int):
+        """Ring allreduce + residual add (synchronous).
+
+        Computes: hidden[i] = hidden[i] + sum(partial[0..TP-1])
+        on all GPUs, using ring topology for balanced bandwidth.
+
+        Args:
+            partial_ptrs: per-GPU GEMV partial result pointers
+            hidden_ptrs:  per-GPU hidden state pointers (read-modify-write)
+            num_elems:    number of FP16 elements
+        """
+        tp = self._tp_size
+        if tp == 1:
+            return
+
+        hip = self._hip
+
+        # Sync all GPUs to ensure compute kernels have completed
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            hip.synchronize()
+
+        self._run_ring_allreduce(
+            partial_ptrs,
+            self._allreduce_streams,
+            use_residual_add=True,
+            hidden_ptrs=hidden_ptrs,
+            num_elems=num_elems)
+
+    def allreduce_sum(self, partial_ptrs: list, num_elems: int):
+        """Ring allreduce sum only (no residual add).
+
+        Computes: partial[i] = sum(partial[0..TP-1]) for all i.
+
+        Args:
+            partial_ptrs: per-GPU partial result pointers (read-write)
+            num_elems:    number of FP16 elements
+        """
+        tp = self._tp_size
+        if tp == 1:
+            return
+
+        hip = self._hip
+
+        # Sync all GPUs
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            hip.synchronize()
+
+        self._run_ring_allreduce(
+            partial_ptrs,
+            self._allreduce_streams,
+            use_residual_add=False,
+            num_elems=num_elems)
+
+    def allreduce_residual_async(self, partial_ptrs: list, hidden_ptrs: list,
+                                  num_elems: int, compute_streams: list):
+        """Ring allreduce + residual add, submitted asynchronously.
+
+        Records compute events → allreduce streams wait on events →
+        runs ring allreduce → records completion events.
+        Python returns immediately after GPU work is submitted.
+
+        Next-layer must call wait_for_allreduce_on_compute_stream() before
+        reading d_hidden.
+
+        Args:
+            partial_ptrs:    per-GPU GEMV partial result pointers
+            hidden_ptrs:     per-GPU hidden state pointers
+            num_elems:       number of FP16 elements
+            compute_streams: per-GPU compute stream handles
+        """
+        tp = self._tp_size
+        if tp == 1:
+            return
+
+        hip = self._hip
+
+        # Step 1: Record compute completion events on each GPU's compute stream
+        for i, dev_id in enumerate(self._device_ids):
+            hip.set_device(dev_id)
+            hip.event_record(self._compute_events[i], compute_streams[i])
+
+        # Step 2: Each GPU's allreduce stream must wait for ALL compute events.
+        # In the ring, GPU[i] eventually reads from GPU[i-1]'s partial buffer,
+        # so we need all GEMVs to complete before starting the ring.
+        # (Same requirement as FusedP2PReduce where each GPU reads all peer partials.)
+        for i, dev_id in enumerate(self._device_ids):
+            hip.set_device(dev_id)
+            ar_stream = self._allreduce_streams[i]
+            for j in range(tp):
+                hip.stream_wait_event(ar_stream, self._compute_events[j])
+
+        # Step 3: Run ring allreduce synchronously on allreduce streams
+        # (uses internal stream_synchronize to coordinate rounds across GPUs)
+        # The compute streams are NOT blocked — only the allreduce streams sync.
+        # The "async" aspect: compute events gate the start (GPU-side, no CPU wait),
+        # and ar_done_events signal completion to the compute stream.
+        self._run_ring_allreduce(
+            partial_ptrs,
+            self._allreduce_streams,
+            use_residual_add=True,
+            hidden_ptrs=hidden_ptrs,
+            num_elems=num_elems)
+
+        # Step 4: Record allreduce completion events on each GPU's allreduce stream
+        for i, dev_id in enumerate(self._device_ids):
+            hip.set_device(dev_id)
+            hip.event_record(self._ar_done_events[i], self._allreduce_streams[i])
+
+    def wait_for_allreduce_on_compute_stream(self, compute_streams: list):
+        """Make each GPU's compute stream wait for allreduce completion (GPU-side).
+
+        Same interface as P2PAllreduce.wait_for_allreduce_on_compute_stream.
+        """
+        hip = self._hip
+        for i, dev_id in enumerate(self._device_ids):
+            hip.set_device(dev_id)
+            hip.stream_wait_event(compute_streams[i], self._ar_done_events[i])
+
+    def cleanup(self):
+        """Free temporary buffers and destroy streams/events."""
+        hip = self._hip
+
+        # Free recv/fp32_acc/fp32_result/fp16_send buffers
+        for i, dev_id in enumerate(self._device_ids):
+            hip.set_device(dev_id)
+            for buf_list in [self._recv_bufs, self._fp32_acc_bufs,
+                              self._fp32_result_bufs, self._fp16_send_bufs]:
+                if i < len(buf_list) and buf_list[i]:
+                    try:
+                        hip.free(buf_list[i])
+                    except HIPError:
+                        pass
+        self._recv_bufs.clear()
+        self._fp32_acc_bufs.clear()
+        self._fp32_result_bufs.clear()
+        self._fp16_send_bufs.clear()
+
+        # Destroy dedicated allreduce streams
+        for i, dev_id in enumerate(self._device_ids):
+            try:
+                hip.set_device(dev_id)
+                if i < len(self._allreduce_streams):
+                    hip.stream_destroy(self._allreduce_streams[i])
+            except HIPError:
+                pass
+        self._allreduce_streams.clear()
+
+        # Destroy compute events
+        for i, dev_id in enumerate(self._device_ids):
+            try:
+                hip.set_device(dev_id)
+                if i < len(self._compute_events):
+                    hip.event_destroy(self._compute_events[i])
+            except HIPError:
+                pass
+        self._compute_events.clear()
+
+        # Destroy allreduce done events
+        for i, dev_id in enumerate(self._device_ids):
+            try:
+                hip.set_device(dev_id)
+                if i < len(self._ar_done_events):
+                    hip.event_destroy(self._ar_done_events[i])
+            except HIPError:
+                pass
+        self._ar_done_events.clear()
+
+        self._lib = None
 class PinnedAsyncAllreduce:
     """Pinned-memory async allreduce for TP inference.
 
