@@ -1,0 +1,39 @@
+{
+  "featureId": "allreduce-overlap-deepening",
+  "reviewedAt": "2026-03-15T17:32:04Z",
+  "commitId": "f9866f4",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "Well-executed investigation and implementation. The feature correctly analyzes the C dispatch loop overlap mechanics, documents that hipStreamWaitEvent is already host-non-blocking (so current overlap is maximal without HIP graphs), and delivers the concrete optimization via c_dispatch_v2.c which batches hipSetDevice calls to save ~384 calls/token. The implementation is binary-compatible with c_dispatch.c (same struct layout, new entry point). The test suite provides analytical documentation plus correctness and regression verification. All 5 tests pass.",
+    "issues": [
+      {
+        "file": "src/runtime/c_dispatch_v2.c",
+        "line": null,
+        "severity": "non_blocking",
+        "description": "c_dispatch_v2.c is 545 lines and contains mostly duplicated code from c_dispatch.c with minor loop order changes. The comment 'This file is identical to c_dispatch.c except for the optimizations above' is accurate but the duplication creates a maintenance burden: if c_dispatch.c is updated for future features, c_dispatch_v2.c must be kept in sync manually. Consider using #include or a shared header for the common struct/type definitions to reduce duplication. This follows the project convention of creating versioned variants but the maintenance concern is real."
+      },
+      {
+        "file": "tests/test_allreduce_overlap.py",
+        "line": null,
+        "severity": "non_blocking",
+        "description": "The test file is 686 lines and includes detailed analytical documentation of overlap mechanics as test output. This approach (embedding architectural analysis in test output) is correct for VAL-OVERLAP-001 ('A microbenchmark or profiling trace shows that compute kernels are dispatched while allreduce is in-flight') but makes the test harder to parse for CI/CD purposes. The PASS/FAIL output is clear however."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "knowledge",
+      "observation": "Key finding: hipStreamWaitEvent is already host-non-blocking on gfx906/ROCm 7.1. This means the current C dispatch already achieves the maximum achievable compute-communication overlap without HIP graphs. This is critical architectural knowledge that directly shapes the Sprint 3 M2 strategy (HIP graphs are the right next step, not further allreduce restructuring). This should be documented in the architecture library.",
+      "evidence": "Handoff: 'Key finding: hipStreamWaitEvent is host-non-blocking; current C dispatch already achieves maximum achievable overlap without HIP graphs'. Test 1 (overlap analysis) explicitly documents this."
+    },
+    {
+      "area": "knowledge",
+      "observation": "The total hipSetDevice call count per token is ~2432 (baseline) / ~2048 (v2), each costing ~3µs = ~7.3ms/~6.1ms overhead. This is a meaningful fraction of the 26ms/token budget but still dominated by allreduce (~15ms). The overhead breakdown (hipSetDevice: ~6-7ms, events: ~3ms, kernel launches: ~3ms, allreduce: ~15ms) should be documented in the architecture library for future optimization targeting.",
+      "evidence": "c_dispatch_v2.c header: 'Baseline: ~2432 hipSetDevice calls/token at ~3µs each ≈ 7.3ms overhead. Optimized: ~2048 calls/token ≈ 6.1ms overhead'"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "Feature passes review. The feature correctly investigates allreduce overlap mechanics, demonstrates that current C dispatch is already optimally overlapped (hipStreamWaitEvent is host-non-blocking), and delivers c_dispatch_v2.c reducing hipSetDevice overhead by ~384 calls/token. All 5 tests pass with correctness (cosine sim 0.999940/0.999994 >= 0.99) and single-GPU regression within bounds. The code duplication in c_dispatch_v2.c is a non-blocking maintenance concern. No blocking issues found."
+}

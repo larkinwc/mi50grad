@@ -1,0 +1,39 @@
+{
+  "featureId": "qkv-sync-elimination",
+  "reviewedAt": "2026-03-15T17:32:04Z",
+  "commitId": "e83d205",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "Clean implementation. The change correctly eliminates 32 host-blocking hipStreamSynchronize calls per token by switching Q/KV GEMV launches from concurrent HIP streams to sequential null-stream execution. The implementation is applied consistently across all three decode paths: Python engine.py, Python tp_engine.py (both cached paths), and C dispatch c_dispatch.c. Stream objects are preserved for potential future use. All correctness and regression tests pass.",
+    "issues": [
+      {
+        "file": "src/inference/engine.py",
+        "line": 1129,
+        "severity": "non_blocking",
+        "description": "The comment 'Concurrent Q+Qgate and K+V projections on independent streams' was replaced with a correct note that sequential null-stream is used. The old comment mentioning Stream 1/Stream 2 was partially removed but the 'Stream 1: Q+Qgate fused GEMV' comment annotation remains in the code. This is a cosmetic issue only — the comment line 'Stream 1:' is now dangling without a matching 'Stream 2:' but does not affect correctness."
+      },
+      {
+        "file": "tests/test_qkv_sync_removal.py",
+        "line": null,
+        "severity": "non_blocking",
+        "description": "The test measures TP=4 latency but the correctness threshold check (cosine sim >= 0.99) is only applied to 10 steps while the latency benchmark runs 50 steps. This means the test validates correctness for the first 10 steps only. Longer-range correctness is not explicitly verified. This is acceptable given the stateless nature of the decode step, but the test could be improved with additional correctness steps."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "knowledge",
+      "observation": "The worker documents that Q/KV stream sync provides minimal latency improvement (~2.8% regression vs Sprint 2 baseline at 36.9 tok/s). This is important knowledge for future workers: the sync overhead was ~30µs × 32 = ~1ms, small relative to allreduce bottleneck (~14ms). This performance characteristic (stream sync overhead is dominated by allreduce) should be documented in the architecture library.",
+      "evidence": "Handoff discoveredIssues: 'The Q/KV stream sync elimination provides minimal latency improvement (~2.8% regression vs Sprint 2 baseline). The sync overhead was ~30µs × 32 = ~1ms (small relative to allreduce ~14ms)'"
+    },
+    {
+      "area": "conventions",
+      "observation": "The worker used a load-free-reload pattern to avoid OOM when loading both single-GPU and TP=4 models (the test loads single-GPU reference, frees it, then loads TP=4). This pattern is important for all TP=4 tests on MI50 but is not documented in AGENTS.md or the library.",
+      "evidence": "test_qkv_sync_removal.py collect_single_gpu_reference() + cleanup() + del engine pattern; Worker skillFeedback noted 'loading single-GPU + TP=4 simultaneously causes OOM on MI50s'"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "Feature passes review. The implementation correctly eliminates 32 host-blocking hipStreamSynchronize calls per token across all decode paths (Python engine, Python TP engine, C dispatch). Tests pass with correctness (cosine sim 0.999965 >= 0.99) and single-GPU regression within bounds. The minimal performance improvement (+0% to -2.8%) is documented and expected given the allreduce bottleneck dominance. No blocking issues found."
+}

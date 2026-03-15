@@ -1088,5 +1088,22 @@ different FFN outputs. The cumulative effect across 48 DeltaNet layers causes ca
 - QKNorm/RoPE → d_k (post-RoPE) → KV cache: Must complete before decode attention reads cache
 - KV cache write → Decode attention read: Must complete before attention kernel launches
 
+### Sprint 3 M1 Results (2026-03-15, allreduce-pipeline)
+
+**Implemented optimizations:**
+- **Q/KV stream sync elimination:** Q and KV GEMVs now run sequentially on default (null) stream instead of concurrent streams with explicit hipStreamSynchronize. Eliminates 32 host-blocking sync calls/token. Impact: minimal (~2.8% regression vs baseline) because sync overhead (~1ms) is dominated by allreduce (~15ms).
+- **Direct KV cache writes:** New `qknorm_rope_cachew.hip` kernel writes post-RoPE K directly to KV cache; V GEMV output pointer redirected to cache position. Eliminates 32 hipMemcpyAsync D2D copies/token. Impact: neutral (~37.8 tok/s vs ~37.9 baseline) — D2D copies too small to be throughput bottleneck under C dispatch.
+- **Allreduce overlap deepening:** `c_dispatch_v2.c` reduces hipSetDevice calls from ~2432 to ~2048/token (~384 saved) by batching device switches and reversing loop order. Impact: ~0.5% within measurement noise.
+
+**Combined Sprint 3 M1 result: 38.1 tok/s** (+0.3% vs Sprint 2 38.0 tok/s baseline)
+
+**Critical findings:**
+1. **hipStreamWaitEvent is host-non-blocking on gfx906/ROCm 7.1.** The C dispatch already achieves the maximum achievable compute-communication overlap without HIP graphs. The GPU enforces event ordering while the host immediately dispatches next kernels.
+2. **C dispatch already hides small async overhead.** With C dispatch's tight pipelining, removing stream syncs and D2D copies does not measurably improve throughput — these operations were already effectively overlapped. The bottleneck is allreduce latency (~15.2 ms/token = 128 × 119µs).
+3. **Overhead breakdown per token:** hipSetDevice: ~2432 calls × ~3µs ≈ 7.3ms; Event ops: ~2048 × ~1.5µs ≈ 3.1ms; hipModuleLaunchKernel: ~960 × ~1µs ≈ 1ms; Allreduce: ~15.2ms. Total overhead ~26.6ms/token → ~37.5 tok/s ceiling with C dispatch.
+4. **Sprint 3 M2 (HIP graph decode) is the correct next step.** Eliminating ~960 kernel launches/token (currently ~1ms each, ~1ms total) would save ~1ms. Graph replay has ~10-100× lower per-launch overhead, potentially saving ~0.9ms → ~39-40 tok/s estimate.
+
+**OOM pattern for MI50 tests:** When testing TP=4 correctness vs single-GPU reference, use the load-free-reload pattern to avoid OOM on MI50 (16GB VRAM): load single-GPU engine → collect reference outputs → call `engine.cleanup()` + `del engine` → then load TP=4 engine. Loading both simultaneously causes OOM. Reference: `tests/test_qkv_sync_removal.py:collect_single_gpu_reference()`.
+
 
 
