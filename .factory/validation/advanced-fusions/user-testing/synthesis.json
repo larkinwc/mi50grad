@@ -1,0 +1,82 @@
+{
+  "milestone": "advanced-fusions",
+  "round": 1,
+  "status": "pass",
+  "assertionsSummary": {
+    "total": 5,
+    "passed": 5,
+    "failed": 0,
+    "blocked": 0
+  },
+  "passedAssertions": [
+    "VAL-ADV-001",
+    "VAL-FINAL-001",
+    "VAL-FINAL-002",
+    "VAL-FINAL-003",
+    "VAL-FINAL-004"
+  ],
+  "failedAssertions": [],
+  "blockedAssertions": [],
+  "appliedUpdates": [
+    {
+      "target": "user-testing.md",
+      "description": "Added 'Flow Validator Guidance: CLI' section with SSH/Docker test patterns, evidence capture instructions, and test file mapping for advanced-fusions assertions",
+      "source": "setup"
+    }
+  ],
+  "previousRound": null,
+  "testDetails": {
+    "VAL-ADV-001": {
+      "testFile": "tests/test_fused_p2p_gemv.py",
+      "exitCode": 0,
+      "keyMetrics": {
+        "rawAllreduceSpeedup": "1.68x (61.1 us vs 102.5 us)",
+        "minCosineSim": 0.999977,
+        "fusedVsSerial": "14.39 tok/s vs 13.24 tok/s (+1.09x)",
+        "fusedCombinedVsCombined": "32.73 vs 33.40 tok/s (0.980x, within 5%)"
+      }
+    },
+    "VAL-FINAL-001": {
+      "testFile": "tests/bench_tp4_final.py",
+      "exitCode": 0,
+      "keyMetrics": {
+        "tp4Throughput": "27.3 tok/s",
+        "singleGpuThroughput": "20.6 tok/s",
+        "speedupVsSingleGpu": "1.35x"
+      }
+    },
+    "VAL-FINAL-002": {
+      "testFile": "tests/bench_tp4_final.py",
+      "exitCode": 0,
+      "keyMetrics": {
+        "tp4Throughput": "27.3 tok/s",
+        "vllmBaseline": "46.9 tok/s",
+        "ratioVsVllm": "0.58x",
+        "reportGenerated": "bench/tp4_optimization_report.md"
+      }
+    },
+    "VAL-FINAL-003": {
+      "testFile": "tests/bench_tp4_final.py",
+      "exitCode": 0,
+      "keyMetrics": {
+        "singleGpuThroughput": "20.6 tok/s",
+        "baseline": "20.3 tok/s",
+        "deviation": "1.3%",
+        "threshold": "10%"
+      }
+    },
+    "VAL-FINAL-004": {
+      "testFile": "tests/bench_tp4_final.py",
+      "exitCode": 0,
+      "keyMetrics": {
+        "reportPath": "bench/tp4_optimization_report.md",
+        "reportGenerated": true,
+        "sections": ["executive summary", "throughput comparison table", "per-optimization breakdown", "gap analysis", "correctness validation"]
+      }
+    }
+  },
+  "frictions": [
+    "user-testing-flow-validator subagent unavailable (custom:CCS-sonnet model not found); validation ran directly",
+    "Long test runtime: ~25 minutes per test run due to 48GB model weight loading across 4 GPUs"
+  ]
+}

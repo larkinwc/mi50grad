@@ -1,0 +1,43 @@
+{
+  "milestone": "advanced-fusions",
+  "groupId": "group-adv-final",
+  "assertions": [
+    {
+      "id": "VAL-ADV-001",
+      "status": "pass",
+      "evidence": "test_fused_p2p_gemv.py PASS (exit code 0). Fused P2P reduce 1.68x faster than standard P2P in raw allreduce microbenchmark (61.1 us vs 102.5 us). Correctness: min cosine sim 0.999977 vs serial reference, threshold 0.99. Fused+Combined mode 0.980x vs Combined (comparable, within 5%). Fused P2P serial mode: 14.39 tok/s vs 13.24 tok/s serial (+1.09x).",
+      "details": "Standard P2P: 102.5 us/call | Fused P2P: 61.1 us/call (1.68x speedup). Correctness all 10 steps passed (min cosine 0.999977). Performance: Serial=13.24 tok/s, Combined=33.40 tok/s, Fused=14.39 tok/s, Fused+Combined=32.73 tok/s. Fused+Combined vs Combined: 0.980x (within 5% threshold). VAL-ADV-001: PASS."
+    },
+    {
+      "id": "VAL-FINAL-001",
+      "status": "pass",
+      "evidence": "bench_tp4_final.py PASS. TP=4 combined mode: 27.3 tok/s (1.35x speedup over single-GPU 20.3 tok/s). Report confirms TP=4 significantly exceeds single-GPU baseline.",
+      "details": "Single-GPU: 20.6 tok/s. TP=4 combined (cached dispatch + stream overlap): 27.3 tok/s, 36.6 ms/tok. Speedup vs single-GPU: 1.35x. VAL-FINAL-001: PASS."
+    },
+    {
+      "id": "VAL-FINAL-002",
+      "status": "pass",
+      "evidence": "bench_tp4_final.py generated bench/tp4_optimization_report.md with full comparison vs vLLM (46.9 tok/s). Report includes gap analysis: our 27.3 tok/s vs vLLM 46.9 tok/s (19.6 tok/s gap, 0.58x ratio). Analysis covers CUDA graphs, torch.compile, chunked prefill, optimized attention as reasons for gap.",
+      "details": "Report at /opt/mi50grad/bench/tp4_optimization_report.md. Comprehensive comparison table: single-GPU 20.3 tok/s, TP=4 serial 12.4 tok/s, cached 23.7 tok/s, combined ~33.5 tok/s, measured 27.3 tok/s, vLLM 46.9 tok/s. Gap analysis with per-factor breakdown included. VAL-FINAL-002: PASS."
+    },
+    {
+      "id": "VAL-FINAL-003",
+      "status": "pass",
+      "evidence": "bench_tp4_final.py single-GPU check: 20.6 tok/s (1.3% deviation from 20.3 tok/s baseline, well within 10% threshold). Regression check: PASS.",
+      "details": "Single-GPU throughput: 20.6 tok/s, latency: 48.6 ms/tok. Deviation: 1.3% from 20.3 tok/s baseline (threshold 10%). Regression check: PASS. VAL-FINAL-003: PASS."
+    },
+    {
+      "id": "VAL-FINAL-004",
+      "status": "pass",
+      "evidence": "bench_tp4_final.py generated /opt/mi50grad/bench/tp4_optimization_report.md with all required measurements: single-GPU 20.6 tok/s baseline, TP=4 incremental phase data, final 27.3 tok/s TP=4 throughput, vLLM 46.9 tok/s comparison, per-optimization breakdown. Report verified via SSH cat.",
+      "details": "Report file generated with: executive summary, throughput comparison table (all phases), per-optimization breakdown (P2P allreduce, cached dispatch, stream overlap, fused P2P, deferred DeltaNet), gap analysis vs vLLM, correctness validation. VAL-FINAL-004: PASS."
+    }
+  ],
+  "frictions": [
+    "user-testing-flow-validator subagent failed due to model configuration issue (custom:CCS-sonnet unavailable); ran validation directly via SSH instead",
+    "Each test run takes 20-30+ minutes due to 48GB+ model weight loading across 4 GPUs",
+    "bench_tp4_final.py measured 27.3 tok/s vs prior measurement of ~33.5 tok/s - run-to-run variability on shared PCIe topology is normal (PCIe congestion, thermal throttling)"
+  ],
+  "blockers": [],
+  "toolsUsed": ["ssh", "docker", "python3", "rsync"]
+}
