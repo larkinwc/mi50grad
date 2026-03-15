@@ -1,0 +1,60 @@
+{
+  "groupId": "p2p-group",
+  "milestone": "p2p-allreduce",
+  "assertions": ["VAL-P2P-001", "VAL-P2P-002", "VAL-P2P-003"],
+  "results": {
+    "VAL-P2P-001": {
+      "status": "pass",
+      "evidence": "Microbenchmark (200 iters, hidden=5120 FP16): TP=4 host-mediated=187.3 us/call, P2P GPU=122.2 us/call, speedup=1.53x (>= 1.5x target). TP=2: host=102.0 us, P2P=79.3 us, speedup=1.29x. All correctness checks also PASS (max_abs_err=0.0000e+00 for TP=2, TP=3, TP=4).",
+      "details": {
+        "tp2_old_median_us": 102.0,
+        "tp2_p2p_median_us": 79.3,
+        "tp2_speedup": 1.29,
+        "tp4_old_median_us": 187.3,
+        "tp4_p2p_median_us": 122.2,
+        "tp4_speedup": 1.53,
+        "correctness_max_abs_err_tp2": 0.0,
+        "correctness_max_abs_err_tp3": 0.0,
+        "correctness_max_abs_err_tp4": 0.0
+      }
+    },
+    "VAL-P2P-002": {
+      "status": "pass",
+      "evidence": "TP=4 decode (test_tp4_correctness.py) with full Qwen3.5-27B-GPTQ-Int4 model loaded on 4 GPUs. All 10 decode steps passed with cosine similarity >= 0.999977 (threshold=0.99). RESULT: PASS — All 10 steps have cosine sim >= 0.99.",
+      "details": {
+        "num_steps": 10,
+        "threshold": 0.99,
+        "min_cosine_sim": 0.999977,
+        "max_cosine_sim": 0.999994,
+        "all_pass": true,
+        "model": "Qwen3.5-27B-GPTQ-Int4",
+        "device_ids": [0, 1, 2, 3]
+      }
+    },
+    "VAL-P2P-003": {
+      "status": "pass",
+      "evidence": "100-step TP=4 decode benchmark (bench_tp4.py) completed successfully with all 4 GPUs. Throughput: 12.4 tok/s, Latency: 80.5 ms/tok. Allreduce overhead: 23.47 ms/tok (29.2% of total). Model weights loaded on all 4 GPUs (Qwen3.5-27B-GPTQ-Int4).",
+      "details": {
+        "tok_per_sec": 12.4,
+        "ms_per_tok": 80.5,
+        "bench_steps": 100,
+        "warmup_steps": 3,
+        "allreduce_ms_per_tok": 23.47,
+        "allreduce_pct": 29.2,
+        "compute_ms_per_tok": 57.01,
+        "total_elapsed_s": 8.05,
+        "baselines": {
+          "single_gpu_tok_s": 20.3,
+          "vllm_tp4_tok_s": 46.9
+        }
+      }
+    }
+  },
+  "frictions": [
+    "Model weight loading takes ~92-137 seconds per test run (27B model on 4 GPUs)",
+    "TP=4 throughput (12.4 tok/s) is below single-GPU (20.3 tok/s) due to allreduce overhead (29.2% of total time). This is expected as a baseline for milestone 1 - further milestones will optimize."
+  ],
+  "blockers": [],
+  "toolsUsed": ["ssh", "docker", "python3"],
+  "overallStatus": "pass"
+}

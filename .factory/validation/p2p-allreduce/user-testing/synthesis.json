@@ -1,0 +1,17 @@
+{
+  "milestone": "p2p-allreduce",
+  "round": 1,
+  "status": "pass",
+  "assertionsSummary": {
+    "total": 3,
+    "passed": 3,
+    "failed": 0,
+    "blocked": 0
+  },
+  "passedAssertions": ["VAL-P2P-001", "VAL-P2P-002", "VAL-P2P-003"],
+  "failedAssertions": [],
+  "blockedAssertions": [],
+  "appliedUpdates": [],
+  "previousRound": null,
+  "notes": "VAL-P2P-001: TP=4 P2P allreduce 1.53x faster (122.2 us vs 187.3 us). VAL-P2P-002: All 10 decode steps cosine sim >= 0.999977 (threshold 0.99). VAL-P2P-003: 100-step benchmark completed at 12.4 tok/s / 80.5 ms/tok (allreduce=29.2% of time). Note: TP=4 throughput is below single-GPU (20.3 tok/s) baseline at this milestone due to allreduce overhead - this is expected as future milestones will optimize communication-compute overlap."
+}
