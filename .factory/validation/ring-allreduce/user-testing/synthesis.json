@@ -1,0 +1,37 @@
+{
+  "milestone": "ring-allreduce",
+  "round": 1,
+  "status": "fail",
+  "assertionsSummary": {
+    "total": 7,
+    "passed": 6,
+    "failed": 1,
+    "blocked": 0
+  },
+  "passedAssertions": [
+    "VAL-RING-001",
+    "VAL-RING-002",
+    "VAL-RING-003",
+    "VAL-RING-004",
+    "VAL-RING-005",
+    "VAL-RING-007"
+  ],
+  "failedAssertions": [
+    {
+      "id": "VAL-RING-006",
+      "reason": "INT8 partial quantization not implemented. No int8/INT8/quantiz code found in src/runtime/p2p_allreduce.py or src/kernels/ring_allreduce.hip. The validation contract notes this assertion is conditional ('if implemented') but the feature was listed as 'fulfills: [VAL-RING-006]' in features.json."
+    }
+  ],
+  "blockedAssertions": [],
+  "appliedUpdates": [],
+  "previousRound": null,
+  "notes": {
+    "VAL-RING-001": "hipcc build exit code 0, ring_allreduce.so = 43424 bytes",
+    "VAL-RING-002": "max_abs_err=0.0e+00 vs CPU reference across all 4 GPUs",
+    "VAL-RING-003": "Min cosine_sim=0.999982 across 10 decode steps with ring allreduce",
+    "VAL-RING-004": "Star=119.5us, Ring=1023.4us (8.56x faster for star); ring has 6 sequential P2P rounds vs star's 2",
+    "VAL-RING-005": "Star=27.0tok/s, Ring=7.8tok/s in TP=4 decode; ring correctness confirmed via cached+stream path (min cos=0.999990). Note: ring+C dispatch falls back to cached+stream due to missing p2p_reduce_residual_tp2 symbol.",
+    "VAL-RING-006": "Feature not implemented — ring-allreduce-kernel feature was marked as 'fulfills: [VAL-RING-006]' but INT8 quantization was not built",
+    "VAL-RING-007": "Star topology documented as default; ring available via set_ring_allreduce(True)"
+  }
+}
