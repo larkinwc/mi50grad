@@ -6,7 +6,59 @@ Architectural decisions, patterns discovered, and kernel design notes.
 
 ---
 
-## Combined Cached Dispatch + Stream Overlap (Milestone 3: combined-cached-stream)
+## Fused P2P GEMV Epilogue (Milestone 3: fused-p2p-gemv-epilogue, 2026-03-14)
+
+**Implementation:** `src/kernels/gemv_p2p_reduce.hip` + `FusedP2PReduce` class in `src/runtime/p2p_allreduce.py`
+
+**Design:** Option B — Separate fused reduce+residual kernel where each GPU reads all peer GPU partial
+results via P2P pointers (remote memory access within kernel), eliminates gather→reduce→broadcast pipeline.
+
+**How it works:**
+- Each GPU launches `fused_p2p_reduce_residual_tp4_kernel` that reads local partial + 3 remote partials via P2P pointers
+- All 4 GPUs run their kernels simultaneously (no sequential gather needed)
+- Each GPU writes its own updated hidden buffer → no broadcast needed
+- Eliminates intermediate gather buffers from GPU0
+
+**Key insight:** On PCIe (no XGMI), remote GPU memory reads from within a kernel use the BAR1 aperture
+mapping. This allows direct P2P reads without hipMemcpyPeerAsync, and for 10KB payloads the parallel
+execution of all 4 kernels simultaneously is faster than the sequential gather+broadcast pipeline.
+
+**Performance results (gfx906 MI50, TP=4, hidden_size=5120):**
+- Standard P2P allreduce: 101.7 us/call
+- Fused P2P reduce:       59.3 us/call  (**1.72x faster** in isolation)
+- Serial decode (standard P2P): 13.24 tok/s (75.50 ms/tok)
+- Serial decode (fused P2P):    14.40 tok/s (69.43 ms/tok) → 1.09x faster
+- Combined mode (standard P2P): 33.28 tok/s (30.05 ms/tok) 
+- Fused+Combined mode:          33.63 tok/s (29.73 ms/tok) → 1.01x (comparable)
+
+**Critical finding:** The fused kernel's async variant (allreduce_residual_async) performs WORSE
+in the combined cached+stream-overlap decode mode. The reason: all 4 GPUs' allreduce streams must
+wait on ALL 4 compute events (since each GPU reads from all other GPUs), creating more cross-GPU
+synchronization. Standard P2P allreduce (where only GPU0 manages gather+reduce+broadcast) overlaps
+better with compute dispatch.
+
+**Design decision:** `_decode_step_cached_stream()` always uses standard P2P allreduce.
+The fused P2P kernel is used in `_allreduce_residual()` (synchronous/serial path) when
+`set_fused_p2p_reduce(True)`. This gives 1.09x speedup in serial mode.
+
+**API:**
+```python
+engine.set_fused_p2p_reduce(True)   # Enable fused P2P (for serial path)
+engine.set_cached_dispatch(True)     # Enable cached dispatch
+engine.set_stream_overlap_dispatch(True)  # Enable stream overlap (uses standard P2P)
+# decode_step automatically picks the best combination
+```
+
+**Correctness:** Cosine similarity = 0.999984-0.999996 vs serial reference (all steps pass 0.99 threshold).
+Tests verify both FP16 GEMV (attention out_proj) and INT4 GEMV (FFN down_proj) paths.
+
+**HIP kernel pattern:** Same as p2p_allreduce.hip — uses `hipLaunchKernelGGL` in C wrappers,
+compiled as shared library. Each GPU sets its own device context before launching. P2P access must
+be enabled between all GPU pairs before kernel execution.
+
+---
+
+
 
 **Implemented:** `_decode_step_cached_stream()` in `src/inference/tp_engine.py` combines both milestone 2 optimizations into a single decode path.
 

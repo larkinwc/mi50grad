@@ -687,3 +687,369 @@ class PinnedAsyncAllreduce:
             except HIPError:
                 pass
         self._host_partials.clear()
+
+
+class FusedP2PReduce:
+    """Fused P2P allreduce for TP inference using gemv_p2p_reduce.hip.
+
+    Key difference from P2PAllreduce:
+    - Each GPU launches its OWN fused kernel that reads all other GPUs' partial
+      results directly via P2P pointers (remote memory access in GPU kernel).
+    - All GPUs compute the full sum simultaneously — no sequential gather+reduce+broadcast.
+    - Eliminates the separate gather and broadcast phases (no intermediate buffers needed).
+
+    For TP=4, hidden_size=5120 (10KB payload):
+      Old P2PAllreduce path per allreduce:
+        1. GPU0: 3x async P2P gathers (30KB transfers, sequential batching)
+        2. GPU0: sync gather stream
+        3. GPU0: reduce kernel (40KB reads + 10KB writes)
+        4. GPU0: sync
+        5. GPU0: 3x async P2P broadcasts (30KB transfers)
+        6. All GPUs: sync broadcast streams
+        Total: ~2 stream syncs + 6 P2P transfers + 1 kernel on 1 GPU
+
+      New FusedP2PReduce path per allreduce:
+        1. All 4 GPUs: sync (ensure GEMV is done on all GPUs)
+        2. All 4 GPUs simultaneously: fused kernel (reads local + 3 remote partials,
+           reads local hidden, writes updated hidden)
+        3. All 4 GPUs: sync kernels
+        Total: 1 sync + 4 simultaneous kernels (each reads 50KB, writes 10KB)
+
+    On PCIe (no XGMI), remote GPU memory reads within a kernel use BAR1 aperture
+    mapping. Latency per remote read may be higher than hipMemcpyPeerAsync for large
+    transfers, but for 10KB payloads the fixed latency dominates over bandwidth.
+
+    Usage:
+        fpr = FusedP2PReduce(hip, device_ids, hidden_size, streams)
+        fpr.allreduce_residual(partial_ptrs, hidden_ptrs, num_elems)
+        fpr.allreduce_residual_async(partial_ptrs, hidden_ptrs, num_elems, compute_streams)
+        fpr.cleanup()
+    """
+
+    def __init__(self, hip: HIPRuntime, device_ids: list, hidden_size: int,
+                 streams: Optional[list] = None):
+        """Initialize fused P2P reduce.
+
+        Args:
+            hip: HIPRuntime instance
+            device_ids: list of GPU device IDs
+            hidden_size: number of FP16 elements per allreduce
+            streams: optional per-GPU compute streams
+        """
+        self._hip = hip
+        self._device_ids = list(device_ids)
+        self._tp_size = len(device_ids)
+        self._hidden_size = hidden_size
+        self._streams = streams if streams else [0] * len(device_ids)
+
+        # Load kernel shared library
+        self._lib = None
+        self._load_lib()
+
+        # Dedicated allreduce streams (non-blocking) for async allreduce overlap
+        self._allreduce_streams = []
+        for dev_id in self._device_ids:
+            hip.set_device(dev_id)
+            self._allreduce_streams.append(hip.stream_create_nonblocking())
+
+        # Compute completion events: recorded after GEMV, waited on by allreduce stream
+        self._compute_events = []
+        for dev_id in self._device_ids:
+            hip.set_device(dev_id)
+            self._compute_events.append(hip.event_create())
+
+        # Allreduce completion events: recorded after fused kernel, waited on by compute
+        self._ar_done_events = []
+        for dev_id in self._device_ids:
+            hip.set_device(dev_id)
+            self._ar_done_events.append(hip.event_create())
+
+        # Enable P2P access between all pairs
+        self._enable_p2p()
+
+    def _enable_p2p(self):
+        """Enable P2P access between all GPU pairs."""
+        hip = self._hip
+        for i, dev_i in enumerate(self._device_ids):
+            hip.set_device(dev_i)
+            for j, dev_j in enumerate(self._device_ids):
+                if i == j:
+                    continue
+                if hip.device_can_access_peer(dev_i, dev_j):
+                    try:
+                        hip.device_enable_peer_access(dev_j)
+                    except HIPError:
+                        pass  # Already enabled
+
+    def _load_lib(self):
+        """Build and load the gemv_p2p_reduce.hip kernel as shared library."""
+        src_dir = Path(__file__).parent.parent / "kernels"
+        hip_path = src_dir / "gemv_p2p_reduce.hip"
+        build_dir = Path(__file__).parent.parent.parent / "build" / "kernels"
+        so_path = build_dir / "gemv_p2p_reduce.so"
+
+        if not hip_path.exists():
+            raise FileNotFoundError(f"Kernel not found: {hip_path}")
+
+        # Build if missing or stale
+        build_dir.mkdir(parents=True, exist_ok=True)
+        if not so_path.exists() or (
+                os.path.getmtime(hip_path) > os.path.getmtime(so_path)):
+            try:
+                subprocess.check_call([
+                    "/opt/rocm/bin/hipcc",
+                    "-O3", "--offload-arch=gfx906", "-std=c++17",
+                    "-shared", "-fPIC",
+                    "-o", str(so_path),
+                    str(hip_path),
+                ])
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                raise RuntimeError(f"Failed to build gemv_p2p_reduce.hip: {e}")
+
+        lib = ctypes.CDLL(str(so_path))
+
+        # fused_p2p_reduce_residual_tp2(hidden, partial_local, partial_peer0, n, stream)
+        lib.fused_p2p_reduce_residual_tp2.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint, ctypes.c_void_p
+        ]
+        lib.fused_p2p_reduce_residual_tp2.restype = ctypes.c_int
+
+        # fused_p2p_reduce_residual_tp4(hidden, partial_local, peer0, peer1, peer2, n, stream)
+        lib.fused_p2p_reduce_residual_tp4.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint, ctypes.c_void_p
+        ]
+        lib.fused_p2p_reduce_residual_tp4.restype = ctypes.c_int
+
+        # fused_p2p_reduce_only_tp4(partial_local, peer0, peer1, peer2, n, stream)
+        lib.fused_p2p_reduce_only_tp4.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_uint, ctypes.c_void_p
+        ]
+        lib.fused_p2p_reduce_only_tp4.restype = ctypes.c_int
+
+        self._lib = lib
+
+    def allreduce_residual(self, partial_ptrs: list, hidden_ptrs: list,
+                           num_elems: int):
+        """Fused P2P allreduce + residual add (synchronous).
+
+        Each GPU launches its own fused kernel that reads all other GPUs'
+        partial results via P2P pointers and updates its own hidden buffer.
+        All 4 kernels run simultaneously on their respective GPUs.
+
+        Args:
+            partial_ptrs: per-GPU GEMV partial result pointers
+            hidden_ptrs:  per-GPU hidden state pointers (read-modify-write)
+            num_elems:    number of FP16 elements
+        """
+        tp = self._tp_size
+        if tp == 1:
+            return
+
+        hip = self._hip
+
+        # Sync all GPUs to ensure GEMV kernels have completed
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            hip.synchronize()
+
+        # Launch fused kernel on each GPU simultaneously
+        # Each GPU reads its own partial + peer partials via P2P pointers
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            ar_stream = self._allreduce_streams[i]
+            ar_stream_ptr = ctypes.c_void_p(ar_stream)
+
+            if tp == 2:
+                # peer index for GPU i = 1 - i
+                peer_i = 1 - i
+                err = self._lib.fused_p2p_reduce_residual_tp2(
+                    ctypes.c_void_p(hidden_ptrs[i]),
+                    ctypes.c_void_p(partial_ptrs[i]),
+                    ctypes.c_void_p(partial_ptrs[peer_i]),
+                    ctypes.c_uint(num_elems),
+                    ar_stream_ptr)
+            elif tp == 4:
+                # For GPU i, the 3 peer indices are all j != i
+                peer_indices = [j for j in range(tp) if j != i]
+                err = self._lib.fused_p2p_reduce_residual_tp4(
+                    ctypes.c_void_p(hidden_ptrs[i]),
+                    ctypes.c_void_p(partial_ptrs[i]),
+                    ctypes.c_void_p(partial_ptrs[peer_indices[0]]),
+                    ctypes.c_void_p(partial_ptrs[peer_indices[1]]),
+                    ctypes.c_void_p(partial_ptrs[peer_indices[2]]),
+                    ctypes.c_uint(num_elems),
+                    ar_stream_ptr)
+            else:
+                raise ValueError(f"tp_size={tp} not supported (2 or 4 only)")
+
+            if err != 0:
+                raise HIPError(
+                    f"fused_p2p_reduce_residual_tp{tp} kernel failed on GPU {i}: "
+                    f"HIP error {err}")
+
+        # Sync all allreduce streams
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            hip.stream_synchronize(self._allreduce_streams[i])
+
+    def allreduce_residual_async(self, partial_ptrs: list, hidden_ptrs: list,
+                                  num_elems: int, compute_streams: list):
+        """Fused P2P allreduce + residual add (asynchronous, stream-overlapping).
+
+        Records compute events → each GPU's allreduce stream waits on ALL compute
+        events (since we need all GPUs to finish GEMV before reading remote partials)
+        → launches fused kernel simultaneously on all GPUs → records completion events.
+
+        The Python call returns immediately; GPU work continues asynchronously.
+        Next-layer's first kernel must call wait_for_allreduce_on_compute_stream()
+        before reading d_hidden.
+
+        Args:
+            partial_ptrs: per-GPU GEMV partial result pointers
+            hidden_ptrs:  per-GPU hidden state pointers
+            num_elems:    number of FP16 elements
+            compute_streams: per-GPU compute stream handles (for event recording)
+        """
+        tp = self._tp_size
+        if tp == 1:
+            return
+
+        hip = self._hip
+
+        # Step 1: Record compute completion events on each GPU's compute stream
+        for i, dev_id in enumerate(self._device_ids):
+            hip.set_device(dev_id)
+            hip.event_record(self._compute_events[i], compute_streams[i])
+
+        # Step 2: Each GPU's allreduce stream waits for ALL compute events
+        # (needed because kernel reads remote GPU data — all GEMVs must complete)
+        for i, dev_id in enumerate(self._device_ids):
+            hip.set_device(dev_id)
+            ar_stream = self._allreduce_streams[i]
+            for j in range(tp):
+                hip.stream_wait_event(ar_stream, self._compute_events[j])
+
+        # Step 3: Launch fused kernel on each GPU (all on their allreduce streams)
+        for i, dev_id in enumerate(self._device_ids):
+            hip.set_device(dev_id)
+            ar_stream = self._allreduce_streams[i]
+            ar_stream_ptr = ctypes.c_void_p(ar_stream)
+
+            if tp == 2:
+                peer_i = 1 - i
+                err = self._lib.fused_p2p_reduce_residual_tp2(
+                    ctypes.c_void_p(hidden_ptrs[i]),
+                    ctypes.c_void_p(partial_ptrs[i]),
+                    ctypes.c_void_p(partial_ptrs[peer_i]),
+                    ctypes.c_uint(num_elems),
+                    ar_stream_ptr)
+            elif tp == 4:
+                peer_indices = [j for j in range(tp) if j != i]
+                err = self._lib.fused_p2p_reduce_residual_tp4(
+                    ctypes.c_void_p(hidden_ptrs[i]),
+                    ctypes.c_void_p(partial_ptrs[i]),
+                    ctypes.c_void_p(partial_ptrs[peer_indices[0]]),
+                    ctypes.c_void_p(partial_ptrs[peer_indices[1]]),
+                    ctypes.c_void_p(partial_ptrs[peer_indices[2]]),
+                    ctypes.c_uint(num_elems),
+                    ar_stream_ptr)
+            else:
+                raise ValueError(f"tp_size={tp} not supported (2 or 4 only)")
+
+            if err != 0:
+                raise HIPError(
+                    f"fused_p2p_reduce_residual_tp{tp} failed on GPU {i}: "
+                    f"HIP error {err}")
+
+        # Step 4: Record allreduce completion events on each GPU's allreduce stream
+        for i, dev_id in enumerate(self._device_ids):
+            hip.set_device(dev_id)
+            hip.event_record(self._ar_done_events[i], self._allreduce_streams[i])
+
+        # Python returns immediately — GPU work continues asynchronously
+
+    def wait_for_allreduce_on_compute_stream(self, compute_streams: list):
+        """Make each GPU's compute stream wait for allreduce completion (GPU-side).
+
+        Same interface as P2PAllreduce.wait_for_allreduce_on_compute_stream.
+        """
+        hip = self._hip
+        for i, dev_id in enumerate(self._device_ids):
+            hip.set_device(dev_id)
+            hip.stream_wait_event(compute_streams[i], self._ar_done_events[i])
+
+    def allreduce_sum(self, partial_ptrs: list, num_elems: int):
+        """Fused P2P allreduce sum only (no hidden residual add).
+
+        Each GPU computes the full sum into its own partial buffer.
+        Only supported for TP=4 currently.
+        """
+        tp = self._tp_size
+        if tp == 1:
+            return
+        if tp != 4:
+            raise ValueError(f"allreduce_sum only supported for TP=4, got TP={tp}")
+
+        hip = self._hip
+
+        # Sync all GPUs
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            hip.synchronize()
+
+        # Launch fused reduce-only kernel on each GPU
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            ar_stream = self._allreduce_streams[i]
+            peer_indices = [j for j in range(tp) if j != i]
+            err = self._lib.fused_p2p_reduce_only_tp4(
+                ctypes.c_void_p(partial_ptrs[i]),
+                ctypes.c_void_p(partial_ptrs[peer_indices[0]]),
+                ctypes.c_void_p(partial_ptrs[peer_indices[1]]),
+                ctypes.c_void_p(partial_ptrs[peer_indices[2]]),
+                ctypes.c_uint(num_elems),
+                ctypes.c_void_p(ar_stream))
+            if err != 0:
+                raise HIPError(
+                    f"fused_p2p_reduce_only_tp4 failed on GPU {i}: HIP error {err}")
+
+        # Sync all allreduce streams
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            hip.stream_synchronize(self._allreduce_streams[i])
+
+    def cleanup(self):
+        """Destroy streams and events."""
+        hip = self._hip
+        for i, dev_id in enumerate(self._device_ids):
+            try:
+                hip.set_device(dev_id)
+                if i < len(self._allreduce_streams):
+                    hip.stream_destroy(self._allreduce_streams[i])
+            except HIPError:
+                pass
+        self._allreduce_streams.clear()
+
+        for i, dev_id in enumerate(self._device_ids):
+            try:
+                hip.set_device(dev_id)
+                if i < len(self._compute_events):
+                    hip.event_destroy(self._compute_events[i])
+            except HIPError:
+                pass
+        self._compute_events.clear()
+
+        for i, dev_id in enumerate(self._device_ids):
+            try:
+                hip.set_device(dev_id)
+                if i < len(self._ar_done_events):
+                    hip.event_destroy(self._ar_done_events[i])
+            except HIPError:
+                pass
+        self._ar_done_events.clear()
+
+        self._lib = None

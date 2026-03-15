@@ -15,7 +15,7 @@ from typing import Optional
 
 from src.inference.engine import InferenceEngine
 from src.runtime.tensor_parallel import TensorParallelGroup
-from src.runtime.p2p_allreduce import P2PAllreduce
+from src.runtime.p2p_allreduce import P2PAllreduce, FusedP2PReduce
 from src.model.qwen import QwenConfig
 
 
@@ -133,6 +133,20 @@ class TPInferenceEngine:
                 print(f"P2P allreduce unavailable ({e}), using host-mediated fallback")
                 self._p2p_ar = None
 
+        # Initialize fused P2P reduce (new path: each GPU launches its own kernel
+        # that reads all peer partials via P2P, eliminating gather+broadcast steps)
+        self._fused_p2p_ar = None
+        self._fused_p2p_reduce = False  # flag to enable fused path
+        if self.tp_size in (2, 4):
+            try:
+                h = config.hidden_size
+                self._fused_p2p_ar = FusedP2PReduce(
+                    self._hip, device_ids, h)
+                print(f"Fused P2P reduce loaded (TP={self.tp_size}, all-GPU simultaneous kernel)")
+            except Exception as e:
+                print(f"Fused P2P reduce unavailable ({e}), using P2P allreduce fallback")
+                self._fused_p2p_ar = None
+
         # Fallback host buffers
         h = config.hidden_size
         self._host_bufs = [ctypes.create_string_buffer(h * 2)
@@ -208,6 +222,31 @@ class TPInferenceEngine:
                   "Falling back to cached dispatch.")
             overlap = False
         self._stream_overlap_dispatch = overlap
+
+    def set_fused_p2p_reduce(self, fused: bool):
+        """Enable or disable fused P2P reduce path.
+
+        When fused=True, allreduce operations use the fused P2P reduce kernel
+        (gemv_p2p_reduce.hip) where each GPU independently reads all peer
+        partial results via P2P and computes the full sum. This eliminates
+        the gather→reduce→broadcast pipeline used by the standard P2P allreduce.
+
+        The fused path may be faster for small payloads (10KB) because:
+        - All 4 GPUs run their kernels simultaneously (no sequential gather)
+        - No intermediate gather buffer needed
+        - Single sync point instead of 2+ stream synchronizations
+
+        However, PCIe remote memory reads from within a kernel may have higher
+        latency than hipMemcpyPeerAsync on 2-hop PCIe topologies. Test both and
+        pick the faster one.
+
+        Requires FusedP2PReduce to be available (_fused_p2p_ar is not None).
+        Falls back to standard P2P allreduce if fused kernel unavailable.
+        """
+        if fused and self._fused_p2p_ar is None:
+            print("WARNING: Fused P2P reduce unavailable. Falling back to standard P2P allreduce.")
+            fused = False
+        self._fused_p2p_reduce = fused
 
     def set_cached_dispatch(self, cached: bool):
         """Enable or disable cached (pre-built parameter) dispatch.
@@ -454,8 +493,12 @@ class TPInferenceEngine:
         or serial implementation based on flags.
 
         Priority order:
-        1. Combined (cached + stream overlap): both _cached_dispatch and
+        1. Combined (cached + stream overlap): _cached_dispatch and
            _stream_overlap_dispatch are True and _p2p_ar is available.
+           NOTE: stream overlap always uses standard P2P allreduce (not fused),
+           because the fused kernel's async variant has more cross-GPU event overhead.
+           The fused P2P kernel is faster in serial/synchronous mode but the
+           standard P2P allreduce overlaps better with cached dispatch.
         2. Cached dispatch only: _cached_dispatch is True.
         3. Stream overlap only: _stream_overlap_dispatch is True.
         4. Threaded: _threaded_dispatch is True.
@@ -642,6 +685,11 @@ class TPInferenceEngine:
         cfg = self.config
         num_layers = cfg.num_hidden_layers
         half_rotary = self.engines[0].rotary_dim // 2
+        # Stream overlap path always uses standard P2P allreduce (not fused).
+        # The fused kernel's async variant requires all 4 GPUs to sync with each
+        # other's compute events, creating more overhead in the overlap path.
+        # Standard P2P allreduce is better for streaming (1.41x slower in isolation
+        # but faster overall due to better overlap with compute dispatch).
         p2p_ar = self._p2p_ar
         compute_streams = self._compute_streams  # [0] * tp_size (default null streams)
 
@@ -1058,9 +1106,18 @@ class TPInferenceEngine:
     def _allreduce_residual(self, buffer_name: str, hidden_size: int):
         """Allreduce + residual add to d_hidden.
 
-        Tries P2P GPU allreduce first, falls back to fast_ar C extension,
-        then Python fallback.
+        Tries fused P2P reduce first (when enabled), then standard P2P GPU allreduce,
+        then fast_ar C extension, then Python fallback.
         """
+        # Fused P2P reduce (new path): each GPU reads all peer partials directly via P2P
+        # and updates its own hidden, all simultaneously. Eliminates gather+broadcast steps.
+        if (self._fused_p2p_reduce and self._fused_p2p_ar is not None
+                and self.tp_size in (2, 4)):
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            hidden_ptrs = [e.d_hidden for e in self.engines]
+            self._fused_p2p_ar.allreduce_residual(partial_ptrs, hidden_ptrs, hidden_size)
+            return
+
         # P2P GPU allreduce (primary path): async P2P gather + on-device kernel + broadcast
         if self._p2p_ar is not None and 2 <= self.tp_size <= 4:
             partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
@@ -1153,6 +1210,9 @@ class TPInferenceEngine:
         if self._p2p_ar:
             self._p2p_ar.cleanup()
             self._p2p_ar = None
+        if self._fused_p2p_ar:
+            self._fused_p2p_ar.cleanup()
+            self._fused_p2p_ar = None
         for engine in self.engines:
             engine.cleanup()
         self.tp_group.cleanup()
