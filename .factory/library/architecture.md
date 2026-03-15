@@ -6,6 +6,84 @@ Architectural decisions, patterns discovered, and kernel design notes.
 
 ---
 
+## HIP Graph Infrastructure (Milestone: hip-graph-decode, 2026-03-15)
+
+**Implementation:** `src/runtime/hip_graph_dispatch.py` + `tests/test_hip_graph_infra.py`
+
+**API availability (gfx906/ROCm 7.1):** All HIP graph functions confirmed available:
+- `hipGraphCreate`, `hipStreamBeginCapture`, `hipStreamEndCapture`, `hipGraphInstantiate`
+- `hipGraphLaunch`, `hipGraphExecKernelNodeSetParams`, `hipGraphExecDestroy`, `hipGraphDestroy`
+- `hipGraphGetNodes`, `hipGraphNodeGetType`, `hipGraphKernelNodeGetParams`
+
+**Key finding: 7.9× speedup for graph replay vs direct launch (8 kernels at N=5120).**
+- Direct 8-kernel dispatch: 140.89 µs/iter
+- Graph replay (8 kernels): 17.83 µs/iter
+- This translates to significant reduction in host-side kernel launch overhead for compute segments
+
+**hipKernelNodeParams struct layout (gfx906/ROCm 7.1):**
+```c
+struct hipKernelNodeParams {
+    uint blockDimX, blockDimY, blockDimZ;  // block dimensions
+    void *extra;                            // NULL normally
+    void *func;                             // kernel function handle
+    uint gridDimX, gridDimY, gridDimZ;     // grid dimensions
+    void *kernelParams;                     // pointer to void** params array
+    uint sharedMemBytes;                    // shared memory
+};
+```
+Note the unusual ordering: blockDim before func, gridDim after func.
+
+**Critical: Kernels must be compiled as HSACO for hipModuleLaunchKernel + graph capture.**
+- `.so` (shared libraries) are called via ctypes but CANNOT be captured via hipStreamBeginCapture
+- Kernels must be compiled with `hipcc --genco --offload-arch=gfx906` to produce `.hsaco`
+- The `.hsaco` is loaded via `hipModuleLoad`, functions obtained via `hipModuleGetFunction`
+- These function handles can then be used with `hipModuleLaunchKernel` on a capture stream
+
+**Graph capture stream:**
+- Use a non-default stream (created with `hipStreamCreate`) for `hipStreamBeginCapture`
+- Capture mode: `hipStreamCaptureModeRelaxed` works on gfx906/ROCm 7.1
+- Captured graph can be replayed on any stream including the null (default) stream
+- Do NOT use `hipStreamCaptureModeGlobal` on streams that have in-flight work
+
+**Mutable parameter update pattern:**
+```python
+# Build new hipKernelNodeParams with updated params_array
+new_kp = hipKernelNodeParams()
+new_kp.blockDimX = block[0]; new_kp.blockDimY = block[1]; new_kp.blockDimZ = block[2]
+new_kp.gridDimX  = grid[0];  new_kp.gridDimY  = grid[1];  new_kp.gridDimZ  = grid[2]
+new_kp.func = original_func_ptr  # must match captured kernel
+new_kp.kernelParams = ctypes.cast(new_params_arr, ctypes.c_void_p).value
+new_kp.sharedMemBytes = 0; new_kp.extra = None
+graph_rt.exec_kernel_node_set_params(graph_exec, node, new_kp)
+# CRITICAL: keep new ctypes param objects alive until after replay!
+```
+
+**Lifecycle pattern for graph segments:**
+1. `hipStreamBeginCapture(stream, hipStreamCaptureModeRelaxed)` — enters capture mode
+2. `hipModuleLaunchKernel(...)` on the capture stream — launches are recorded, NOT executed
+3. `hipStreamEndCapture(stream, &graph)` — captures template graph
+4. `hipGraphInstantiate(&graphExec, graph, NULL, NULL, 0)` — compiles to executable
+5. `hipGraphGetNodes` → `hipGraphNodeGetType` → `hipGraphKernelNodeGetParams` — enumerate nodes
+6. Per-step: `hipGraphExecKernelNodeSetParams` to update mutable args, then `hipGraphLaunch`
+7. Cleanup: `hipGraphExecDestroy` + `hipGraphDestroy`
+
+**Graph capture for C dispatch (existing kernels in c_dispatch.c):**
+- All existing kernels in the C dispatch loop use `hipModuleLaunchKernel` on the null stream
+- To capture these, we need a wrapper: instead of capturing from the C dispatch loop directly,
+  we capture a Python-driven sequence using the same kernel handles and parameter arrays
+  from the existing `CEngineLayerSpec` / `CDispatchPlan` structures
+- The `_engine_layer_caches` (from `build_dispatch_cache()`) already have pre-built params arrays
+  — these can be used directly with `hipModuleLaunchKernel` on a capture stream
+
+**Performance analysis for full decode graph:**
+- With 7.9× speedup per graph segment, graph replay could significantly reduce host overhead
+- Per token with C dispatch: ~960 kernel launches × ~1µs each ≈ 1ms kernel dispatch overhead
+- With graph (assuming ~15 kernels/segment × 128 segments): ~0.13ms overhead → saves ~0.87ms
+- Actual speedup will be ~1-3% of total decode time (currently bottlenecked by allreduce ~15ms)
+- Primary benefit: eliminates Python ↔ C loop overhead for per-segment graph replays
+
+---
+
 ## Fused P2P GEMV Epilogue (Milestone 3: fused-p2p-gemv-epilogue, 2026-03-14)
 
 **Implementation:** `src/kernels/gemv_p2p_reduce.hip` + `FusedP2PReduce` class in `src/runtime/p2p_allreduce.py`
