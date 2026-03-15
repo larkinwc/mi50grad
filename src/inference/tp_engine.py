@@ -599,15 +599,13 @@ class TPInferenceEngine:
 
                 if lw.layer_type == 'full_attention':
                     # --- GEMV projections (all static) ---
+                    # Q and KV GEMVs run sequentially on the default stream.
+                    # No explicit stream sync needed: null stream serializes execution,
+                    # guaranteeing ordering for QKNorm without host-blocking sync calls.
                     if 'gemv_q_fused' in layer_cache:
                         engine.device.launch_cached(layer_cache['gemv_q_fused'])
                     if 'gemv_kv_fused' in layer_cache:
                         engine.device.launch_cached(layer_cache['gemv_kv_fused'])
-
-                    # Sync Q+KV streams if needed
-                    if engine._streams_ready:
-                        engine.device.hip.stream_synchronize(engine._stream_q)
-                        engine.device.hip.stream_synchronize(engine._stream_kv)
 
                     # --- QK-norm + RoPE: update position-dependent cos/sin ptrs ---
                     if 'qknorm_q' in layer_cache:
@@ -769,15 +767,12 @@ class TPInferenceEngine:
 
                 if lw.layer_type == 'full_attention':
                     # --- GEMV projections (cached, all static) ---
+                    # Q and KV GEMVs run sequentially on the default stream.
+                    # No explicit stream sync needed: null stream serializes execution.
                     if 'gemv_q_fused' in layer_cache:
                         engine.device.launch_cached(layer_cache['gemv_q_fused'])
                     if 'gemv_kv_fused' in layer_cache:
                         engine.device.launch_cached(layer_cache['gemv_kv_fused'])
-
-                    # Sync Q+KV streams if needed
-                    if engine._streams_ready:
-                        engine.device.hip.stream_synchronize(engine._stream_q)
-                        engine.device.hip.stream_synchronize(engine._stream_kv)
 
                     # --- QK-norm + RoPE: update position-dependent cos/sin ptrs ---
                     if 'qknorm_q' in layer_cache:
@@ -1576,7 +1571,10 @@ class TPInferenceEngine:
                 fill_kernel_spec(es.ffn_down,          lc.get('ffn_down'))
 
                 es.layer_type = 0 if lw.layer_type == 'full_attention' else 1
-                es.streams_ready = 1 if engine._streams_ready else 0
+                # Q/KV stream sync eliminated: always set streams_ready=0 so C dispatch
+                # never calls hipStreamSynchronize for Q/KV streams.
+                # _stream_q/_stream_kv objects are kept alive for other paths.
+                es.streams_ready = 0
                 es.stream_q  = engine._stream_q
                 es.stream_kv = engine._stream_kv
 

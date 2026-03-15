@@ -1129,21 +1129,21 @@ class InferenceEngine:
         cfg = self.config
         h = cfg.hidden_size
 
-        # Concurrent Q+Qgate and K+V projections on independent streams.
-        # Both GEMVs read d_normed (read-only) — no race condition.
+        # Q+Qgate and K+V projections run sequentially on the default stream.
+        # For decode (batch=1), these are tiny GEMVs (~30µs each) where concurrency
+        # benefit is negligible compared to the 2 host-blocking sync calls per layer.
+        # Sequential execution on the default stream guarantees ordering for QKNorm
+        # without explicit stream synchronization.
         # Stream 1: Q+Qgate fused GEMV → d_q_fused ([Q, Q_gate])
-        # Stream 2: K+V fused GEMV   → d_kv_fused ([K, V])
         self._launch_gemv_fp16(self.d_q_fused, self.d_normed, lw.q_fused_weight,
-                                h, 2 * self.q_dim, stream=self._stream_q)
+                                h, 2 * self.q_dim)
 
         # Fused K+V projection: normed_hidden → [K, V] [2*kv_dim]
         self._launch_gemv_fp16(self.d_kv_fused, self.d_normed, lw.kv_fused_weight,
-                                h, 2 * self.kv_dim, stream=self._stream_kv)
+                                h, 2 * self.kv_dim)
 
-        # Synchronize both streams before QK-norm (which reads d_q and d_k).
-        if self._streams_ready:
-            self.device.hip.stream_synchronize(self._stream_q)
-            self.device.hip.stream_synchronize(self._stream_kv)
+        # No stream sync needed: both GEMVs now run on the default stream,
+        # so QKNorm ordering is guaranteed by the null stream's serial execution.
 
         # Fused QK-norm + RoPE (per-head RMSNorm + partial RoPE in one launch each)
         # Replaces 4 separate launches: qk_norm(Q) + qk_norm(K) + rope(Q) + rope(K)

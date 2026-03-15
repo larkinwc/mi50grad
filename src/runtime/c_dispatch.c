@@ -376,12 +376,9 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
                 err = launch_kernel(&es->gemv_kv_fused, plan);
                 if (err) return err;
 
-                if (es->streams_ready) {
-                    plan->hipStreamSynchronize_fn(
-                        (void *)(uintptr_t)es->stream_q);
-                    plan->hipStreamSynchronize_fn(
-                        (void *)(uintptr_t)es->stream_kv);
-                }
+                /* No stream sync: Q/KV GEMVs now run on the default (null) stream.
+                 * Sequential execution on the null stream guarantees ordering for
+                 * QKNorm without explicit host-blocking hipStreamSynchronize calls. */
 
                 /* QK-norm + RoPE: d_cos_base + offset */
                 uint64_t cos_ptr = es->d_cos_base + cos_offset;
