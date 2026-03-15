@@ -191,6 +191,10 @@ class TPInferenceEngine:
         self._c_dispatch_plan = None
         self._c_dispatch_objects = {}  # keeps ctypes objects alive
 
+        # C dispatch v2 (optimized: batched hipSetDevice calls)
+        self._c_dispatch_v2_enabled = False
+        self._c_dispatch_v2_lib = None
+
     def load_layer_weights(self, layer_idx: int, weights: dict):
         import copy
         for engine in self.engines:
@@ -1392,6 +1396,83 @@ class TPInferenceEngine:
                     enabled = False
         self._c_dispatch_enabled = enabled
 
+    def _load_c_dispatch_v2_lib(self):
+        """Load the c_dispatch_v2.so shared library.
+
+        Builds it via gcc if the .so is missing or stale.
+        c_dispatch_v2 has the same interface as c_dispatch but with optimized
+        hipSetDevice batching that reduces call overhead by ~384 calls/token.
+        Returns the ctypes.CDLL handle, or None on failure.
+        """
+        src_dir = Path(__file__).parent.parent / "runtime"
+        c_path = src_dir / "c_dispatch_v2.c"
+        so_path = src_dir / "c_dispatch_v2.so"
+
+        if not c_path.exists():
+            return None
+
+        if not so_path.exists() or os.path.getmtime(c_path) > os.path.getmtime(so_path):
+            try:
+                subprocess.check_call([
+                    "gcc", "-O3", "-shared", "-fPIC",
+                    "-I/opt/rocm/include",
+                    "-L/opt/rocm/lib", "-lamdhip64",
+                    "-o", str(so_path), str(c_path),
+                ], stderr=subprocess.DEVNULL)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                return None
+
+        try:
+            lib = ctypes.CDLL(str(so_path))
+        except OSError:
+            return None
+
+        # Register function signatures (same as v1 but entry point is c_dispatch_step_v2)
+        lib.c_dispatch_step_v2.argtypes = [
+            ctypes.c_uint64,  # plan_ptr
+            ctypes.c_uint64,  # cos_offset
+            ctypes.c_uint32,  # seq_len
+        ]
+        lib.c_dispatch_step_v2.restype = ctypes.c_int
+
+        lib.c_dispatch_get_spec_size.argtypes = []
+        lib.c_dispatch_get_spec_size.restype = ctypes.c_int
+        lib.c_dispatch_get_kernel_spec_size.argtypes = []
+        lib.c_dispatch_get_kernel_spec_size.restype = ctypes.c_int
+        lib.c_dispatch_get_allreduce_spec_size.argtypes = []
+        lib.c_dispatch_get_allreduce_spec_size.restype = ctypes.c_int
+        lib.c_dispatch_get_plan_size.argtypes = []
+        lib.c_dispatch_get_plan_size.restype = ctypes.c_int
+
+        return lib
+
+    def set_c_dispatch_v2(self, enabled: bool):
+        """Enable or disable optimized C dispatch v2.
+
+        c_dispatch_v2 is a drop-in replacement for c_dispatch with batched
+        hipSetDevice calls. It saves ~384 hipSetDevice calls/token (from ~2432
+        to ~2048) by eliminating redundant device context switches in the
+        allreduce routine when the device context is already correct.
+
+        Estimated improvement: ~1-2% throughput from reduced host overhead.
+
+        Requires set_c_dispatch(True) to have been called first (to build the
+        dispatch plan). The same CDispatchPlan is reused — only the entry
+        point changes from c_dispatch_step to c_dispatch_step_v2.
+        """
+        if enabled:
+            if not self._c_dispatch_enabled:
+                # Must have c_dispatch enabled first (for plan building)
+                print("WARNING: set_c_dispatch_v2 requires set_c_dispatch(True) first.")
+                return
+            if self._c_dispatch_v2_lib is None:
+                self._c_dispatch_v2_lib = self._load_c_dispatch_v2_lib()
+                if self._c_dispatch_v2_lib is None:
+                    print("WARNING: Failed to load c_dispatch_v2.so. "
+                          "Staying with c_dispatch_v1.")
+                    return
+        self._c_dispatch_v2_enabled = enabled
+
     def _build_c_dispatch_plan(self):
         """Build the CDispatchPlan ctypes structure from the engine caches.
 
@@ -1795,16 +1876,25 @@ class TPInferenceEngine:
         cos_offset = position * half_rotary * 2  # byte offset into cos/sin tables
         seq_len    = self.engines[0].kv_cache.current_len + 1
 
-        # Call C dispatch loop
+        # Call C dispatch loop (v2 if enabled, else v1)
         plan = self._c_dispatch_objects['plan']
         plan_ptr = ctypes.addressof(plan)
-        err = self._c_dispatch_lib.c_dispatch_step(
-            ctypes.c_uint64(plan_ptr),
-            ctypes.c_uint64(cos_offset),
-            ctypes.c_uint32(seq_len),
-        )
-        if err:
-            raise RuntimeError(f"c_dispatch_step failed: HIP error {err}")
+        if self._c_dispatch_v2_enabled and self._c_dispatch_v2_lib is not None:
+            err = self._c_dispatch_v2_lib.c_dispatch_step_v2(
+                ctypes.c_uint64(plan_ptr),
+                ctypes.c_uint64(cos_offset),
+                ctypes.c_uint32(seq_len),
+            )
+            if err:
+                raise RuntimeError(f"c_dispatch_step_v2 failed: HIP error {err}")
+        else:
+            err = self._c_dispatch_lib.c_dispatch_step(
+                ctypes.c_uint64(plan_ptr),
+                ctypes.c_uint64(cos_offset),
+                ctypes.c_uint32(seq_len),
+            )
+            if err:
+                raise RuntimeError(f"c_dispatch_step failed: HIP error {err}")
 
         # Synchronize all GPUs after C loop
         for dev_id in self.device_ids:
