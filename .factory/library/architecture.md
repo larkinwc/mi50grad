@@ -6,6 +6,48 @@ Architectural decisions, patterns discovered, and kernel design notes.
 
 ---
 
+## Graph-Based Decode Path (Milestone: hip-graph-decode, 2026-03-15)
+
+**Implementation:** `src/inference/tp_engine.py` (`_GraphDecodeState` class + `set_graph_dispatch()` + `_decode_step_graph()`) + `tests/test_graph_decode.py`
+
+**Critical bug: multi-kernel same func handle disambiguation.**
+When building mutable node lists after capture, multiple kernels share the same HIP function handle (e.g., `gemv_fp16_v2` is used by `gemv_q_fused`, `gemv_k_only`, `gemv_v_cache`, AND `gemv_o_proj`). You CANNOT identify which node corresponds to which LaunchSpec using func handles alone.
+
+**Solution: position-based node identification.**
+After `hipStreamEndCapture` + `hipGraphInstantiate`, `hipGraphGetNodes` returns nodes in capture order (same order as kernel launches during capture). Build a `capture_order` list matching the order of `hipModuleLaunchKernel` calls during capture. Then zip `capture_order` with `_kernel_nodes` to identify each node by position.
+
+```python
+# WRONG: func-based (will identify wrong nodes when funcs collide):
+for node in seg._kernel_nodes:
+    if node_params.func in func_to_spec:  # BUG: multiple keys with same func!
+        ...
+
+# CORRECT: position-based:
+capture_order = ['attn_rmsnorm', 'gemv_q_fused', 'gemv_k_only', 'gemv_v_cache', ...]
+for pos, (node, key) in enumerate(zip(seg._kernel_nodes, capture_order)):
+    if key in mutable_keys:
+        ...
+```
+
+**Performance findings: graph replay is SLOWER than C dispatch for full decode.**
+- C dispatch: 38 tok/s (tight C loop, no Python per-layer overhead)
+- Graph dispatch: 28 tok/s (Python loop calling `hipGraphLaunch` × 512 times)
+- Reason: `hipGraphLaunch` × 512 + `hipGraphExecKernelNodeSetParams` × 256 in Python still carries Python ctypes call overhead (~10ms/token vs C loop).
+- Graph replay only reduces host overhead for KERNEL LAUNCHES (7.9× per segment). But the per-layer Python orchestration for allreduce calls remains. Net result: graph dispatch is slower.
+- **To achieve actual speedup, the replay loop must also run in C (move `replay_step` to a C extension).** This is future work.
+
+**Correctness findings:**
+- All 15 decode steps achieve cosine sim >= 0.99 vs single-GPU reference
+- Mutable params (cos/sin, seq_len, KV cache pointers) update correctly across steps
+- Direct KV write mode (qknorm_rope_cachew kernel) works correctly in graph mode
+
+**Dispatch priority (highest to lowest):**
+graph > c_dispatch > cached+stream > cached > serial
+
+**Graph capture: 512 segments in ~130ms** (4 GPUs × 64 layers × 2 segments)
+
+---
+
 ## HIP Graph Infrastructure (Milestone: hip-graph-decode, 2026-03-15)
 
 **Implementation:** `src/runtime/hip_graph_dispatch.py` + `tests/test_hip_graph_infra.py`
