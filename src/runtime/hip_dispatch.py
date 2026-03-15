@@ -231,6 +231,10 @@ class HIPRuntime:
         lib.hipStreamSynchronize.argtypes = [ctypes.c_void_p]
         lib.hipStreamSynchronize.restype = ctypes.c_int
 
+        # hipGetLastError
+        lib.hipGetLastError.argtypes = []
+        lib.hipGetLastError.restype = ctypes.c_int
+
         # hipStreamDestroy
         lib.hipStreamDestroy.argtypes = [ctypes.c_void_p]
         lib.hipStreamDestroy.restype = ctypes.c_int

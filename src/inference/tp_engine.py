@@ -172,6 +172,12 @@ class TPInferenceEngine:
         # Default compute stream for each GPU (0 = HIP default stream)
         self._compute_streams = [0] * self.tp_size
 
+        # C dispatch loop extension (loaded lazily via set_c_dispatch())
+        self._c_dispatch_enabled = False
+        self._c_dispatch_lib = None
+        self._c_dispatch_plan = None
+        self._c_dispatch_objects = {}  # keeps ctypes objects alive
+
     def load_layer_weights(self, layer_idx: int, weights: dict):
         import copy
         for engine in self.engines:
@@ -489,10 +495,13 @@ class TPInferenceEngine:
     def decode_step(self, token_embedding: np.ndarray, position: int) -> np.ndarray:
         """Run one decode step with fused host-side allreduce.
 
-        Dispatches to cached+stream (combined), cached, stream_overlap, threaded,
-        or serial implementation based on flags.
+        Dispatches to C dispatch, cached+stream (combined), cached,
+        stream_overlap, threaded, or serial implementation based on flags.
 
         Priority order:
+        0. C dispatch (highest): _c_dispatch_enabled is True. Dispatches all
+           64 layers in a tight C loop via c_dispatch.so, eliminating Python
+           dispatch overhead.
         1. Combined (cached + stream overlap): _cached_dispatch and
            _stream_overlap_dispatch are True and _p2p_ar is available.
            NOTE: stream overlap always uses standard P2P allreduce (not fused),
@@ -504,6 +513,8 @@ class TPInferenceEngine:
         4. Threaded: _threaded_dispatch is True.
         5. Serial: fallback.
         """
+        if self._c_dispatch_enabled and self._c_dispatch_plan is not None:
+            return self._decode_step_c_dispatch(token_embedding, position)
         if (self._cached_dispatch and self._engine_layer_caches
                 and self._stream_overlap_dispatch and self._p2p_ar is not None):
             return self._decode_step_cached_stream(token_embedding, position)
@@ -1183,6 +1194,508 @@ class TPInferenceEngine:
         for engine in self.engines:
             hip.set_device(engine.device.device_id)
             hip.memcpy_h2d(engine.d_hidden, result_bytes, size)
+
+    # ------------------------------------------------------------------
+    # C dispatch extension support
+    # ------------------------------------------------------------------
+
+    def _load_c_dispatch_lib(self):
+        """Load the c_dispatch.so shared library.
+
+        Builds it via gcc if the .so is missing or stale.
+        Returns the ctypes.CDLL handle, or None on failure.
+        """
+        src_dir = Path(__file__).parent.parent / "runtime"
+        c_path = src_dir / "c_dispatch.c"
+        so_path = src_dir / "c_dispatch.so"
+
+        if not c_path.exists():
+            return None
+
+        if not so_path.exists() or os.path.getmtime(c_path) > os.path.getmtime(so_path):
+            try:
+                subprocess.check_call([
+                    "gcc", "-O3", "-shared", "-fPIC",
+                    "-I/opt/rocm/include",
+                    "-L/opt/rocm/lib", "-lamdhip64",
+                    "-o", str(so_path), str(c_path),
+                ], stderr=subprocess.DEVNULL)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                return None
+
+        try:
+            lib = ctypes.CDLL(str(so_path))
+        except OSError:
+            return None
+
+        # Register function signatures
+        lib.c_dispatch_step.argtypes = [
+            ctypes.c_uint64,  # plan_ptr
+            ctypes.c_uint64,  # cos_offset
+            ctypes.c_uint32,  # seq_len
+        ]
+        lib.c_dispatch_step.restype = ctypes.c_int
+
+        lib.c_dispatch_get_spec_size.argtypes = []
+        lib.c_dispatch_get_spec_size.restype = ctypes.c_int
+        lib.c_dispatch_get_kernel_spec_size.argtypes = []
+        lib.c_dispatch_get_kernel_spec_size.restype = ctypes.c_int
+        lib.c_dispatch_get_allreduce_spec_size.argtypes = []
+        lib.c_dispatch_get_allreduce_spec_size.restype = ctypes.c_int
+        lib.c_dispatch_get_plan_size.argtypes = []
+        lib.c_dispatch_get_plan_size.restype = ctypes.c_int
+
+        return lib
+
+    def set_c_dispatch(self, enabled: bool):
+        """Enable or disable C dispatch loop.
+
+        When enabled=True, decode_step uses _decode_step_c_dispatch() which
+        dispatches all 64 layers' kernels in a tight C loop via c_dispatch.so,
+        without returning to Python between layers. This eliminates ~14ms/tok
+        Python dispatch overhead from the cached+stream path.
+
+        Requires:
+        - build_dispatch_cache() must have been called first
+        - P2P allreduce must be available
+        - c_dispatch.so must be loadable
+
+        Falls back to cached+stream if C dispatch is unavailable.
+        """
+        if enabled:
+            if not self._engine_layer_caches:
+                self.build_dispatch_cache()
+            if self._p2p_ar is None:
+                print("WARNING: C dispatch requires P2P allreduce (unavailable). "
+                      "Falling back to cached+stream.")
+                enabled = False
+            elif self._c_dispatch_lib is None:
+                self._c_dispatch_lib = self._load_c_dispatch_lib()
+                if self._c_dispatch_lib is None:
+                    print("WARNING: Failed to load c_dispatch.so. "
+                          "Falling back to cached+stream.")
+                    enabled = False
+            if enabled and self._c_dispatch_plan is None:
+                try:
+                    self._c_dispatch_plan = self._build_c_dispatch_plan()
+                except Exception as e:
+                    print(f"WARNING: Failed to build C dispatch plan: {e}. "
+                          "Falling back to cached+stream.")
+                    enabled = False
+        self._c_dispatch_enabled = enabled
+
+    def _build_c_dispatch_plan(self):
+        """Build the CDispatchPlan ctypes structure from the engine caches.
+
+        Returns a ctypes buffer containing the serialized plan plus references
+        to all Python objects that must stay alive.
+
+        The plan contains:
+        - CDispatchPlan header
+        - CEngineLayerSpec[num_layers * num_engines] (all engines, all layers)
+        - CAllreduceSpec[num_layers] for attention
+        - CAllreduceSpec[num_layers] for FFN
+        """
+        import ctypes as ct
+
+        num_layers = self.config.num_hidden_layers
+        num_engines = self.tp_size
+        p2p_ar = self._p2p_ar
+
+        # Kernel spec struct (must match c_dispatch.c exactly)
+        # uint64 func, 3x uint32 grid, 3x uint32 block, uint32 shared_mem,
+        # uint64 params_array, uint32 num_params, uint32 present
+        # = 8 + 12 + 12 + 4 + 8 + 4 + 4 = 52 bytes (need alignment)
+        # Let C tell us the actual size
+        lib = self._c_dispatch_lib
+        kernel_spec_size = lib.c_dispatch_get_kernel_spec_size()
+        engine_spec_size = lib.c_dispatch_get_spec_size()
+        ar_spec_size     = lib.c_dispatch_get_allreduce_spec_size()
+        plan_size        = lib.c_dispatch_get_plan_size()
+
+        # Allocate flat buffers
+        n_engine_specs = num_layers * num_engines
+        engine_specs_buf = ct.create_string_buffer(n_engine_specs * engine_spec_size)
+        attn_ar_buf      = ct.create_string_buffer(num_layers * ar_spec_size)
+        ffn_ar_buf       = ct.create_string_buffer(num_layers * ar_spec_size)
+        plan_buf         = ct.create_string_buffer(plan_size)
+
+        hip = self._hip
+
+        # Helper to pack a CKernelSpec into a bytes buffer at offset
+        def pack_kernel_spec(buf, offset, spec_dict, key):
+            """Pack a LaunchSpec into a CKernelSpec at buf[offset]."""
+            if key not in spec_dict:
+                # present = 0, everything else 0
+                return  # already zero-initialized by create_string_buffer
+
+            spec = spec_dict[key]
+            ct.memmove(
+                ct.addressof(buf) + offset + 0,
+                ct.c_uint64(spec.func),
+                8
+            )
+            o = 8
+            for v in [spec.grid[0], spec.grid[1], spec.grid[2],
+                      spec.block[0], spec.block[1], spec.block[2],
+                      spec.shared_mem]:
+                ct.memmove(ct.addressof(buf) + offset + o, ct.c_uint32(v), 4)
+                o += 4
+            # params_array pointer
+            params_ptr = ct.addressof(spec.params_array)
+            ct.memmove(ct.addressof(buf) + offset + o, ct.c_uint64(params_ptr), 8)
+            o += 8
+            # num_params
+            ct.memmove(ct.addressof(buf) + offset + o,
+                        ct.c_uint32(len(spec.params)), 4)
+            o += 4
+            # present = 1
+            ct.memmove(ct.addressof(buf) + offset + o, ct.c_uint32(1), 4)
+
+        # Build a simpler approach: use ctypes structures
+        # Define CKernelSpec as a ctypes Structure
+        class CKernelSpec(ct.Structure):
+            _fields_ = [
+                ('func',         ct.c_uint64),
+                ('grid_x',       ct.c_uint32),
+                ('grid_y',       ct.c_uint32),
+                ('grid_z',       ct.c_uint32),
+                ('block_x',      ct.c_uint32),
+                ('block_y',      ct.c_uint32),
+                ('block_z',      ct.c_uint32),
+                ('shared_mem',   ct.c_uint32),
+                ('params_array', ct.c_uint64),
+                ('num_params',   ct.c_uint32),
+                ('present',      ct.c_uint32),
+            ]
+
+        class CEngineLayerSpec(ct.Structure):
+            _fields_ = [
+                ('attn_rmsnorm',      CKernelSpec),
+                ('gemv_q_fused',      CKernelSpec),
+                ('gemv_kv_fused',     CKernelSpec),
+                ('qknorm_q',          CKernelSpec),
+                ('qknorm_k',          CKernelSpec),
+                ('decode_attn',       CKernelSpec),
+                ('sigmoid_mul',       CKernelSpec),
+                ('gemv_o_proj',       CKernelSpec),
+                ('gemv_la_in_proj',   CKernelSpec),
+                ('deltanet_v3',       CKernelSpec),
+                ('deltanet_v3_shift', CKernelSpec),
+                ('gemv_la_out_proj',  CKernelSpec),
+                ('ffn_rmsnorm',       CKernelSpec),
+                ('ffn_gate_up_silu',  CKernelSpec),
+                ('ffn_down',          CKernelSpec),
+                ('layer_type',        ct.c_int),
+                ('streams_ready',     ct.c_int),
+                ('stream_q',          ct.c_uint64),
+                ('stream_kv',         ct.c_uint64),
+                ('d_cos_base',        ct.c_uint64),
+                ('d_sin_base',        ct.c_uint64),
+                ('d_k_src',           ct.c_uint64),
+                ('d_v_src',           ct.c_uint64),
+                ('kv_cache_k_base',   ct.c_uint64),
+                ('kv_cache_v_base',   ct.c_uint64),
+                ('kv_stride',         ct.c_uint32),
+                ('_pad',              ct.c_uint32),
+            ]
+
+        # Allreduce function type signatures
+        ReduceTp2Func = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_void_p,
+                                      ct.c_void_p, ct.c_uint32, ct.c_void_p)
+        ReduceTp3Func = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_void_p,
+                                      ct.c_void_p, ct.c_void_p, ct.c_uint32,
+                                      ct.c_void_p)
+        ReduceTp4Func = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_void_p,
+                                      ct.c_void_p, ct.c_void_p, ct.c_void_p,
+                                      ct.c_uint32, ct.c_void_p)
+        HipSetDeviceFunc      = ct.CFUNCTYPE(ct.c_int, ct.c_int)
+        HipStreamSyncFunc     = ct.CFUNCTYPE(ct.c_int, ct.c_void_p)
+        HipEventRecordFunc    = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_void_p)
+        HipStreamWaitFunc     = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_void_p, ct.c_uint)
+        HipMemcpyPeerAsyncFunc= ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_int,
+                                              ct.c_void_p, ct.c_int, ct.c_size_t, ct.c_void_p)
+        HipMemcpyAsyncFunc    = ct.CFUNCTYPE(ct.c_int, ct.c_void_p, ct.c_void_p,
+                                              ct.c_size_t, ct.c_int, ct.c_void_p)
+        HipGetLastErrorFunc   = ct.CFUNCTYPE(ct.c_int)
+        HipModuleLaunchFunc   = ct.CFUNCTYPE(
+            ct.c_int,
+            ct.c_void_p,                  # function handle
+            ct.c_uint, ct.c_uint, ct.c_uint,  # grid xyz
+            ct.c_uint, ct.c_uint, ct.c_uint,  # block xyz
+            ct.c_uint,                    # shared_mem
+            ct.c_void_p,                  # stream
+            ct.POINTER(ct.c_void_p),      # params
+            ct.POINTER(ct.c_void_p),      # extra
+        )
+
+        class CAllreduceSpec(ct.Structure):
+            _fields_ = [
+                ('reduce_tp2',      ReduceTp2Func),
+                ('reduce_tp3',      ReduceTp3Func),
+                ('reduce_tp4',      ReduceTp4Func),
+                ('tp_size',         ct.c_int),
+                ('device_ids',      ct.c_int * 4),
+                ('partial_ptrs',    ct.c_uint64 * 4),
+                ('hidden_ptrs',     ct.c_uint64 * 4),
+                ('gather_bufs',     ct.c_uint64 * 3),
+                ('allreduce_streams', ct.c_uint64 * 4),
+                ('compute_events',  ct.c_uint64 * 4),
+                ('ar_done_events',  ct.c_uint64 * 4),
+                ('compute_streams', ct.c_uint64 * 4),
+                ('num_elems',       ct.c_uint32),
+                ('_pad',            ct.c_uint32),
+            ]
+
+        class CDispatchPlan(ct.Structure):
+            _fields_ = [
+                ('num_layers',              ct.c_int),
+                ('num_engines',             ct.c_int),
+                ('engine_layer_specs',      ct.c_uint64),
+                ('attn_allreduce_specs',    ct.c_uint64),
+                ('ffn_allreduce_specs',     ct.c_uint64),
+                ('use_stream_overlap',      ct.c_int),
+                ('hipSetDevice_fn',         HipSetDeviceFunc),
+                ('hipStreamSynchronize_fn', HipStreamSyncFunc),
+                ('hipEventRecord_fn',       HipEventRecordFunc),
+                ('hipStreamWaitEvent_fn',   HipStreamWaitFunc),
+                ('hipMemcpyPeerAsync_fn',   HipMemcpyPeerAsyncFunc),
+                ('hipMemcpyAsync_fn',       HipMemcpyAsyncFunc),
+                ('hipGetLastError_fn',      HipGetLastErrorFunc),
+                ('hipModuleLaunchKernel_fn', HipModuleLaunchFunc),
+            ]
+
+        # Verify sizes match C
+        assert ct.sizeof(CKernelSpec) == lib.c_dispatch_get_kernel_spec_size(), \
+            f"CKernelSpec size mismatch: Python={ct.sizeof(CKernelSpec)}, C={lib.c_dispatch_get_kernel_spec_size()}"
+        assert ct.sizeof(CEngineLayerSpec) == lib.c_dispatch_get_spec_size(), \
+            f"CEngineLayerSpec size mismatch: Python={ct.sizeof(CEngineLayerSpec)}, C={lib.c_dispatch_get_spec_size()}"
+        assert ct.sizeof(CAllreduceSpec) == lib.c_dispatch_get_allreduce_spec_size(), \
+            f"CAllreduceSpec size mismatch: Python={ct.sizeof(CAllreduceSpec)}, C={lib.c_dispatch_get_allreduce_spec_size()}"
+        assert ct.sizeof(CDispatchPlan) == lib.c_dispatch_get_plan_size(), \
+            f"CDispatchPlan size mismatch: Python={ct.sizeof(CDispatchPlan)}, C={lib.c_dispatch_get_plan_size()}"
+
+        # Helper: fill a CKernelSpec from a LaunchSpec (or None for absent)
+        def fill_kernel_spec(c_spec, py_spec):
+            if py_spec is None:
+                c_spec.present = 0
+                return
+            c_spec.func = py_spec.func
+            c_spec.grid_x, c_spec.grid_y, c_spec.grid_z = py_spec.grid
+            c_spec.block_x, c_spec.block_y, c_spec.block_z = py_spec.block
+            c_spec.shared_mem = py_spec.shared_mem
+            # params_array: address of the pre-built void*[] array
+            c_spec.params_array = ct.addressof(py_spec.params_array)
+            c_spec.num_params = len(py_spec.params)
+            c_spec.present = 1
+
+        # Build the engine layer spec array
+        ELSArray = CEngineLayerSpec * (num_layers * num_engines)
+        els_array = ELSArray()
+
+        for layer_idx in range(num_layers):
+            for engine_idx, engine in enumerate(self.engines):
+                lc = self._engine_layer_caches[engine_idx][layer_idx]
+                lw = engine.layers[layer_idx]
+                es = els_array[layer_idx * num_engines + engine_idx]
+
+                fill_kernel_spec(es.attn_rmsnorm,      lc.get('attn_rmsnorm'))
+                fill_kernel_spec(es.gemv_q_fused,      lc.get('gemv_q_fused'))
+                fill_kernel_spec(es.gemv_kv_fused,     lc.get('gemv_kv_fused'))
+                fill_kernel_spec(es.qknorm_q,          lc.get('qknorm_q'))
+                fill_kernel_spec(es.qknorm_k,          lc.get('qknorm_k'))
+                fill_kernel_spec(es.decode_attn,       lc.get('decode_attn'))
+                fill_kernel_spec(es.sigmoid_mul,       lc.get('sigmoid_mul'))
+                fill_kernel_spec(es.gemv_o_proj,       lc.get('gemv_o_proj'))
+                fill_kernel_spec(es.gemv_la_in_proj,   lc.get('gemv_la_in_proj'))
+                fill_kernel_spec(es.deltanet_v3,       lc.get('deltanet_v3'))
+                fill_kernel_spec(es.deltanet_v3_shift, lc.get('deltanet_v3_shift'))
+                fill_kernel_spec(es.gemv_la_out_proj,  lc.get('gemv_la_out_proj'))
+                fill_kernel_spec(es.ffn_rmsnorm,       lc.get('ffn_rmsnorm'))
+                fill_kernel_spec(es.ffn_gate_up_silu,  lc.get('ffn_gate_up_silu'))
+                fill_kernel_spec(es.ffn_down,          lc.get('ffn_down'))
+
+                es.layer_type = 0 if lw.layer_type == 'full_attention' else 1
+                es.streams_ready = 1 if engine._streams_ready else 0
+                es.stream_q  = engine._stream_q
+                es.stream_kv = engine._stream_kv
+
+                # Position-dependent: store d_cos / d_sin base pointers
+                es.d_cos_base = engine.d_cos
+                es.d_sin_base = engine.d_sin
+
+                # KV cache append params (full attention layers only)
+                if lw.layer_type == 'full_attention':
+                    kv_stride = (engine.local_num_kv_heads *
+                                 self.config.head_dim * 2)
+                    es.d_k_src         = engine.d_k
+                    es.d_v_src         = engine.d_v
+                    es.kv_cache_k_base = engine.kv_cache.layer_k_ptr(layer_idx)
+                    es.kv_cache_v_base = engine.kv_cache.layer_v_ptr(layer_idx)
+                    es.kv_stride       = kv_stride
+                else:
+                    es.kv_cache_k_base = 0
+                    es.kv_cache_v_base = 0
+                    es.kv_stride       = 0
+
+        # Build allreduce spec arrays
+        AttnARArray = CAllreduceSpec * num_layers
+        FfnARArray  = CAllreduceSpec * num_layers
+        attn_ar_array = AttnARArray()
+        ffn_ar_array  = FfnARArray()
+
+        # Get p2p_allreduce library function pointers
+        p2p_lib = p2p_ar._lib
+        reduce_tp2 = ReduceTp2Func(
+            ct.cast(p2p_lib.p2p_reduce_residual_tp2, ct.c_void_p).value)
+        reduce_tp3 = ReduceTp3Func(
+            ct.cast(p2p_lib.p2p_reduce_residual_tp3, ct.c_void_p).value)
+        reduce_tp4 = ReduceTp4Func(
+            ct.cast(p2p_lib.p2p_reduce_residual_tp4, ct.c_void_p).value)
+
+        def fill_ar_spec(c_ar, partial_attr):
+            """Fill a CAllreduceSpec for one layer."""
+            c_ar.reduce_tp2 = reduce_tp2
+            c_ar.reduce_tp3 = reduce_tp3
+            c_ar.reduce_tp4 = reduce_tp4
+            c_ar.tp_size = self.tp_size
+            for i, engine in enumerate(self.engines):
+                c_ar.device_ids[i]    = engine.device.device_id
+                c_ar.partial_ptrs[i]  = getattr(engine, partial_attr)
+                c_ar.hidden_ptrs[i]   = engine.d_hidden
+                c_ar.compute_streams[i] = 0  # null stream (default)
+            # Gather bufs (on GPU0, for TP>1)
+            for i, ptr in enumerate(p2p_ar._gather_bufs):
+                c_ar.gather_bufs[i] = ptr
+            # Allreduce streams and events from p2p_ar
+            for i in range(self.tp_size):
+                c_ar.allreduce_streams[i] = p2p_ar._allreduce_streams[i]
+                c_ar.compute_events[i]    = p2p_ar._compute_events[i]
+                c_ar.ar_done_events[i]    = p2p_ar._ar_done_events[i]
+            c_ar.num_elems = self.config.hidden_size
+
+        for layer_idx in range(num_layers):
+            fill_ar_spec(attn_ar_array[layer_idx], 'd_proj_out')
+            fill_ar_spec(ffn_ar_array[layer_idx],  'd_ffn_out')
+
+        # Build the CDispatchPlan
+        plan = CDispatchPlan()
+        plan.num_layers   = num_layers
+        plan.num_engines  = num_engines
+        plan.engine_layer_specs   = ct.addressof(els_array)
+        plan.attn_allreduce_specs = ct.addressof(attn_ar_array)
+        plan.ffn_allreduce_specs  = ct.addressof(ffn_ar_array)
+        plan.use_stream_overlap   = 1
+
+        # HIP API function pointers
+        hip_lib_handle = self._hip._lib
+        hip_set_device_fn = HipSetDeviceFunc(
+            ct.cast(hip_lib_handle.hipSetDevice, ct.c_void_p).value)
+        hip_stream_sync_fn = HipStreamSyncFunc(
+            ct.cast(hip_lib_handle.hipStreamSynchronize, ct.c_void_p).value)
+        hip_event_record_fn = HipEventRecordFunc(
+            ct.cast(hip_lib_handle.hipEventRecord, ct.c_void_p).value)
+        hip_stream_wait_fn = HipStreamWaitFunc(
+            ct.cast(hip_lib_handle.hipStreamWaitEvent, ct.c_void_p).value)
+        hip_memcpy_peer_async_fn = HipMemcpyPeerAsyncFunc(
+            ct.cast(hip_lib_handle.hipMemcpyPeerAsync, ct.c_void_p).value)
+        hip_memcpy_async_fn = HipMemcpyAsyncFunc(
+            ct.cast(hip_lib_handle.hipMemcpyAsync, ct.c_void_p).value)
+        hip_get_last_error_fn = HipGetLastErrorFunc(
+            ct.cast(hip_lib_handle.hipGetLastError, ct.c_void_p).value)
+        hip_module_launch_fn = HipModuleLaunchFunc(
+            ct.cast(hip_lib_handle.hipModuleLaunchKernel, ct.c_void_p).value)
+
+        plan.hipSetDevice_fn         = hip_set_device_fn
+        plan.hipStreamSynchronize_fn = hip_stream_sync_fn
+        plan.hipEventRecord_fn       = hip_event_record_fn
+        plan.hipStreamWaitEvent_fn   = hip_stream_wait_fn
+        plan.hipMemcpyPeerAsync_fn   = hip_memcpy_peer_async_fn
+        plan.hipMemcpyAsync_fn       = hip_memcpy_async_fn
+        plan.hipGetLastError_fn      = hip_get_last_error_fn
+        plan.hipModuleLaunchKernel_fn = hip_module_launch_fn
+
+        # Store all objects to keep them alive (Python GC must not collect them)
+        self._c_dispatch_objects = {
+            'els_array':       els_array,
+            'attn_ar_array':   attn_ar_array,
+            'ffn_ar_array':    ffn_ar_array,
+            'plan':            plan,
+            'reduce_tp2':      reduce_tp2,
+            'reduce_tp3':      reduce_tp3,
+            'reduce_tp4':      reduce_tp4,
+            'hip_set_device_fn':        hip_set_device_fn,
+            'hip_stream_sync_fn':       hip_stream_sync_fn,
+            'hip_event_record_fn':      hip_event_record_fn,
+            'hip_stream_wait_fn':       hip_stream_wait_fn,
+            'hip_memcpy_peer_async_fn': hip_memcpy_peer_async_fn,
+            'hip_memcpy_async_fn':      hip_memcpy_async_fn,
+            'hip_get_last_error_fn':    hip_get_last_error_fn,
+            'hip_module_launch_fn':     hip_module_launch_fn,
+        }
+
+        print(f"C dispatch plan built: {num_layers} layers × {num_engines} engines")
+        return plan
+
+    def _decode_step_c_dispatch(self, token_embedding: np.ndarray,
+                                 position: int) -> np.ndarray:
+        """Decode step using C dispatch loop.
+
+        Dispatches all 64 layers' kernels in a tight C loop via c_dispatch.so,
+        without returning to Python between layers. This eliminates ~14ms/tok
+        Python dispatch overhead from the cached+stream path.
+
+        The C extension handles:
+        - Per-engine kernel dispatch (attention + FFN for all layers)
+        - Position-dependent param updates (cos/sin offsets, seq_len)
+        - KV cache D2D copies
+        - Async allreduce with HIP events (stream overlap)
+
+        Python handles:
+        - Token embedding upload to all GPUs
+        - Final norm + logits (post-loop, single GPU)
+        - KV cache advance
+        """
+        h = self.config.hidden_size
+        half_rotary = self.engines[0].rotary_dim // 2
+
+        # Upload embedding to all GPUs
+        emb_bytes = token_embedding.tobytes()
+        for engine in self.engines:
+            engine.device.upload(engine.d_hidden, emb_bytes)
+
+        # Compute position-dependent params
+        cos_offset = position * half_rotary * 2  # byte offset into cos/sin tables
+        seq_len    = self.engines[0].kv_cache.current_len + 1
+
+        # Call C dispatch loop
+        plan = self._c_dispatch_objects['plan']
+        plan_ptr = ctypes.addressof(plan)
+        err = self._c_dispatch_lib.c_dispatch_step(
+            ctypes.c_uint64(plan_ptr),
+            ctypes.c_uint64(cos_offset),
+            ctypes.c_uint32(seq_len),
+        )
+        if err:
+            raise RuntimeError(f"c_dispatch_step failed: HIP error {err}")
+
+        # Synchronize all GPUs after C loop
+        for dev_id in self.device_ids:
+            self._hip.set_device(dev_id)
+            self._hip.synchronize()
+
+        # Advance KV caches
+        for engine in self.engines:
+            engine.kv_cache.advance()
+
+        # Final norm and logits (GPU0 only)
+        e0 = self.engines[0]
+        if e0.d_final_norm:
+            e0._launch_rmsnorm(e0.d_hidden2, e0.d_hidden, e0.d_final_norm, h)
+            return np.frombuffer(e0.device.download(e0.d_hidden2, h * 2),
+                                 dtype=np.float16)
+        return np.frombuffer(e0.device.download(e0.d_hidden, h * 2),
+                             dtype=np.float16)
 
     def synchronize(self):
         for engine in self.engines:
