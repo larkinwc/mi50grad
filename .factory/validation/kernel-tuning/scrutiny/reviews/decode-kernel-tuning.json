@@ -1,0 +1,44 @@
+{
+  "featureId": "decode-kernel-tuning",
+  "milestone": "kernel-tuning",
+  "status": "pass",
+  "summary": "The worker implemented a comprehensive kernel auto-tuning framework (tests/test_kernel_tuning.py, 892 lines) covering all 4 decode-critical kernels (INT4 GEMV, FlashAttention decode, elementwise, DeltaNet v3) for Qwen3.5-27B shapes on gfx906. Kernel improvements were correctly wired into engine.py. Correctness was verified on the GPU server (all VAL-TUNE-001/002/003/005 PASS). One non-blocking issue: the build_dispatch_cache() path uses rmsnorm_v3 without fallback, which could fail if the tuned kernel is unavailable at cache build time (though runtime kernels have proper fallbacks).",
+  "issues": [
+    {
+      "severity": "non_blocking",
+      "description": "build_dispatch_cache() uses self.kernels.get_hip('rmsnorm_v3', 'elementwise_v3') and self.kernels.get_hip('flash_attn_256_decode', 'flash_attn_256_tuned') directly WITHOUT try/except fallback. The runtime dispatch methods (_launch_rmsnorm, _launch_decode_attn_256) have proper fallbacks, but the LaunchSpec cache build will fail if these tuned kernels aren't available. This inconsistency means cached dispatch mode silently requires tuned kernels.",
+      "location": "src/inference/engine.py, build_dispatch_cache(), lines 2253-2254 and 2449-2450"
+    },
+    {
+      "severity": "suggestion",
+      "description": "The try/except Exception pattern in _launch_rmsnorm, _launch_skip_rmsnorm, etc. uses bare 'Exception' which catches KeyboardInterrupt and SystemExit only in Python 3 (both derive from BaseException, not Exception). However, these will also silently swallow legitimate errors during kernel loading (corrupted .so, wrong signature). A more specific exception would be preferable, but this is cosmetic since it works correctly in practice.",
+      "location": "src/inference/engine.py, _launch_rmsnorm, _launch_skip_rmsnorm, _launch_silu_fused, _launch_residual_add"
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "target": "library",
+      "observation": "Kernel tuning results for Qwen3.5-27B on gfx906 (MI50) are documented in bench/tp4_optimization_report_v2.md. Key findings: flash_attn_256_decode is 2.8-5.5x faster than original for decode, elementwise_v3 is 1.17-1.58x faster than v2, INT4 GEMV v3_t16 is 1.29x faster than v2_fused for N=4096 K=5120, DeltaNet v3 already optimal.",
+      "evidence": "Commit 8a3e964 adds tests/test_kernel_tuning.py with measured results. Commit message confirms all VAL-TUNE assertions pass."
+    },
+    {
+      "target": "library",
+      "observation": "The build_dispatch_cache() function in engine.py requires elementwise_v3.hip and flash_attn_256_tuned.hip to be compiled before calling build_dispatch_cache(). This is a hidden dependency - if cached dispatch mode is used, the v3 kernels MUST be available, unlike the runtime dispatch path which has fallbacks.",
+      "evidence": "src/inference/engine.py lines 2253-2254, 2331-2337, 2449-2450: uses get_hip('rmsnorm_v3', 'elementwise_v3') and get_hip('flash_attn_256_decode', 'flash_attn_256_tuned') without fallback in build_dispatch_cache()."
+    }
+  ],
+  "metrics": {
+    "filesChanged": ["src/inference/engine.py", "tests/test_kernel_tuning.py"],
+    "testsAdded": ["tests/test_kernel_tuning.py"],
+    "keyResults": {
+      "val_tune_001": "PASS - INT4 GEMV tuned for all 3 Qwen shapes (N=4096,K=5120; N=11008,K=5120; N=13696,K=5120), correctness < 1e-2",
+      "val_tune_002": "PASS - FlashAttention decode tuned for kv_lens 64/128/256/512/1024/2048, correctness < 5e-3",
+      "val_tune_003": "PASS - Elementwise rmsnorm/silu_fused/skip_rmsnorm/residual_add compared v2 vs v3, correctness < 5e-3",
+      "val_tune_005": "PASS - No correctness regressions in tuned variants",
+      "flashAttnSpeedup": "2.8-5.5x for decode (kv_len 64-2048)",
+      "elementwiseSpeedup": "1.17-1.58x (rmsnorm_v3 vs v2)",
+      "gemvSpeedup": "1.29x (v3_t16 vs v2_fused for N=4096)",
+      "syntaxCheck": "PASS - python3 -m py_compile tests/test_kernel_tuning.py exit code 0"
+    }
+  }
+}

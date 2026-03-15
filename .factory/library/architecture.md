@@ -1000,5 +1000,63 @@ different FFN outputs. The cumulative effect across 48 DeltaNet layers causes ca
   — much more complex, unknown numerical properties
 - The 80-allreduce path is correct in count but changes the math fundamentally — not acceptable
 
+---
+
+## Kernel Tuning Results — gfx906 MI50, Qwen3.5-27B Decode Shapes (kernel-tuning milestone, 2026-03-15)
+
+**Summary:** Systematic auto-tuning of all decode-critical kernels confirmed that current defaults (v3 variants) are already optimal for Qwen3.5-27B shapes on gfx906. Results are wired into `engine.py` as defaults with v2 fallbacks.
+
+**INT4 GEMV tuning** (`gemv_int4_v3.hip` / `gemv_int4_v4.hip`):
+- Shapes: N=4096,K=5120 (attn out_proj), N=11008,K=5120 (FFN gate/up), N=13696,K=5120 (FFN gate/up large)
+- Best: `gemv_int4_v3_t16` (threads-per-column=16, 256 threads/WG, cooperative reduction)
+- Performance: ~30 µs/call (N=4096), ~64 µs/call (N=11008), ~80 µs/call (N=13696)
+- vs v2_fused: **1.29x faster** (N=4096), ~tied (N=11008)
+- Conclusion: v3_t16 is optimal for K=5120 Qwen shapes; v4 variants offer no improvement
+
+**FlashAttention decode tuning** (`flash_attn_256_tuned.hip` → `flash_attn_256_decode`):
+- Qwen3.5-27B: num_heads=48, num_kv_heads=8, head_dim=256, decode (1 query token)
+- Tuned kernel: 4-wavefront KV-parallel merge (vs original 1-WF per query)
+- Performance: kv=256→~62µs, kv=512→~113µs, kv=1024→~223µs, kv=2048→~435µs
+- vs original `flash_attn_256_fp16`: **2.8-5.5x faster** across kv_lens 64-2048
+- Correctness: max_abs_err < 5e-3 vs numpy reference
+- Wired into `engine.py` as: `get_hip("flash_attn_256_decode", "flash_attn_256_tuned")`
+
+**Elementwise kernel tuning** (`elementwise_v3.hip` — float4/128-bit vectorized):
+- `rmsnorm_v3` vs `rmsnorm_v2`: **1.17-1.58x faster** at dim=5120 (~35 µs vs ~50 µs)
+- `silu_fused_v3` vs `silu_fused_v2`: **~1.0-1.31x faster** at dim=5120 (~54 µs)
+- `residual_add_v3` vs `residual_add_v2`: **1.26-1.32x faster** at dim=5120 (~53 µs)
+- v3 uses float4 loads (8 FP16 per thread, grid = (dim+2047)//2048); v2 uses float2 (2 FP16 per thread, grid = (dim+511)//512)
+- All correctness: max_abs_err < 5e-3
+
+**DeltaNet v3 occupancy assessment** (`deltanet_v3.hip`):
+- Config: 48 WGs (one per v-head), 256 threads/WG
+- 48 WGs on 60 CUs → ~0.8 WGs/CU; already near-optimal
+- No occupancy improvements possible — kernel is limited by sequential state-update recurrence
+- Performance: benchmark confirms config is already optimal
+
+**build_dispatch_cache() dependency on tuned kernels:**
+- `engine.py build_dispatch_cache()` uses `get_hip("rmsnorm_v3", "elementwise_v3")` and `get_hip("flash_attn_256_decode", "flash_attn_256_tuned")` WITHOUT try/except fallbacks
+- This means cached dispatch mode REQUIRES `elementwise_v3.so` and `flash_attn_256_tuned.so` to be compiled
+- The runtime dispatch methods (`_launch_rmsnorm`, `_launch_decode_attn_256`, etc.) DO have try/except fallbacks
+- Workers extending cached dispatch MUST ensure tuned kernels are compiled, or add fallbacks to build_dispatch_cache()
+
+**Final Sprint 2 Benchmark Results** (all optimizations: C dispatch + star allreduce + tuned kernels):
+- TP=4 throughput: **38.0 tok/s** (vs 25.5 tok/s combined baseline → **1.49x improvement**)
+- vs single-GPU: **1.87x** (38.0 vs 20.3 tok/s)
+- vs vLLM TP=4 (AWQ): **81%** (38.0 / 46.9 tok/s, gap = 8.9 tok/s)
+- Correctness: cosine_sim = 0.999988 vs single-GPU (PASS >= 0.99)
+- Single-GPU regression: 21.5 tok/s (PASS, within ±10% of 20.3 baseline)
+- Fallback path: C dispatch disabled → correctly falls back to cached+stream
+
+**All phase comparison:**
+| Phase | Tok/s |
+|---|---|
+| Single-GPU baseline | 20.3 |
+| TP=4 serial (P2P allreduce) | 12.4 |
+| TP=4 cached dispatch | 23.7 |
+| TP=4 combined (cached+stream) | 25.5 |
+| TP=4 C dispatch + tuned kernels | **38.0** |
+| vLLM TP=4 (AWQ, reference) | 46.9 |
+
 
 
