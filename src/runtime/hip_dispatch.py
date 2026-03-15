@@ -221,6 +221,12 @@ class HIPRuntime:
         lib.hipStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
         lib.hipStreamCreate.restype = ctypes.c_int
 
+        # hipStreamCreateWithFlags
+        lib.hipStreamCreateWithFlags.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint
+        ]
+        lib.hipStreamCreateWithFlags.restype = ctypes.c_int
+
         # hipStreamSynchronize
         lib.hipStreamSynchronize.argtypes = [ctypes.c_void_p]
         lib.hipStreamSynchronize.restype = ctypes.c_int
@@ -228,6 +234,12 @@ class HIPRuntime:
         # hipStreamDestroy
         lib.hipStreamDestroy.argtypes = [ctypes.c_void_p]
         lib.hipStreamDestroy.restype = ctypes.c_int
+
+        # hipStreamWaitEvent
+        lib.hipStreamWaitEvent.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint  # stream, event, flags
+        ]
+        lib.hipStreamWaitEvent.restype = ctypes.c_int
 
         # --- Pinned host memory ---
 
@@ -510,11 +522,29 @@ class HIPRuntime:
     # --- Stream methods ---
 
     def stream_create(self) -> int:
-        """Create a HIP stream. Returns stream handle."""
+        """Create a HIP stream (blocking — synchronizes with null stream). Returns stream handle."""
         stream = ctypes.c_void_p(0)
         self._check(
             self._lib.hipStreamCreate(ctypes.byref(stream)),
             "hipStreamCreate"
+        )
+        return stream.value
+
+    def stream_create_nonblocking(self) -> int:
+        """Create a non-blocking HIP stream (does NOT synchronize with null stream).
+
+        Use for streams that should run independently of the default stream.
+        hipStreamNonBlocking = 1. This avoids the null stream's implicit
+        serialization, enabling true overlap between compute (null stream)
+        and allreduce (non-blocking stream).
+        """
+        stream = ctypes.c_void_p(0)
+        HIP_STREAM_NON_BLOCKING = 1
+        self._check(
+            self._lib.hipStreamCreateWithFlags(
+                ctypes.byref(stream), ctypes.c_uint(HIP_STREAM_NON_BLOCKING)
+            ),
+            "hipStreamCreateWithFlags(NonBlocking)"
         )
         return stream.value
 
@@ -530,6 +560,15 @@ class HIPRuntime:
         self._check(
             self._lib.hipStreamDestroy(ctypes.c_void_p(stream)),
             "hipStreamDestroy"
+        )
+
+    def stream_wait_event(self, stream: int, event: int):
+        """Make a stream wait for an event to complete (GPU-side wait, non-blocking on CPU)."""
+        self._check(
+            self._lib.hipStreamWaitEvent(
+                ctypes.c_void_p(stream), ctypes.c_void_p(event), ctypes.c_uint(0)
+            ),
+            "hipStreamWaitEvent"
         )
 
 
@@ -601,6 +640,11 @@ class GPUDevice:
         """Create a HIP stream on this device."""
         self.hip.set_device(self.device_id)
         return self.hip.stream_create()
+
+    def create_stream_nonblocking(self) -> int:
+        """Create a non-blocking HIP stream on this device (no null stream sync)."""
+        self.hip.set_device(self.device_id)
+        return self.hip.stream_create_nonblocking()
 
     def create_event(self) -> int:
         """Create a HIP event on this device."""

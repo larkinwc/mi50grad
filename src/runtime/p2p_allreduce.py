@@ -73,6 +73,29 @@ class P2PAllreduce:
             ptr = hip.malloc(size)
             self._gather_bufs.append(ptr)
 
+        # Dedicated allreduce streams (non-blocking) for async allreduce overlap.
+        # Using non-blocking streams avoids the null stream's implicit serialization,
+        # allowing allreduce to truly run concurrently with compute (null stream)
+        # when using allreduce_residual_async().
+        self._allreduce_streams = []
+        for dev_id in self._device_ids:
+            hip.set_device(dev_id)
+            self._allreduce_streams.append(hip.stream_create_nonblocking())
+
+        # Compute completion events (one per GPU): recorded after GEMV on compute stream,
+        # waited on by allreduce stream before P2P gather.
+        self._compute_events = []
+        for dev_id in self._device_ids:
+            hip.set_device(dev_id)
+            self._compute_events.append(hip.event_create())
+
+        # Allreduce completion events (one per GPU): recorded on allreduce stream after
+        # broadcast, waited on by compute stream before next RMSNorm reads d_hidden.
+        self._ar_done_events = []
+        for dev_id in self._device_ids:
+            hip.set_device(dev_id)
+            self._ar_done_events.append(hip.event_create())
+
         # Enable P2P access between all pairs (idempotent)
         self._enable_p2p()
 
@@ -344,6 +367,149 @@ class P2PAllreduce:
             hip.set_device(self._device_ids[i])
             hip.stream_synchronize(self._streams[i])
 
+    def record_compute_events(self, compute_streams: list):
+        """Record compute completion events on each GPU's compute stream.
+
+        Call this after GEMV kernel launches (before allreduce). The events
+        are then waited on by the allreduce stream, creating a GPU-side
+        dependency that replaces hipDeviceSynchronize().
+
+        Args:
+            compute_streams: per-GPU compute stream handles (list of int)
+        """
+        hip = self._hip
+        for i, dev_id in enumerate(self._device_ids):
+            hip.set_device(dev_id)
+            hip.event_record(self._compute_events[i], compute_streams[i])
+
+    def allreduce_residual_async(self, partial_ptrs: list, hidden_ptrs: list,
+                                 num_elems: int, compute_streams: list):
+        """P2P allreduce + residual add, submitted asynchronously.
+
+        This is a non-blocking version of allreduce_residual() that:
+        1. Records compute events on each GPU's compute stream
+        2. Makes the allreduce stream wait on all compute events (GPU-side wait)
+        3. Runs P2P gather + reduce kernel + broadcast on dedicated allreduce streams
+        4. Records allreduce completion events (for next-layer compute to wait on)
+
+        The Python call returns immediately after submitting GPU work; the GPU
+        executes the allreduce on its dedicated stream concurrently with any
+        subsequent Python-submitted work on the compute stream.
+
+        Next-layer's first kernel (RMSNorm reading d_hidden) must call
+        wait_for_allreduce_on_compute_stream() before it can safely read d_hidden.
+
+        Args:
+            partial_ptrs: list of device ptrs, partial_ptrs[i] on device i
+            hidden_ptrs:  list of device ptrs, hidden_ptrs[i] on device i
+            num_elems:    number of FP16 elements
+            compute_streams: per-GPU compute stream handles (for event recording)
+        """
+        tp = self._tp_size
+        if tp == 1:
+            return
+
+        hip = self._hip
+        size = num_elems * 2
+        dev0_id = self._device_ids[0]
+        ar_stream0 = self._allreduce_streams[0]
+        ar_stream0_ptr = ctypes.c_void_p(ar_stream0)
+
+        # Step 1: Record compute completion events on each GPU's compute stream.
+        # The allreduce stream will wait on these before reading partial results.
+        for i, dev_id in enumerate(self._device_ids):
+            hip.set_device(dev_id)
+            hip.event_record(self._compute_events[i], compute_streams[i])
+
+        # Step 2: Make allreduce stream on GPU0 wait for ALL compute events.
+        # This is a GPU-side wait (no CPU blocking). The allreduce stream
+        # queues the dependency and won't start P2P copies until all GEMV
+        # kernels have completed on all GPUs.
+        hip.set_device(dev0_id)
+        for i in range(tp):
+            hip.stream_wait_event(ar_stream0, self._compute_events[i])
+
+        # Step 3: Async P2P gather partials to GPU0 on allreduce stream
+        for i in range(1, tp):
+            hip.memcpy_peer_async(
+                self._gather_bufs[i - 1], dev0_id,
+                partial_ptrs[i], self._device_ids[i],
+                size, ar_stream0)
+
+        # Step 4: Launch reduce kernel on GPU0 allreduce stream
+        # (P2P copies above complete before kernel runs, since same stream)
+        if tp == 2:
+            err = self._lib.p2p_reduce_residual_tp2(
+                ctypes.c_void_p(hidden_ptrs[0]),
+                ctypes.c_void_p(partial_ptrs[0]),
+                ctypes.c_void_p(self._gather_bufs[0]),
+                ctypes.c_uint(num_elems),
+                ar_stream0_ptr)
+        elif tp == 3:
+            err = self._lib.p2p_reduce_residual_tp3(
+                ctypes.c_void_p(hidden_ptrs[0]),
+                ctypes.c_void_p(partial_ptrs[0]),
+                ctypes.c_void_p(self._gather_bufs[0]),
+                ctypes.c_void_p(self._gather_bufs[1]),
+                ctypes.c_uint(num_elems),
+                ar_stream0_ptr)
+        elif tp == 4:
+            err = self._lib.p2p_reduce_residual_tp4(
+                ctypes.c_void_p(hidden_ptrs[0]),
+                ctypes.c_void_p(partial_ptrs[0]),
+                ctypes.c_void_p(self._gather_bufs[0]),
+                ctypes.c_void_p(self._gather_bufs[1]),
+                ctypes.c_void_p(self._gather_bufs[2]),
+                ctypes.c_uint(num_elems),
+                ar_stream0_ptr)
+        else:
+            raise ValueError(f"tp_size={tp} not supported (2-4 only)")
+
+        if err != 0:
+            raise HIPError(f"p2p_reduce_residual_tp{tp} kernel failed: HIP error {err}")
+
+        # Step 5: Record event on GPU0's allreduce stream after reduce kernel.
+        # Broadcast streams for other GPUs must wait on this event.
+        hip.set_device(dev0_id)
+        hip.event_record(self._ar_done_events[0], ar_stream0)
+
+        # Broadcast to all other GPUs, each on their own allreduce stream
+        for i in range(1, tp):
+            hip.set_device(self._device_ids[i])
+            # Make GPU[i]'s allreduce stream wait for GPU0's reduce to complete
+            hip.stream_wait_event(self._allreduce_streams[i], self._ar_done_events[0])
+            # Async P2P broadcast to GPU[i]
+            hip.memcpy_peer_async(
+                hidden_ptrs[i], self._device_ids[i],
+                hidden_ptrs[0], dev0_id,
+                size, self._allreduce_streams[i])
+            # Record completion event for GPU[i]
+            hip.event_record(self._ar_done_events[i], self._allreduce_streams[i])
+
+        # Update GPU0's completion event after all broadcast dispatches are queued
+        hip.set_device(dev0_id)
+        hip.event_record(self._ar_done_events[0], ar_stream0)
+        # Python call returns here. GPU continues asynchronously.
+
+    def wait_for_allreduce_on_compute_stream(self, compute_streams: list):
+        """Make each GPU's compute stream wait for allreduce completion (GPU-side wait).
+
+        Call this before launching the next-layer's first kernel (RMSNorm) that
+        reads d_hidden. This creates a GPU-side dependency without CPU blocking.
+
+        The kernel launch itself can happen immediately (HIP queues it on the
+        compute stream, which will wait on the allreduce completion event
+        before executing the kernel).
+
+        Args:
+            compute_streams: per-GPU compute stream handles
+        """
+        hip = self._hip
+        for i, dev_id in enumerate(self._device_ids):
+            hip.set_device(dev_id)
+            # Make compute stream wait on allreduce done event for THIS GPU
+            hip.stream_wait_event(compute_streams[i], self._ar_done_events[i])
+
     def cleanup(self):
         """Free temporary buffers."""
         if self._gather_bufs:
@@ -354,6 +520,37 @@ class P2PAllreduce:
                 except HIPError:
                     pass
             self._gather_bufs.clear()
+
+        # Destroy dedicated allreduce streams
+        for i, dev_id in enumerate(self._device_ids):
+            try:
+                self._hip.set_device(dev_id)
+                if i < len(self._allreduce_streams):
+                    self._hip.stream_destroy(self._allreduce_streams[i])
+            except HIPError:
+                pass
+        self._allreduce_streams.clear()
+
+        # Destroy compute events
+        for i, dev_id in enumerate(self._device_ids):
+            try:
+                self._hip.set_device(dev_id)
+                if i < len(self._compute_events):
+                    self._hip.event_destroy(self._compute_events[i])
+            except HIPError:
+                pass
+        self._compute_events.clear()
+
+        # Destroy allreduce done events
+        for i, dev_id in enumerate(self._device_ids):
+            try:
+                self._hip.set_device(dev_id)
+                if i < len(self._ar_done_events):
+                    self._hip.event_destroy(self._ar_done_events[i])
+            except HIPError:
+                pass
+        self._ar_done_events.clear()
+
         self._lib = None
 
 

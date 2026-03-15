@@ -152,6 +152,12 @@ class TPInferenceEngine:
         self._cached_dispatch = False
         self._engine_layer_caches = []  # per-engine list of layer_cache dicts
 
+        # Stream overlap dispatch: allreduce on dedicated stream, overlapping with
+        # next-layer compute. Requires P2P allreduce with async methods.
+        self._stream_overlap_dispatch = False
+        # Default compute stream for each GPU (0 = HIP default stream)
+        self._compute_streams = [0] * self.tp_size
+
     def load_layer_weights(self, layer_idx: int, weights: dict):
         import copy
         for engine in self.engines:
@@ -180,6 +186,28 @@ class TPInferenceEngine:
             self._engine_layer_caches.append(lc)
         print(f"Dispatch cache built for {len(self.engines)} engines × "
               f"{len(self.engines[0].layers)} layers")
+
+    def set_stream_overlap_dispatch(self, overlap: bool):
+        """Enable or disable stream overlap dispatch.
+
+        When overlap=True, allreduce operations are submitted asynchronously
+        on dedicated allreduce streams. Stream events gate the dependency
+        between allreduce completion and the next layer's compute (RMSNorm).
+
+        This allows Python to continue dispatching the next layer's kernels
+        immediately after submitting the allreduce. The GPU-side execution
+        uses hipStreamWaitEvent to enforce the correct data dependency, so
+        the RMSNorm kernel will wait for allreduce to complete on the GPU,
+        but Python does not block.
+
+        Requires P2P allreduce to be available (_p2p_ar is not None).
+        Falls back to cached dispatch if P2P allreduce unavailable.
+        """
+        if overlap and self._p2p_ar is None:
+            print("WARNING: Stream overlap requires P2P allreduce (unavailable). "
+                  "Falling back to cached dispatch.")
+            overlap = False
+        self._stream_overlap_dispatch = overlap
 
     def set_cached_dispatch(self, cached: bool):
         """Enable or disable cached (pre-built parameter) dispatch.
@@ -422,12 +450,16 @@ class TPInferenceEngine:
     def decode_step(self, token_embedding: np.ndarray, position: int) -> np.ndarray:
         """Run one decode step with fused host-side allreduce.
 
-        Dispatches to cached, threaded, or serial implementation based on flags.
-        Cached dispatch (set_cached_dispatch(True)) uses pre-built ctypes parameter
-        arrays for lower Python overhead. Set threading with set_threaded_dispatch().
+        Dispatches to cached, stream_overlap, threaded, or serial implementation
+        based on flags. Cached dispatch (set_cached_dispatch(True)) uses pre-built
+        ctypes parameter arrays for lower Python overhead. Stream overlap
+        (set_stream_overlap_dispatch(True)) makes allreduce async on a dedicated
+        stream. Set threading with set_threaded_dispatch().
         """
         if self._cached_dispatch and self._engine_layer_caches:
             return self._decode_step_cached(token_embedding, position)
+        if self._stream_overlap_dispatch and self._p2p_ar is not None:
+            return self._decode_step_stream_overlap(token_embedding, position)
         if self._threaded_dispatch:
             return self._decode_step_threaded(token_embedding, position)
         return self._decode_step_serial(token_embedding, position)
@@ -556,6 +588,130 @@ class TPInferenceEngine:
 
             # Allreduce FFN partials + residual add
             self._allreduce_residual("d_ffn_out", h)
+
+        for engine in self.engines:
+            engine.kv_cache.advance()
+
+        e0 = self.engines[0]
+        if e0.d_final_norm:
+            e0._launch_rmsnorm(e0.d_hidden2, e0.d_hidden, e0.d_final_norm, h)
+            return np.frombuffer(e0.device.download(e0.d_hidden2, h * 2),
+                                 dtype=np.float16)
+        return np.frombuffer(e0.device.download(e0.d_hidden, h * 2),
+                             dtype=np.float16)
+
+    def _decode_step_stream_overlap(self, token_embedding: np.ndarray,
+                                     position: int) -> np.ndarray:
+        """Decode step with async allreduce on dedicated streams.
+
+        Uses HIP stream events to overlap allreduce with next-layer compute:
+        1. Launch GEMV kernels on default compute stream (all 4 GPUs, serial Python)
+        2. Record compute events on each GPU's compute stream
+        3. Make allreduce stream wait on compute events (GPU-side, no CPU block)
+        4. Submit allreduce asynchronously (returns to Python immediately)
+        5. Make next-layer's compute stream wait on allreduce done events (GPU-side)
+        6. Launch next-layer's RMSNorm on compute stream (queued on GPU, waits for AR)
+
+        This creates a pipeline: while GPU runs allreduce, Python dispatches
+        next-layer kernel launches. The GPU enforces data dependencies via events.
+
+        Key difference from serial: no CPU-blocking hipDeviceSynchronize().
+        Instead: hipEventRecord + hipStreamWaitEvent for GPU-side ordering.
+        """
+        h = self.config.hidden_size
+        cfg = self.config
+        num_layers = cfg.num_hidden_layers
+        p2p_ar = self._p2p_ar
+        compute_streams = self._compute_streams  # [0] * tp_size (default streams)
+
+        # Upload embedding to all GPUs
+        emb_bytes = token_embedding.tobytes()
+        for engine in self.engines:
+            engine.device.upload(engine.d_hidden, emb_bytes)
+
+        for layer_idx in range(num_layers):
+            lw_list = [e.layers[layer_idx] for e in self.engines]
+
+            # ── ATTENTION PHASE ──────────────────────────────────────────────
+
+            # Make compute stream wait on allreduce done from previous layer's
+            # FFN allreduce (GPU-side). First layer: hipEventCreate creates events
+            # in an "unrecorded" state on ROCm — hipStreamWaitEvent on an unrecorded
+            # event is a no-op (safe). So layer 0 proceeds without blocking.
+            if layer_idx > 0:
+                p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
+
+            # RMSNorm (reads d_hidden — gated by allreduce done event above)
+            for engine, lw in zip(self.engines, lw_list):
+                engine._launch_rmsnorm(engine.d_normed, engine.d_hidden,
+                                       lw.attn_norm, h)
+
+            # Attention GEMV kernels (reads d_normed)
+            for engine, lw in zip(self.engines, lw_list):
+                if lw.layer_type == 'full_attention':
+                    engine._decode_full_attention(layer_idx, lw, position)
+                else:
+                    if engine._deltanet_gpu:
+                        engine._decode_linear_attention_gpu(layer_idx, lw, position)
+                    else:
+                        engine._decode_linear_attention(layer_idx, lw, position)
+
+            # Async allreduce: record compute events → allreduce stream waits →
+            # P2P gather + reduce + broadcast (all non-blocking from Python)
+            partial_ptrs = [e.d_proj_out for e in self.engines]
+            hidden_ptrs = [e.d_hidden for e in self.engines]
+            p2p_ar.allreduce_residual_async(
+                partial_ptrs, hidden_ptrs, h, compute_streams)
+
+            # ── FFN PHASE ────────────────────────────────────────────────────
+
+            # Make compute stream wait for attention allreduce completion (GPU-side).
+            # This ensures FFN's RMSNorm reads the updated d_hidden.
+            p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
+
+            # FFN RMSNorm (reads d_hidden — gated by attention allreduce done event)
+            for engine, lw in zip(self.engines, lw_list):
+                engine._launch_rmsnorm(engine.d_normed, engine.d_hidden,
+                                       lw.ffn_norm, h)
+
+            # FFN GEMV kernels
+            for engine, lw in zip(self.engines, lw_list):
+                if engine._gemv_int4_dual:
+                    engine._launch_ffn_gate_up_silu(
+                        engine.d_ffn_gate, engine.d_normed,
+                        lw, h, engine.local_intermediate_size)
+                else:
+                    engine._launch_gemv_int4(
+                        engine.d_ffn_gate, engine.d_normed,
+                        lw.gate_qweight, lw.gate_scales, lw.gate_zeros,
+                        h, engine.local_intermediate_size)
+                    engine._launch_gemv_int4(
+                        engine.d_ffn_up, engine.d_normed,
+                        lw.up_qweight, lw.up_scales, lw.up_zeros,
+                        h, engine.local_intermediate_size)
+                    engine._launch_silu_fused(
+                        engine.d_ffn_gate, engine.d_ffn_up,
+                        engine.d_ffn_gate, engine.local_intermediate_size)
+                engine._launch_gemv_int4(
+                    engine.d_ffn_out, engine.d_ffn_gate,
+                    lw.down_qweight, lw.down_scales, lw.down_zeros,
+                    engine.local_intermediate_size, h)
+
+            # Async FFN allreduce (non-blocking; next layer will wait for it)
+            partial_ptrs = [e.d_ffn_out for e in self.engines]
+            p2p_ar.allreduce_residual_async(
+                partial_ptrs, hidden_ptrs, h, compute_streams)
+
+        # After all layers: wait for the last FFN allreduce to complete
+        # before reading d_hidden for final norm
+        p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
+
+        # Synchronize all GPUs to ensure all GPU work is complete
+        # (compute streams + allreduce streams). hipDeviceSynchronize waits
+        # for all streams on the current device.
+        for dev_id in self.device_ids:
+            self._hip.set_device(dev_id)
+            self._hip.synchronize()  # hipDeviceSynchronize — waits all streams
 
         for engine in self.engines:
             engine.kv_cache.advance()
