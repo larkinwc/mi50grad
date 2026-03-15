@@ -6,6 +6,22 @@ Architectural decisions, patterns discovered, and kernel design notes.
 
 ---
 
+## P2P Allreduce Race Condition Fix (TP=4 Correctness Bug)
+
+**Critical bug found and fixed:** The P2P allreduce (`src/runtime/p2p_allreduce.py`) had a race condition where the P2P gather was copying stale/incomplete partial results from GPUs 1-3.
+
+**Root cause:** GPU GEMV kernels (in `InferenceEngine`) are dispatched on the engine's own streams (`_stream_q`, `_stream_kv`, etc.). The P2P allreduce uses different streams (TensorParallelGroup streams). Without synchronization between the compute stream and the P2P stream, the `hipMemcpyPeerAsync` gather could read unfinished GEMV results.
+
+**Fix:** Added `hipDeviceSynchronize()` for all GPUs at the start of both `allreduce_residual()` and `allreduce_sum()` in `P2PAllreduce`, before the P2P gather phase.
+
+**Impact:** Without fix, cosine similarity was ~0.1 (effectively random). With fix, cosine similarity is ~0.9999, matching host-mediated allreduce.
+
+**Lesson:** When mixing GPU computation streams with P2P transfer streams, you MUST synchronize all source devices before initiating peer-to-peer copies. The `hipMemcpyPeerAsync` does not automatically track dependencies from other streams.
+
+**Performance note:** The `hipDeviceSynchronize()` adds some overhead but is necessary for correctness. Future optimization could use HIP events (`hipEventRecord` on the compute stream + `hipStreamWaitEvent` on the P2P stream) to create fine-grained dependencies instead of full device synchronization.
+
+---
+
 ## Optimization Sprint Reference (kernel-optimization-sprint mission)
 
 ### FlashAttention Block-Tiling Design
