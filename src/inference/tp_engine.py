@@ -450,12 +450,20 @@ class TPInferenceEngine:
     def decode_step(self, token_embedding: np.ndarray, position: int) -> np.ndarray:
         """Run one decode step with fused host-side allreduce.
 
-        Dispatches to cached, stream_overlap, threaded, or serial implementation
-        based on flags. Cached dispatch (set_cached_dispatch(True)) uses pre-built
-        ctypes parameter arrays for lower Python overhead. Stream overlap
-        (set_stream_overlap_dispatch(True)) makes allreduce async on a dedicated
-        stream. Set threading with set_threaded_dispatch().
+        Dispatches to cached+stream (combined), cached, stream_overlap, threaded,
+        or serial implementation based on flags.
+
+        Priority order:
+        1. Combined (cached + stream overlap): both _cached_dispatch and
+           _stream_overlap_dispatch are True and _p2p_ar is available.
+        2. Cached dispatch only: _cached_dispatch is True.
+        3. Stream overlap only: _stream_overlap_dispatch is True.
+        4. Threaded: _threaded_dispatch is True.
+        5. Serial: fallback.
         """
+        if (self._cached_dispatch and self._engine_layer_caches
+                and self._stream_overlap_dispatch and self._p2p_ar is not None):
+            return self._decode_step_cached_stream(token_embedding, position)
         if self._cached_dispatch and self._engine_layer_caches:
             return self._decode_step_cached(token_embedding, position)
         if self._stream_overlap_dispatch and self._p2p_ar is not None:
@@ -588,6 +596,187 @@ class TPInferenceEngine:
 
             # Allreduce FFN partials + residual add
             self._allreduce_residual("d_ffn_out", h)
+
+        for engine in self.engines:
+            engine.kv_cache.advance()
+
+        e0 = self.engines[0]
+        if e0.d_final_norm:
+            e0._launch_rmsnorm(e0.d_hidden2, e0.d_hidden, e0.d_final_norm, h)
+            return np.frombuffer(e0.device.download(e0.d_hidden2, h * 2),
+                                 dtype=np.float16)
+        return np.frombuffer(e0.device.download(e0.d_hidden, h * 2),
+                             dtype=np.float16)
+
+    def _decode_step_cached_stream(self, token_embedding: np.ndarray,
+                                    position: int) -> np.ndarray:
+        """Combined cached dispatch + async stream overlap decode step.
+
+        Combines the benefits of both optimization modes:
+        - Cached dispatch: pre-built ctypes parameter arrays avoid per-launch
+          Python overhead (~5-6ms savings vs serial dispatch).
+        - Stream overlap: async allreduce on dedicated streams avoids CPU-blocking
+          hipDeviceSynchronize(), allowing Python to continue dispatching next-layer
+          kernels while GPU executes allreduce P2P copies in flight.
+
+        Per-layer flow:
+          1. [Attention] Launch RMSNorm + GEMV on compute stream (via cached params)
+          2. Submit async allreduce for attention partials:
+             - Record compute events on each GPU
+             - Allreduce stream waits on compute events (GPU-side)
+             - P2P gather + reduce kernel + broadcast on allreduce streams (non-blocking)
+             - Record allreduce done events
+          3. Make compute stream wait on allreduce done events (GPU-side, queued)
+          4. [FFN] Launch FFN RMSNorm + gate+up+silu + down_proj on compute stream (cached)
+          5. Submit async allreduce for FFN partials
+          6. [Next layer] Compute stream waits on FFN allreduce done event before RMSNorm
+
+        Python returns immediately after submitting GPU work (step 2 returns without
+        CPU blocking). While GPU executes allreduce, Python is already dispatching
+        step 3 (wait event, queued GPU-side) and next layer's cached kernel launches.
+
+        This hides allreduce latency (~23ms/tok) behind Python dispatch time for
+        next-layer kernel launches (~14ms/tok with cached dispatch).
+        """
+        h = self.config.hidden_size
+        cfg = self.config
+        num_layers = cfg.num_hidden_layers
+        half_rotary = self.engines[0].rotary_dim // 2
+        p2p_ar = self._p2p_ar
+        compute_streams = self._compute_streams  # [0] * tp_size (default null streams)
+
+        # Upload embedding to all GPUs
+        emb_bytes = token_embedding.tobytes()
+        for engine in self.engines:
+            engine.device.upload(engine.d_hidden, emb_bytes)
+
+        # Pre-compute RoPE offset for this position
+        cos_offset = position * half_rotary * 2  # byte offset into cos/sin tables
+
+        for layer_idx in range(num_layers):
+            # --- Compute stream waits for previous layer's FFN allreduce ---
+            # GPU-side wait: hipStreamWaitEvent on allreduce_done events for all GPUs.
+            # (Layer 0: allreduce events are unrecorded on ROCm →
+            #  hipStreamWaitEvent on unrecorded event is a no-op, safe.)
+            if layer_idx > 0:
+                p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
+
+            for engine_idx, (engine, lc) in enumerate(
+                    zip(self.engines, self._engine_layer_caches)):
+                layer_cache = lc[layer_idx]
+                lw = engine.layers[layer_idx]
+
+                # --- Attention RMSNorm (cached, all static) ---
+                engine.device.launch_cached(layer_cache['attn_rmsnorm'])
+
+                if lw.layer_type == 'full_attention':
+                    # --- GEMV projections (cached, all static) ---
+                    if 'gemv_q_fused' in layer_cache:
+                        engine.device.launch_cached(layer_cache['gemv_q_fused'])
+                    if 'gemv_kv_fused' in layer_cache:
+                        engine.device.launch_cached(layer_cache['gemv_kv_fused'])
+
+                    # Sync Q+KV streams if needed
+                    if engine._streams_ready:
+                        engine.device.hip.stream_synchronize(engine._stream_q)
+                        engine.device.hip.stream_synchronize(engine._stream_kv)
+
+                    # --- QK-norm + RoPE: update position-dependent cos/sin ptrs ---
+                    if 'qknorm_q' in layer_cache:
+                        spec_q = layer_cache['qknorm_q']
+                        spec_q.params[2].value = engine.d_cos + cos_offset
+                        spec_q.params[3].value = engine.d_sin + cos_offset
+                        engine.device.launch_cached(spec_q)
+                    if 'qknorm_k' in layer_cache:
+                        spec_k = layer_cache['qknorm_k']
+                        spec_k.params[2].value = engine.d_cos + cos_offset
+                        spec_k.params[3].value = engine.d_sin + cos_offset
+                        engine.device.launch_cached(spec_k)
+
+                    # GPU-to-GPU KV cache update
+                    engine.kv_cache.append_kv_gpu(layer_idx, engine.d_k, engine.d_v)
+
+                    # --- Decode attention: update seq_len ---
+                    if 'decode_attn' in layer_cache:
+                        spec_attn = layer_cache['decode_attn']
+                        spec_attn.params[4].value = engine.kv_cache.current_len + 1
+                        engine.device.launch_cached(spec_attn)
+
+                    # --- Sigmoid gate ---
+                    if 'sigmoid_mul' in layer_cache:
+                        engine.device.launch_cached(layer_cache['sigmoid_mul'])
+
+                    # --- Output projection ---
+                    if 'gemv_o_proj' in layer_cache:
+                        engine.device.launch_cached(layer_cache['gemv_o_proj'])
+
+                else:  # DeltaNet linear attention
+                    # --- Linear attention input projection ---
+                    if 'gemv_la_in_proj' in layer_cache:
+                        engine.device.launch_cached(layer_cache['gemv_la_in_proj'])
+
+                    # --- DeltaNet v3 main kernel ---
+                    if 'deltanet_v3' in layer_cache:
+                        engine.device.launch_cached(layer_cache['deltanet_v3'])
+                    if 'deltanet_v3_shift' in layer_cache:
+                        engine.device.launch_cached(layer_cache['deltanet_v3_shift'])
+
+                    # --- Linear attention output projection ---
+                    if 'gemv_la_out_proj' in layer_cache:
+                        engine.device.launch_cached(layer_cache['gemv_la_out_proj'])
+
+            # --- Async allreduce attention partials + residual add ---
+            # Records compute events → allreduce stream waits → P2P gather+reduce+broadcast
+            # Records allreduce done events. Returns immediately (non-blocking).
+            partial_ptrs = [e.d_proj_out for e in self.engines]
+            hidden_ptrs = [e.d_hidden for e in self.engines]
+            p2p_ar.allreduce_residual_async(
+                partial_ptrs, hidden_ptrs, h, compute_streams)
+
+            # --- Make compute stream wait for attention allreduce before FFN RMSNorm ---
+            p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
+
+            for engine_idx, (engine, lc) in enumerate(
+                    zip(self.engines, self._engine_layer_caches)):
+                layer_cache = lc[layer_idx]
+
+                # --- FFN RMSNorm (cached, reads d_hidden — gated by attention AR done) ---
+                engine.device.launch_cached(layer_cache['ffn_rmsnorm'])
+
+                # --- FFN gate+up+silu (cached) ---
+                if 'ffn_gate_up_silu' in layer_cache:
+                    engine.device.launch_cached(layer_cache['ffn_gate_up_silu'])
+                else:
+                    # Fallback to regular launch for non-fused path
+                    lw = engine.layers[layer_idx]
+                    engine._launch_ffn_gate_up_silu(
+                        engine.d_ffn_gate, engine.d_normed,
+                        lw, h, engine.local_intermediate_size)
+
+                # --- FFN down projection (cached) ---
+                if 'ffn_down' in layer_cache:
+                    engine.device.launch_cached(layer_cache['ffn_down'])
+                else:
+                    lw = engine.layers[layer_idx]
+                    engine._launch_gemv_int4(
+                        engine.d_ffn_out, engine.d_ffn_gate,
+                        lw.down_qweight, lw.down_scales, lw.down_zeros,
+                        engine.local_intermediate_size, h)
+
+            # --- Async allreduce FFN partials + residual add ---
+            # Non-blocking: next layer will call wait_for_allreduce_on_compute_stream()
+            # before launching its RMSNorm.
+            partial_ptrs = [e.d_ffn_out for e in self.engines]
+            p2p_ar.allreduce_residual_async(
+                partial_ptrs, hidden_ptrs, h, compute_streams)
+
+        # After all layers: wait for the last FFN allreduce before reading d_hidden
+        p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
+
+        # Synchronize all GPUs to ensure all GPU work is complete
+        for dev_id in self.device_ids:
+            self._hip.set_device(dev_id)
+            self._hip.synchronize()
 
         for engine in self.engines:
             engine.kv_cache.advance()

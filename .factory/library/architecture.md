@@ -6,6 +6,46 @@ Architectural decisions, patterns discovered, and kernel design notes.
 
 ---
 
+## Combined Cached Dispatch + Stream Overlap (Milestone 3: combined-cached-stream)
+
+**Implemented:** `_decode_step_cached_stream()` in `src/inference/tp_engine.py` combines both milestone 2 optimizations into a single decode path.
+
+**Key design:**
+- Enabled when both `set_cached_dispatch(True)` AND `set_stream_overlap_dispatch(True)` are called
+- `decode_step()` dispatches to combined mode first (highest priority), then cached-only, then stream_overlap, then serial
+- The combined method is a direct fusion of `_decode_step_cached()` and `_decode_step_stream_overlap()`
+
+**Per-layer structure:**
+1. `wait_for_allreduce_on_compute_stream()` at layer start (waits for previous FFN AR, GPU-side, no CPU block)
+2. Per-engine attention kernels via `launch_cached()` (cached ctypes params)
+3. `allreduce_residual_async()` for attention partials (non-blocking Python return)
+4. `wait_for_allreduce_on_compute_stream()` for attention AR completion
+5. Per-engine FFN kernels via `launch_cached()` (cached ctypes params)
+6. `allreduce_residual_async()` for FFN partials (non-blocking; next layer waits for it)
+
+**Performance results (4x MI50, 100 steps, Qwen3.5-27B-GPTQ-Int4):**
+- Serial: 13.5 tok/s (74.3 ms/tok)
+- Cached-only: 23.8 tok/s (42.0 ms/tok)
+- Stream overlap only: 14.4 tok/s (69.3 ms/tok)
+- **Combined: 28.2–34.4 tok/s (29–35 ms/tok)** — 1.185–1.445x vs cached, 2.09x vs serial
+
+**Correctness:** Min cosine similarity = 0.999979 (all 10 steps pass, threshold 0.99).
+
+**Why combined beats cached:**
+- Cached dispatch reduces Python overhead from ~60ms to ~14ms
+- Cached+stream then overlaps allreduce (~28ms) with Python dispatch time for next layer
+- Effective throughput: hidden_allreduce → wall_clock ≈ max(14ms, residual after overlap)
+- Actual measured: 29-35 ms/tok (allreduce largely hidden behind ~14ms Python dispatch)
+
+**Profiler caveat:** The `AllreduceProfiler` in bench_tp4.py only instruments `_allreduce_residual()`. Combined mode uses `allreduce_residual_async()` instead, so the profiler reports 0.00 ms allreduce. This is expected — it means allreduce runs asynchronously on GPU without Python timing.
+
+**Implementation files:**
+- `src/inference/tp_engine.py`: `_decode_step_cached_stream()`, updated `decode_step()` dispatch priority
+- `tests/test_combined_dispatch.py`: Correctness (10 steps) + benchmark (100 steps) + profile breakdown
+- `tests/bench_tp4.py`: Added "COMBINED MODE" section
+
+---
+
 ## Stream Overlap with HIP Events (Milestone 2: stream-compute-overlap)
 
 **Implemented:** Async P2P allreduce on dedicated non-blocking HIP streams with GPU-side event synchronization.

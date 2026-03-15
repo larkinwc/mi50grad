@@ -100,7 +100,10 @@ class AllreduceProfiler:
 
 def run_benchmark(engine, emb, warmup_steps, bench_steps, threaded: bool, label: str,
                   cached: bool = False, stream_overlap: bool = False):
-    """Run a benchmark with the given mode (serial, threaded, cached, or stream_overlap).
+    """Run a benchmark with the given mode (serial, threaded, cached, stream_overlap, or combined).
+
+    When both cached=True and stream_overlap=True, the engine uses the combined
+    _decode_step_cached_stream() path that merges both optimizations.
 
     Returns (tok_per_sec, ms_per_tok, mean_ar_ms, mean_compute_ms).
     """
@@ -227,6 +230,14 @@ def main():
         engine, emb, WARMUP_STEPS, BENCH_STEPS, threaded=False, cached=False,
         stream_overlap=True, label="STREAM OVERLAP")
 
+    # ----------- Combined (cached + stream overlap) benchmark -----------
+    print(f"\n{'=' * 70}")
+    print("COMBINED MODE (cached dispatch + async stream overlap allreduce)")
+    print("=" * 70)
+    combined_tps, combined_ms, combined_ar_ms, combined_compute_ms = run_benchmark(
+        engine, emb, WARMUP_STEPS, BENCH_STEPS, threaded=False, cached=True,
+        stream_overlap=True, label="COMBINED")
+
     # ----------- Threaded benchmark (for reference) -----------
     print(f"\n{'=' * 70}")
     print("THREADED DISPATCH (reference — known to be SLOWER than serial)")
@@ -238,7 +249,9 @@ def main():
     # ----------- Summary -----------
     cached_speedup = serial_ms / cached_ms if cached_ms > 0 else float('nan')
     overlap_speedup = serial_ms / overlap_ms if overlap_ms > 0 else float('nan')
+    combined_speedup = serial_ms / combined_ms if combined_ms > 0 else float('nan')
     threaded_speedup = serial_ms / threaded_ms if threaded_ms > 0 else float('nan')
+    combined_vs_cached = cached_ms / combined_ms if combined_ms > 0 else float('nan')
 
     print()
     print("=" * 70)
@@ -252,18 +265,22 @@ def main():
           f"{cached_ar_ms:>10.2f} {cached_compute_ms:>12.2f}")
     print(f"{'Stream Overlap':<26} {overlap_tps:>10.1f} {overlap_ms:>10.1f} "
           f"{overlap_ar_ms:>10.2f} {overlap_compute_ms:>12.2f}")
+    print(f"{'Combined (cached+stream)':<26} {combined_tps:>10.1f} {combined_ms:>10.1f} "
+          f"{combined_ar_ms:>10.2f} {combined_compute_ms:>12.2f}")
     print(f"{'Threaded (FYI)':<26} {threaded_tps:>10.1f} {threaded_ms:>10.1f} "
           f"{threaded_ar_ms:>10.2f} {threaded_compute_ms:>12.2f}")
     print("-" * 72)
-    print(f"  Speedup (cached/serial):         {cached_speedup:.3f}x")
-    print(f"  Speedup (stream_overlap/serial): {overlap_speedup:.3f}x")
-    print(f"  Speedup (threaded/serial):       {threaded_speedup:.3f}x")
+    print(f"  Speedup (cached/serial):          {cached_speedup:.3f}x")
+    print(f"  Speedup (stream_overlap/serial):  {overlap_speedup:.3f}x")
+    print(f"  Speedup (combined/serial):        {combined_speedup:.3f}x")
+    print(f"  Speedup (combined/cached):        {combined_vs_cached:.3f}x")
+    print(f"  Speedup (threaded/serial):        {threaded_speedup:.3f}x")
     print()
     print("BASELINES FOR COMPARISON:")
     print(f"  Single-GPU:         20.3 tok/s  (49.3 ms/tok)")
     print(f"  vLLM TP=4:          46.9 tok/s")
     print(f"  Theoretical TP=4:  ~81.2 tok/s  (20.3 * 4)")
-    best_tps = max(serial_tps, cached_tps, overlap_tps)
+    best_tps = max(serial_tps, cached_tps, overlap_tps, combined_tps)
     if best_tps > 20.3:
         vs_single = best_tps / 20.3
         print(f"  Best mode vs single: {vs_single:.2f}x")
