@@ -1,0 +1,73 @@
+{
+  "featureId": "c-dispatch-extension",
+  "milestone": "c-dispatch-loop",
+  "reviewedAt": "2026-03-15T05:20:00Z",
+  "status": "pass",
+  "issues": [
+    {
+      "severity": "suggestion",
+      "description": "The pack_kernel_spec() helper function defined early in _build_c_dispatch_plan() is never called — the code was refactored to use ctypes Structure classes (the CKernelSpec/CEngineLayerSpec approach). The unused helper adds dead code.",
+      "location": "src/inference/tp_engine.py:_build_c_dispatch_plan(), lines ~1305-1330"
+    },
+    {
+      "severity": "suggestion",
+      "description": "The c_dispatch_step() function uses NULL (default/null stream) for all kernel launches in launch_kernel(). This matches the Python cached+stream behavior (which uses the default HIP stream), so it is correct. However, for full_attention layers the Q/KV GEMV kernels are dispatched on _stream_q/_stream_kv in the original Python path and then synchronized back. The C path dispatches them on the null stream without the Q/KV concurrency optimization. This is a minor performance opportunity left on the table.",
+      "location": "src/runtime/c_dispatch.c:launch_kernel() and full_attention block"
+    },
+    {
+      "severity": "non_blocking",
+      "description": "In _build_c_dispatch_plan(), the Python ctypes Function types (ReduceTp2Func, ReduceTp3Func, etc.) are created once and shared across all CAllreduceSpec entries via fill_ar_spec(). This means all 64 attn_ar_array and 64 ffn_ar_array entries point to the same ctypes CFUNCTYPE wrappers. While this is correct (the same function pointer for all layers), it means these function objects must be kept alive. They are stored in _c_dispatch_objects, which is correct.",
+      "location": "src/inference/tp_engine.py:_build_c_dispatch_plan()"
+    },
+    {
+      "severity": "suggestion",
+      "description": "The C dispatch plan stores KV cache base pointers per-layer at build time via kv_cache.layer_k_ptr(layer_idx). If the KV cache is reallocated or its base address changes (e.g., re-initialization), the plan would become stale with dangling pointers. The current code does not handle this case. However, in practice the KV cache is allocated once and never reallocated, so this is a low-risk issue.",
+      "location": "src/inference/tp_engine.py:_build_c_dispatch_plan() — kv_cache_k_base/kv_cache_v_base assignment"
+    }
+  ],
+  "validationAssertions": {
+    "VAL-CDISPATCH-001": {
+      "status": "pass",
+      "evidence": "gcc compilation succeeds (BUILD_OK), ctypes loading succeeds, struct sizes verified: CKernelSpec=56B, CEngineLayerSpec=920B, CAllreduceSpec=272B, CDispatchPlan=104B"
+    },
+    "VAL-CDISPATCH-002": {
+      "status": "pass",
+      "evidence": "test_c_dispatch.py Test 2: min cosine sim 0.999972 for all 10 steps >= 0.99 threshold"
+    },
+    "VAL-CDISPATCH-005": {
+      "status": "pass",
+      "evidence": "test_c_dispatch.py Test 4: positions 0/10/50/100 all PASS (cosine sim 0.999992-0.999999)"
+    },
+    "VAL-CDISPATCH-006": {
+      "status": "pass",
+      "evidence": "C code correctly implements: hipEventRecord (compute events), hipStreamWaitEvent (AR stream waits), async P2P gather, reduce kernel, broadcast, done event recording. Allreduce runs asynchronously on dedicated streams."
+    },
+    "VAL-CDISPATCH-007": {
+      "status": "pass",
+      "evidence": "bench_single_gpu.py: 20.8 tok/s, within ±10% of 20.3 baseline"
+    },
+    "VAL-CDISPATCH-008": {
+      "status": "pass",
+      "evidence": "C code has explicit layer_type branches: 0=full_attention (qknorm, decode_attn, kv_cache append) and 1=deltanet (deltanet_v3, shift). Correctness confirmed by 10-step test."
+    },
+    "VAL-CDISPATCH-009": {
+      "status": "pass",
+      "evidence": "C code: hipMemcpyAsync(dst_k/dst_v, d_k_src/d_v_src, kv_stride, 3 /* D2D */, NULL) executed at each full_attention layer with position-dependent dst offset."
+    },
+    "VAL-CDISPATCH-010": {
+      "status": "pass",
+      "evidence": "decode_step() priority: if _c_dispatch_enabled and _c_dispatch_plan → _decode_step_c_dispatch(), then cached+stream, then cached, then serial"
+    }
+  },
+  "sharedStateObservations": [
+    {
+      "target": "library",
+      "observation": "C dispatch loop implementation in src/runtime/c_dispatch.c uses the 'no HIP headers' pattern (function pointer approach), same as fast_allreduce.c. Build command: gcc -O3 -shared -fPIC -I/opt/rocm/include -L/opt/rocm/lib -lamdhip64 -o src/runtime/c_dispatch.so src/runtime/c_dispatch.c. The -I/opt/rocm/include -L/opt/rocm/lib flags are present but not actually needed since no HIP types are used directly — the code uses uint64_t for all HIP handles. The build command in services.yaml is already correct."
+    },
+    {
+      "target": "library",
+      "observation": "C dispatch plan building (_build_c_dispatch_plan) must be called AFTER build_dispatch_cache(). The plan captures pointer addresses at build time (d_cos, d_sin, d_k, d_v, kv_cache base ptrs). These pointers are stable for the lifetime of the engine. set_c_dispatch(True) handles this ordering automatically by calling build_dispatch_cache() if caches not yet built."
+    }
+  ],
+  "summary": "c-dispatch-extension is a high-quality implementation. C extension compiles cleanly, loads correctly, and achieves 31.1 tok/s vs 24.6 tok/s cached+stream (1.27x speedup in this validation run). All correctness tests pass with min cosine sim 0.999972. Position-dependent params work at all tested positions. Async allreduce integration is correct. The implementation follows the existing patterns (function pointer approach, no HIP headers in C) and correctly handles both layer types. Minor: one dead code path (unused pack_kernel_spec helper)."
+}

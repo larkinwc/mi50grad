@@ -1,0 +1,100 @@
+{
+  "milestone": "c-dispatch-loop",
+  "round": 1,
+  "status": "pass",
+  "validatorsRun": {
+    "build_c_dispatch": {
+      "passed": true,
+      "command": "ssh root@192.168.1.198 \"docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /opt/mi50grad:/opt/mi50grad mi50grad bash -c 'cd /opt/mi50grad && gcc -O3 -shared -fPIC -I/opt/rocm/include -L/opt/rocm/lib -lamdhip64 -o src/runtime/c_dispatch.so src/runtime/c_dispatch.c && echo BUILD_OK'\"",
+      "exitCode": 0,
+      "output": "BUILD_OK — c_dispatch.so compiled successfully"
+    },
+    "test_c_dispatch": {
+      "passed": true,
+      "command": "ssh root@192.168.1.198 \"docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c 'cd /opt/mi50grad && python3 tests/test_c_dispatch.py'\"",
+      "exitCode": 0,
+      "output": "Test 1 (compilation): PASS. Test 2 (correctness): PASS (min_cos=0.999972, all 10 steps >= 0.99). Test 3 (benchmark): C dispatch 31.1 tok/s vs cached+stream 24.6 tok/s (1.27x speedup). Test 4 (position params): PASS at positions 0/10/50/100. ALL CRITICAL TESTS PASSED."
+    },
+    "test_c_dispatch_e2e": {
+      "passed": true,
+      "command": "ssh root@192.168.1.198 \"docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c 'cd /opt/mi50grad && python3 tests/test_c_dispatch_e2e.py'\"",
+      "exitCode": 0,
+      "output": "Test 1 (C dispatch vs single-GPU, cos >= 0.99): Min cosine sim 0.999987 → PASS. Test 2 (Benchmark, 100 steps): Cached+stream 29.5 tok/s, C dispatch 35.2 tok/s, speedup 1.19x, above 25.5 baseline → PASS. Test 3 (Single-GPU regression): 20.7 tok/s >= 18.3 tok/s → PASS. Test 4 (Fallback): Mode selection PASS, Correctness PASS. OVERALL: ALL CRITICAL TESTS PASSED."
+    },
+    "typecheck": {
+      "passed": true,
+      "command": "N/A — no typecheck configured for this project (GPU inference project, Python scripts only)",
+      "exitCode": 0
+    },
+    "lint": {
+      "passed": true,
+      "command": "N/A — no lint configured for this project",
+      "exitCode": 0
+    }
+  },
+  "reviewsSummary": {
+    "total": 2,
+    "passed": 2,
+    "failed": 0,
+    "failedFeatures": []
+  },
+  "blockingIssues": [],
+  "appliedUpdates": [],
+  "suggestedGuidanceUpdates": [
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add note: When building the C dispatch plan (_build_c_dispatch_plan), the pack_kernel_spec() helper was defined but never used because the implementation was refactored mid-development to use ctypes Structure classes. Workers should clean up dead code helpers before committing. The unused function is harmless but adds noise.",
+      "evidence": "c-dispatch-extension review found an unused pack_kernel_spec() helper in tp_engine.py that was never called after the implementation was refactored to use ctypes Structures.",
+      "isSystemic": false
+    },
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add note: For GPU throughput benchmarks, performance thresholds in test suites should be hard FAILs (not soft WARNs) when they represent mission-critical requirements. The benchmark check in test_c_dispatch_e2e.py uses 'WARN' rather than 'FAIL' when C dispatch doesn't exceed the 25.5 tok/s baseline, meaning a performance regression would not cause the test to exit with code 1. For this project, throughput is a hard requirement.",
+      "evidence": "c-dispatch-integration review: test_c_dispatch_e2e.py test_benchmark() uses 'WARN' not 'FAIL' for the above-baseline check. In practice the benchmark passed (35.2 tok/s > 25.5), but the soft-fail would mask regressions.",
+      "isSystemic": false
+    }
+  ],
+  "rejectedObservations": [
+    {
+      "observation": "C dispatch uses NULL stream for kernel launches, skipping the Q/KV stream concurrency optimization from the original Python cached+stream path",
+      "reason": "This is a performance opportunity (not a bug). The C dispatch still achieves 1.2-1.4x speedup over cached+stream overall by eliminating Python dispatch overhead. Implementing Q/KV stream concurrency in C would require more complex stream management and is out of scope for this milestone."
+    },
+    {
+      "observation": "model loading twice in test_c_dispatch_e2e.py adds ~100s test time",
+      "reason": "This is a test performance issue, not a correctness or production concern. The test is run manually on the GPU server. The extra load time is acceptable."
+    }
+  ],
+  "previousRound": null,
+  "featureResults": [
+    {
+      "featureId": "c-dispatch-extension",
+      "commitId": "925f3fc",
+      "status": "pass",
+      "keyMetrics": {
+        "compilationStatus": "SUCCESS",
+        "correctnessMinCosineSim": 0.999972,
+        "correctnessThreshold": 0.99,
+        "benchmarkCDispatch": "31.1 tok/s",
+        "benchmarkCachedStream": "24.6 tok/s",
+        "speedup": "1.27x",
+        "positionParamsCorrect": true,
+        "singleGPURegression": "20.8 tok/s (within ±10% of 20.3 baseline)"
+      }
+    },
+    {
+      "featureId": "c-dispatch-integration",
+      "commitId": "9991db8",
+      "status": "pass",
+      "keyMetrics": {
+        "e2eCorrectnessCDispatchVsSingleGPU": "0.999987 min cosine sim (PASS)",
+        "benchmarkCDispatch": "35.2 tok/s",
+        "benchmarkCachedStream": "29.5 tok/s",
+        "speedup": "1.19x",
+        "aboveTP4Baseline": true,
+        "singleGPURegression": "20.7 tok/s (PASS)",
+        "fallbackModeSelection": "PASS",
+        "fallbackCorrectness": "min cosine sim 0.999988 (PASS)"
+      }
+    }
+  ]
+}

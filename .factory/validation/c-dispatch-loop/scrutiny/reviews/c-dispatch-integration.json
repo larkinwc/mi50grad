@@ -1,0 +1,48 @@
+{
+  "featureId": "c-dispatch-integration",
+  "milestone": "c-dispatch-loop",
+  "reviewedAt": "2026-03-15T05:25:00Z",
+  "status": "pass",
+  "issues": [
+    {
+      "severity": "non_blocking",
+      "description": "The feature description says it adds _decode_step_c_dispatch(), set_c_dispatch(), and build_c_dispatch_plan() to TPInferenceEngine, and updates decode_step() dispatch priority. However, all of this was already implemented in the prior c-dispatch-extension feature (commit 925f3fc). This feature only added tests/test_c_dispatch_e2e.py. This is not a code issue — the implementation is complete and correct — but the feature split may cause confusion in the history.",
+      "location": "features.json — feature description vs what was actually committed in 9991db8"
+    },
+    {
+      "severity": "suggestion",
+      "description": "test_c_dispatch_e2e.py Test 2 (benchmark) marks 'WARN' (not FAIL) if C dispatch doesn't exceed 25.5 tok/s baseline. The note in the test says this 'may be expected if allreduce dominates dispatch overhead'. In the actual run, C dispatch achieved 35.2 tok/s, well above baseline. However, the soft-fail behavior on the benchmark check means a regression (C dispatch slower than 25.5 tok/s baseline) would be reported only as a WARNING, not a test failure. Given the mission's performance requirements, consider making this a hard FAIL threshold.",
+      "location": "tests/test_c_dispatch_e2e.py:test_benchmark() — above_baseline check"
+    },
+    {
+      "severity": "suggestion",
+      "description": "test_c_dispatch_e2e.py loads the single-GPU engine twice: once in Phase 1 (for reference outputs, collecting 10 outputs) and once in Test 3 (regression check). The model takes ~100s to load each time. These could be combined into one load to save test time (~100s), though correctness is unaffected.",
+      "location": "tests/test_c_dispatch_e2e.py:main() — two separate load_single_engine() calls"
+    }
+  ],
+  "validationAssertions": {
+    "VAL-CDISPATCH-003": {
+      "status": "pass",
+      "evidence": "Test 1: C dispatch vs single-GPU reference, min cosine sim 0.999987 for all 10 steps >= 0.99 threshold"
+    },
+    "VAL-CDISPATCH-004": {
+      "status": "pass",
+      "evidence": "Test 2: C dispatch 35.2 tok/s vs cached+stream 29.5 tok/s (1.19x speedup). C dispatch 35.2 tok/s > 25.5 tok/s baseline."
+    },
+    "VAL-CDISPATCH-007": {
+      "status": "pass",
+      "evidence": "Test 3: Single-GPU 20.7 tok/s, within allowed range 18.3-22.3 tok/s (±10% of 20.3 baseline)"
+    },
+    "VAL-CROSS-003": {
+      "status": "pass",
+      "evidence": "Test 4: with set_c_dispatch(False), _c_dispatch_enabled=False, cached+stream correctly selected (cached=True, stream_overlap=True, p2p_ar available). Cosine sim vs C dispatch: min 0.999988, all 5 steps pass."
+    }
+  },
+  "sharedStateObservations": [
+    {
+      "target": "library",
+      "observation": "C dispatch achieves ~35 tok/s (1.2-1.4x over cached+stream ~25-30 tok/s) on TP=4 Qwen3.5-27B-GPTQ-Int4 gfx906. The speedup varies run-to-run (1.19x-1.37x observed) due to ROCm JIT timing and PCIe congestion. This is consistent with the ~14ms Python dispatch overhead being eliminated by the C loop."
+    }
+  ],
+  "summary": "c-dispatch-integration correctly adds e2e test coverage for the C dispatch loop. The test suite covers all 4 required validation assertions (VAL-CDISPATCH-003, -004, -007, VAL-CROSS-003). All tests passed in this validation run: C dispatch 35.2 tok/s vs baseline 25.5 tok/s (+38%), correctness cosine sim 0.999987, single-GPU 20.7 tok/s (no regression), fallback path correct. Minor: benchmark failure is soft-WARN rather than hard-FAIL; model is loaded twice adding ~100s test time."
+}
