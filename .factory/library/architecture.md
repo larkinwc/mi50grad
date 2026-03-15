@@ -744,4 +744,50 @@ Set `engine.set_threaded_dispatch(True/False)` to toggle. Performance is slightl
 **Recommendation for future workers**: Do NOT use Python threading for GPU kernel dispatch. 
 Focus on reducing Python overhead per launch or using HIP stream-based async operations.
 
+---
+
+## Parameter Pre-Caching (Cached Dispatch) — threaded-kernel-dispatch milestone, 2026-03-14
+
+**Key finding**: Python ctypes parameter construction is the dominant bottleneck for kernel launch overhead.
+
+**Root cause**: Each kernel launch in `_decode_step_serial` creates new ctypes.c_uint64/c_uint32 objects and a new `(ctypes.c_void_p * n)()` C array. This takes ~21μs per launch (measured). With ~2560 launches for TP=4 decode (10 kernels/layer × 64 layers × 4 GPUs), this adds ~54ms of Python overhead per decode step.
+
+**Solution**: `LaunchSpec` class in `src/runtime/hip_dispatch.py`:
+- Pre-builds ctypes param objects and params_array once at init
+- Mutable params (RoPE cos/sin ptrs, attention seq_len) updated in-place via `spec.params[i].value = new_val`
+- `hip_runtime.launch_spec(spec)` calls `hipModuleLaunchKernel` directly with pre-built array
+- Per-launch overhead: ~0.12μs (184x reduction vs uncached ~21μs)
+
+**API**:
+```python
+# Build cache after loading all weights:
+engine.build_dispatch_cache()
+# Enable cached dispatch:
+engine.set_cached_dispatch(True)
+# This calls _decode_step_cached() which uses LaunchSpec objects
+```
+
+**Performance results (TP=4, Qwen3.5-27B-GPTQ-Int4, 100 decode steps)**:
+- Serial (uncached): 11.4 tok/s (87.6 ms/tok) — baseline
+- Cached dispatch: 23.4 tok/s (42.6 ms/tok) — **2.05x speedup**
+- Threaded: 6.9 tok/s (144.1 ms/tok) — **0.61x, SLOWER** (confirmed counter-productive)
+
+**Why cached dispatch doesn't achieve full theoretical gain**:
+- Theoretical: save ~54ms → reduce from 88ms to 34ms → 2.6x speedup
+- Actual: 42.6ms remaining latency (vs theoretical 34ms)
+- Remaining overhead: Python loop over 64 layers × 4 GPUs, plus allreduce (28ms/tok)
+- The allreduce (28ms/tok) now dominates: 66.1% of total time with cached dispatch
+
+**Next bottleneck for future workers (stream-compute-overlap)**:
+- Allreduce 28ms/tok dominates after cached dispatch reduces compute overhead to 14ms/tok
+- Solution: Replace hipDeviceSynchronize with HIP events (stream-based sync) to allow
+  allreduce to overlap with next-layer compute
+- Target: replace `P2PAllreduce.allreduce_residual()` synchronous `hipDeviceSynchronize()`
+  with `hipEventRecord + hipStreamWaitEvent` for non-blocking pipeline
+
+**Key implementation files**:
+- `src/runtime/hip_dispatch.py`: `LaunchSpec` class + `HIPRuntime.launch_spec()` + `GPUDevice.launch_cached()`
+- `src/inference/engine.py`: `InferenceEngine.build_decode_launch_cache()` → builds per-layer `LaunchSpec` dict
+- `src/inference/tp_engine.py`: `TPInferenceEngine.build_dispatch_cache()`, `set_cached_dispatch()`, `_decode_step_cached()`
+
 

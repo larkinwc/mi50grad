@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Threaded dispatch correctness and performance test.
+Dispatch optimization correctness and performance test.
 
 Tests:
-1. Correctness: threaded dispatch output == serial dispatch output (cosine sim > 0.999)
-2. Performance: threaded dispatch is faster than serial dispatch
+1. Correctness: cached dispatch output == serial dispatch output (cosine sim > 0.999)
+2. Performance: cached dispatch is faster than serial dispatch
 3. Reports speedup ratio
+
+NOTE: Python threading for GPU dispatch is counter-productive (see architecture.md).
+      hipDeviceSynchronize takes ~0.6μs on idle GPU; hipModuleLaunchKernel is async,
+      so threading adds 490μs/round overhead × 128 rounds = 63ms penalty per step.
+      The optimized path is CACHED dispatch (pre-built ctypes parameter arrays).
 
 USAGE:
     # Stop vLLM first:
@@ -58,11 +63,22 @@ def reset_engine(engine: TPInferenceEngine):
 
 
 def bench_mode(engine: TPInferenceEngine, emb: np.ndarray,
-               threaded: bool, label: str, steps: int = BENCH_STEPS):
-    """Run decode steps in specified mode, return (outputs, tok_per_sec, mean_ms)."""
-    print(f"\n[{label}] Warming up {WARMUP_STEPS} steps (threaded={threaded})...")
+               mode: str, label: str, steps: int = BENCH_STEPS):
+    """Run decode steps in specified mode, return (outputs, tok_per_sec, mean_ms).
+
+    mode: 'serial' or 'cached'
+    """
+    print(f"\n[{label}] Warming up {WARMUP_STEPS} steps (mode={mode})...")
     reset_engine(engine)
-    engine.set_threaded_dispatch(threaded)
+
+    if mode == 'serial':
+        engine.set_cached_dispatch(False)
+        engine.set_threaded_dispatch(False)
+    elif mode == 'cached':
+        engine.set_cached_dispatch(True)
+        engine.set_threaded_dispatch(False)
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
 
     for i in range(WARMUP_STEPS):
         engine.decode_step(emb, i)
@@ -90,20 +106,23 @@ def bench_mode(engine: TPInferenceEngine, emb: np.ndarray,
 
 def main():
     print("=" * 70)
-    print("Threaded Dispatch Correctness and Performance Test")
+    print("Dispatch Optimization: Correctness and Performance Test")
     print("=" * 70)
     print(f"Model:        {MODEL_DIR}")
     print(f"GPUs:         {DEVICE_IDS}")
     print(f"Warmup steps: {WARMUP_STEPS}")
     print(f"Bench steps:  {BENCH_STEPS}")
     print(f"Cosine sim threshold: {COSINE_SIM_THRESHOLD}")
+    print()
+    print("Testing CACHED dispatch (pre-built ctypes parameter arrays)")
+    print("vs SERIAL dispatch (rebuilds ctypes params each launch)")
 
     # Verify GPU count
     from src.runtime.hip_dispatch import HIPRuntime
     hip = HIPRuntime()
     hip.init()
     n_gpus = hip.device_count()
-    print(f"GPUs visible: {n_gpus}")
+    print(f"\nGPUs visible: {n_gpus}")
     if n_gpus < 4:
         print(f"ERROR: Need 4 GPUs, only {n_gpus} visible.")
         print("Make sure to use: -e HIP_VISIBLE_DEVICES=0,1,2,3")
@@ -130,21 +149,25 @@ def main():
     t_load_elapsed = time.perf_counter() - t_load
     print(f"Weights loaded in {t_load_elapsed:.1f}s")
 
+    # Build dispatch cache
+    print("\nBuilding dispatch cache...")
+    engine.build_dispatch_cache()
+
     # Fixed input for reproducibility
     np.random.seed(42)
     emb = np.random.randn(config.hidden_size).astype(np.float16)
 
     # --- Serial benchmark ---
     serial_outputs, serial_tps, serial_mean_ms = bench_mode(
-        engine, emb, threaded=False, label="SERIAL")
+        engine, emb, mode='serial', label="SERIAL")
 
-    # --- Threaded benchmark ---
-    threaded_outputs, threaded_tps, threaded_mean_ms = bench_mode(
-        engine, emb, threaded=True, label="THREADED")
+    # --- Cached dispatch benchmark ---
+    cached_outputs, cached_tps, cached_mean_ms = bench_mode(
+        engine, emb, mode='cached', label="CACHED")
 
     # --- Correctness comparison ---
     print("\n" + "=" * 70)
-    print("CORRECTNESS: THREADED vs SERIAL")
+    print("CORRECTNESS: CACHED vs SERIAL")
     print("=" * 70)
     print(f"{'Step':>4}  {'Cosine Sim':>12}  {'Status':>10}  {'Max|diff|':>12}")
     print("-" * 54)
@@ -154,14 +177,14 @@ def main():
 
     for step in range(BENCH_STEPS):
         ref = serial_outputs[step]
-        thr = threaded_outputs[step]
-        cos_sim = cosine_similarity(ref, thr)
+        cached = cached_outputs[step]
+        cos_sim = cosine_similarity(ref, cached)
         if np.isnan(cos_sim):
             max_diff = float('nan')
             status = "FAIL(NaN)"
             all_pass = False
         else:
-            max_diff = float(np.max(np.abs(ref.astype(np.float32) - thr.astype(np.float32))))
+            max_diff = float(np.max(np.abs(ref.astype(np.float32) - cached.astype(np.float32))))
             if cos_sim >= COSINE_SIM_THRESHOLD:
                 status = "PASS"
             else:
@@ -178,12 +201,12 @@ def main():
     print(f"Threshold: {COSINE_SIM_THRESHOLD}")
 
     # --- Performance summary ---
-    speedup = serial_mean_ms / threaded_mean_ms if threaded_mean_ms > 0 else float('nan')
+    speedup = serial_mean_ms / cached_mean_ms if cached_mean_ms > 0 else float('nan')
     print("\n" + "=" * 70)
     print("PERFORMANCE SUMMARY")
     print("=" * 70)
     print(f"  Serial dispatch:   {serial_tps:.2f} tok/s  ({serial_mean_ms:.2f} ms/tok)")
-    print(f"  Threaded dispatch: {threaded_tps:.2f} tok/s  ({threaded_mean_ms:.2f} ms/tok)")
+    print(f"  Cached dispatch:   {cached_tps:.2f} tok/s  ({cached_mean_ms:.2f} ms/tok)")
     print(f"  Speedup:           {speedup:.3f}x")
     print()
     print("BASELINES FOR COMPARISON:")
@@ -198,13 +221,13 @@ def main():
     if correctness_ok and speedup_ok:
         print(f"RESULT: PASS")
         print(f"  Correctness: cosine sim >= {COSINE_SIM_THRESHOLD} for all steps ✓")
-        print(f"  Performance: threaded {speedup:.3f}x faster than serial ✓")
+        print(f"  Performance: cached {speedup:.3f}x faster than serial ✓")
     else:
         print(f"RESULT: FAIL")
         if not correctness_ok:
             print(f"  FAIL: Correctness — some steps have cosine sim < {COSINE_SIM_THRESHOLD}")
         if not speedup_ok:
-            print(f"  FAIL: Performance — threaded not faster than serial ({speedup:.3f}x)")
+            print(f"  FAIL: Performance — cached not faster than serial ({speedup:.3f}x)")
     print("=" * 70)
 
     engine.cleanup()

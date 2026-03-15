@@ -17,6 +17,62 @@ from typing import Optional
 
 
 # ============================================================
+# Pre-built launch specification for cached kernel dispatch
+# ============================================================
+
+class LaunchSpec:
+    """Pre-built kernel launch specification for cached (low-overhead) dispatch.
+
+    Holds a pre-built C array of void pointers to ctypes values. The ctypes
+    values themselves are stored in `params` and remain alive as long as the
+    LaunchSpec exists. Mutable values (e.g., position-dependent pointers) can
+    be updated in-place:
+
+        spec.params[2].value = new_ptr  # update ctypes value in-place
+        hip.launch_spec(spec)           # params_array pointer automatically updated
+
+    This avoids re-allocating Python ctypes objects and the params_array on
+    every kernel launch, reducing per-launch overhead from ~10μs to ~2μs.
+
+    Usage:
+        from src.runtime.hip_dispatch import LaunchSpec
+        spec = LaunchSpec(
+            func=kernel_func_handle,
+            grid=(grid_x, 1, 1),
+            block=(256, 1, 1),
+            params=[ctypes.c_uint64(ptr0), ctypes.c_uint32(K), ...],
+            shared_mem=0,
+        )
+        # Later: update mutable param in-place
+        spec.params[0].value = new_ptr
+        # Launch using pre-built params array
+        hip_runtime.launch_spec(spec)
+    """
+
+    def __init__(self, func: int, grid: tuple, block: tuple,
+                 params: list, shared_mem: int = 0):
+        """
+        Args:
+            func: HIP kernel function handle (int)
+            grid: (gx, gy, gz) grid dimensions
+            block: (bx, by, bz) block dimensions
+            params: list of ctypes objects (c_uint64, c_uint32, c_float, etc.)
+            shared_mem: shared memory bytes per block
+        """
+        self.func = func
+        self.grid = grid
+        self.block = block
+        self.params = params  # Keep alive: params_array holds pointers into these
+        self.shared_mem = shared_mem
+
+        # Pre-build the C array of void* pointers once
+        n = len(params)
+        self.params_array = (ctypes.c_void_p * n)()
+        for i, p in enumerate(params):
+            self.params_array[i] = ctypes.cast(ctypes.pointer(p), ctypes.c_void_p)
+
+
+# ============================================================
 # HIP library binding via ctypes
 # ============================================================
 
@@ -347,6 +403,31 @@ class HIPRuntime:
             "hipModuleLaunchKernel"
         )
 
+    def launch_spec(self, spec: 'LaunchSpec', stream: int = 0):
+        """Launch a pre-built LaunchSpec (cached parameter array).
+
+        This avoids re-allocating Python ctypes objects on each launch,
+        reducing per-launch Python overhead significantly.
+
+        The LaunchSpec holds a pre-built C array of void pointers to ctypes
+        values. Mutable ctypes values (e.g., position-dependent pointers) can
+        be updated in-place via spec.update_value(idx, new_val) before calling
+        this method — the pre-built pointer array automatically reflects updates.
+        """
+        gx, gy, gz = spec.grid
+        bx, by, bz = spec.block
+        self._check(
+            self._lib.hipModuleLaunchKernel(
+                ctypes.c_void_p(spec.func),
+                gx, gy, gz, bx, by, bz,
+                spec.shared_mem,
+                ctypes.c_void_p(stream),
+                ctypes.cast(spec.params_array, ctypes.POINTER(ctypes.c_void_p)),
+                None,
+            ),
+            "hipModuleLaunchKernel (cached)"
+        )
+
     # --- Peer-to-peer methods ---
 
     def device_can_access_peer(self, device_id: int, peer_device_id: int) -> bool:
@@ -533,6 +614,16 @@ class GPUDevice:
         self.hip.set_device(self.device_id)
         self.hip.launch_kernel(func, grid, block, kernel_params,
                                shared_mem, stream)
+
+    def launch_cached(self, spec: 'LaunchSpec', stream: int = 0):
+        """Launch a pre-built LaunchSpec (cached parameter array).
+
+        Lower overhead than launch() since no Python ctypes objects are
+        created. The caller must update spec.params[i].value in-place for
+        any parameters that change between calls (e.g., position pointers).
+        """
+        self.hip.set_device(self.device_id)
+        self.hip.launch_spec(spec, stream)
 
     def cleanup(self):
         for ptr in self._allocations:

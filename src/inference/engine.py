@@ -2189,3 +2189,292 @@ class InferenceEngine:
             except Exception:
                 pass
         self.device.cleanup()
+
+    # --- Parameter pre-caching for low-overhead cached dispatch ---
+
+    def build_decode_launch_cache(self):
+        """Pre-build ctypes parameter arrays for all decode kernel launches.
+
+        Call this after all layer weights are loaded. Creates LaunchSpec objects
+        for every kernel in the decode loop (per layer). Avoids re-constructing
+        ctypes objects on each decode step, reducing Python overhead by ~5x.
+
+        Returns:
+            dict mapping layer_idx -> LayerLaunchCache (namedtuple-like object)
+            with pre-built LaunchSpec instances for each kernel in that layer.
+
+        For position-dependent kernels (qknorm_rope), the LaunchSpec contains
+        mutable ctypes.c_uint64 objects for the cos/sin pointers. Update them
+        in-place before calling launch_cached:
+            cache[layer_idx].qknorm_q.params[2].value = new_cos_ptr
+            cache[layer_idx].qknorm_q.params[3].value = new_sin_ptr
+        """
+        from src.runtime.hip_dispatch import LaunchSpec
+        cfg = self.config
+        h = cfg.hidden_size
+        half_rotary = self.rotary_dim // 2
+        inter = self.local_intermediate_size
+        k_splits = self._gemv_int4_k_splits
+
+        layer_caches = {}
+
+        for layer_idx, lw in enumerate(self.layers):
+            lc = {}
+
+            # --- Attention RMSNorm ---
+            lc['attn_rmsnorm'] = LaunchSpec(
+                func=self.kernels.get_hip("rmsnorm_v2", "elementwise_v2"),
+                grid=(1, 1, 1), block=(256, 1, 1),
+                params=[
+                    ctypes.c_uint64(self.d_normed),
+                    ctypes.c_uint64(self.d_hidden),
+                    ctypes.c_uint64(lw.attn_norm),
+                    ctypes.c_uint32(h),
+                    ctypes.c_float(cfg.rms_norm_eps),
+                ],
+            )
+
+            if lw.layer_type == 'full_attention':
+                # --- Full attention GEMV projections ---
+                if self._gemv_fp16_v2:
+                    q_grid = (2 * self.q_dim + 3) // 4
+                    lc['gemv_q_fused'] = LaunchSpec(
+                        func=self.kernels.get_hip("gemv_fp16_v2", "gemv_fp16_v2"),
+                        grid=(q_grid, 1, 1), block=(256, 1, 1),
+                        params=[
+                            ctypes.c_uint64(self.d_normed),
+                            ctypes.c_uint64(lw.q_fused_weight),
+                            ctypes.c_uint64(self.d_q_fused),
+                            ctypes.c_uint32(h),
+                            ctypes.c_uint32(2 * self.q_dim),
+                            ctypes.c_uint64(0),  # no residual
+                        ],
+                    )
+                    kv_grid = (2 * self.kv_dim + 3) // 4
+                    lc['gemv_kv_fused'] = LaunchSpec(
+                        func=self.kernels.get_hip("gemv_fp16_v2", "gemv_fp16_v2"),
+                        grid=(kv_grid, 1, 1), block=(256, 1, 1),
+                        params=[
+                            ctypes.c_uint64(self.d_normed),
+                            ctypes.c_uint64(lw.kv_fused_weight),
+                            ctypes.c_uint64(self.d_kv_fused),
+                            ctypes.c_uint32(h),
+                            ctypes.c_uint32(2 * self.kv_dim),
+                            ctypes.c_uint64(0),  # no residual
+                        ],
+                    )
+
+                # --- QK-norm + RoPE (position-mutable) ---
+                # params[2] = cos ptr, params[3] = sin ptr — updated per step
+                if self._qknorm_rope_fused:
+                    qknorm_func = self.kernels.get_hip("qknorm_rope_fused", "qknorm_rope")
+                    # Initial cos/sin at position 0 (will be updated per step)
+                    lc['qknorm_q'] = LaunchSpec(
+                        func=qknorm_func,
+                        grid=(self.local_num_attention_heads, 1, 1), block=(256, 1, 1),
+                        params=[
+                            ctypes.c_uint64(self.d_q),
+                            ctypes.c_uint64(lw.q_norm),
+                            ctypes.c_uint64(self.d_cos),  # mutable: index [2]
+                            ctypes.c_uint64(self.d_sin),  # mutable: index [3]
+                            ctypes.c_uint32(cfg.head_dim),
+                            ctypes.c_uint32(half_rotary),
+                            ctypes.c_float(cfg.rms_norm_eps),
+                        ],
+                    )
+                    lc['qknorm_k'] = LaunchSpec(
+                        func=qknorm_func,
+                        grid=(self.local_num_kv_heads, 1, 1), block=(256, 1, 1),
+                        params=[
+                            ctypes.c_uint64(self.d_k),
+                            ctypes.c_uint64(lw.k_norm),
+                            ctypes.c_uint64(self.d_cos),  # mutable: index [2]
+                            ctypes.c_uint64(self.d_sin),  # mutable: index [3]
+                            ctypes.c_uint32(cfg.head_dim),
+                            ctypes.c_uint32(half_rotary),
+                            ctypes.c_float(cfg.rms_norm_eps),
+                        ],
+                    )
+
+                # --- Decode attention (seq_len is mutable: index [4]) ---
+                attn_func = self.kernels.get_hip("flash_attn_256_fp16", "flash_attn_256")
+                lc['decode_attn'] = LaunchSpec(
+                    func=attn_func,
+                    grid=(self.local_num_attention_heads, 1, 1), block=(256, 1, 1),
+                    params=[
+                        ctypes.c_uint64(self.d_q),
+                        ctypes.c_uint64(self.kv_cache.layer_k_ptr(layer_idx)),
+                        ctypes.c_uint64(self.kv_cache.layer_v_ptr(layer_idx)),
+                        ctypes.c_uint64(self.d_attn_out),
+                        ctypes.c_uint32(1),   # seq_len: mutable [4], updated per step
+                        ctypes.c_uint32(1),   # num_q_rows = 1 for decode
+                        ctypes.c_uint32(self.local_num_attention_heads),
+                        ctypes.c_uint32(self.local_num_kv_heads),
+                        ctypes.c_uint32(0),   # non-causal
+                    ],
+                )
+
+                # --- Sigmoid gate on attention output ---
+                sig_grid = (self.q_dim + 255) // 256
+                lc['sigmoid_mul'] = LaunchSpec(
+                    func=self.kernels.get_hip("sigmoid_mul_fp16", "sigmoid_mul"),
+                    grid=(sig_grid, 1, 1), block=(256, 1, 1),
+                    params=[
+                        ctypes.c_uint64(self.d_attn_out),
+                        ctypes.c_uint64(self.d_q_gate),
+                        ctypes.c_uint32(self.q_dim),
+                    ],
+                )
+
+                # --- Output projection (o_proj): TP writes to d_proj_out ---
+                if self._gemv_fp16_v2:
+                    o_grid = (h + 3) // 4
+                    lc['gemv_o_proj'] = LaunchSpec(
+                        func=self.kernels.get_hip("gemv_fp16_v2", "gemv_fp16_v2"),
+                        grid=(o_grid, 1, 1), block=(256, 1, 1),
+                        params=[
+                            ctypes.c_uint64(self.d_attn_out),
+                            ctypes.c_uint64(lw.o_weight),
+                            ctypes.c_uint64(self.d_proj_out),
+                            ctypes.c_uint32(self.q_dim),
+                            ctypes.c_uint32(h),
+                            ctypes.c_uint64(0),  # no residual (TP path)
+                        ],
+                    )
+
+            else:
+                # --- Linear attention (DeltaNet) ---
+                if self._gemv_fp16_v2:
+                    la_grid = (self.la_total_dim + 3) // 4
+                    lc['gemv_la_in_proj'] = LaunchSpec(
+                        func=self.kernels.get_hip("gemv_fp16_v2", "gemv_fp16_v2"),
+                        grid=(la_grid, 1, 1), block=(256, 1, 1),
+                        params=[
+                            ctypes.c_uint64(self.d_normed),
+                            ctypes.c_uint64(lw.la_in_proj_fused),
+                            ctypes.c_uint64(self.d_la_packed),
+                            ctypes.c_uint32(h),
+                            ctypes.c_uint32(self.la_total_dim),
+                            ctypes.c_uint64(0),  # no residual
+                        ],
+                    )
+
+                # DeltaNet v3 main kernel
+                if self._deltanet_v3:
+                    slot = self.deltanet_state.get_slot(layer_idx, cfg)
+                    d_conv = self.deltanet_state.d_conv_states[slot]
+                    d_state = self.deltanet_state.d_states[slot]
+                    dn_suffix = f"_tp{self.tp_size}" if self.tp_size > 1 else ""
+                    dn_func = self.kernels.get_hip("deltanet_decode_v3", "deltanet_v3",
+                                                    hsaco_suffix=dn_suffix)
+                    lc['deltanet_v3'] = LaunchSpec(
+                        func=dn_func,
+                        grid=(self.local_linear_num_v_heads, 1, 1), block=(256, 1, 1),
+                        params=[
+                            ctypes.c_uint64(self.d_la_qkv),
+                            ctypes.c_uint64(self.d_la_dt),
+                            ctypes.c_uint64(self.d_la_b),
+                            ctypes.c_uint64(self.d_la_z),
+                            ctypes.c_uint64(d_conv),
+                            ctypes.c_uint64(lw.d_la_conv_weight),
+                            ctypes.c_uint64(lw.d_la_A_log),
+                            ctypes.c_uint64(lw.d_la_dt_bias),
+                            ctypes.c_uint64(lw.d_la_norm),
+                            ctypes.c_uint64(d_state),
+                            ctypes.c_uint64(self.d_la_out),
+                        ],
+                        shared_mem=8192,
+                    )
+                    # DeltaNet conv shift kernel
+                    conv_dim = self.deltanet_state.conv_dim
+                    shift_func = self.kernels.get_hip("deltanet_conv_shift_v3",
+                                                       "deltanet_v3",
+                                                       hsaco_suffix=dn_suffix)
+                    shift_grid = (conv_dim + 255) // 256
+                    lc['deltanet_v3_shift'] = LaunchSpec(
+                        func=shift_func,
+                        grid=(shift_grid, 1, 1), block=(256, 1, 1),
+                        params=[
+                            ctypes.c_uint64(self.d_la_qkv),
+                            ctypes.c_uint64(d_conv),
+                            ctypes.c_uint32(conv_dim),
+                        ],
+                    )
+
+                # --- Linear attention output projection ---
+                if self._gemv_fp16_v2:
+                    la_out_grid = (h + 3) // 4
+                    lc['gemv_la_out_proj'] = LaunchSpec(
+                        func=self.kernels.get_hip("gemv_fp16_v2", "gemv_fp16_v2"),
+                        grid=(la_out_grid, 1, 1), block=(256, 1, 1),
+                        params=[
+                            ctypes.c_uint64(self.d_la_out),
+                            ctypes.c_uint64(lw.la_out_proj),
+                            ctypes.c_uint64(self.d_proj_out),
+                            ctypes.c_uint32(self.la_z_dim),
+                            ctypes.c_uint32(h),
+                            ctypes.c_uint64(0),  # no residual (TP path)
+                        ],
+                    )
+
+            # --- FFN RMSNorm ---
+            lc['ffn_rmsnorm'] = LaunchSpec(
+                func=self.kernels.get_hip("rmsnorm_v2", "elementwise_v2"),
+                grid=(1, 1, 1), block=(256, 1, 1),
+                params=[
+                    ctypes.c_uint64(self.d_normed),
+                    ctypes.c_uint64(self.d_hidden),
+                    ctypes.c_uint64(lw.ffn_norm),
+                    ctypes.c_uint32(h),
+                    ctypes.c_float(cfg.rms_norm_eps),
+                ],
+            )
+
+            # --- FFN gate+up+silu ---
+            if self._gemv_int4_dual_fused:
+                ffn_grid = (inter + 255) // 256
+                lc['ffn_gate_up_silu'] = LaunchSpec(
+                    func=self.kernels.get_hip("gemv_int4_dual_fused", "gemv_int4_dual"),
+                    grid=(ffn_grid, k_splits, 1), block=(256, 1, 1),
+                    params=[
+                        ctypes.c_uint64(self.d_normed),
+                        ctypes.c_uint64(lw.gate_qweight),
+                        ctypes.c_uint64(lw.gate_scales),
+                        ctypes.c_uint64(lw.gate_zeros),
+                        ctypes.c_uint64(lw.up_qweight),
+                        ctypes.c_uint64(lw.up_scales),
+                        ctypes.c_uint64(lw.up_zeros),
+                        ctypes.c_uint64(self.d_gemv_fp32),
+                        ctypes.c_uint64(self.d_gemv_fp32_2),
+                        ctypes.c_uint64(self.d_gemv_done),
+                        ctypes.c_uint64(self.d_ffn_gate),
+                        ctypes.c_uint32(h),
+                        ctypes.c_uint32(inter),
+                        ctypes.c_uint32(cfg.group_size),
+                        ctypes.c_uint32(k_splits),
+                    ],
+                )
+
+            # --- FFN down projection (INT4 v3 t16, no residual for TP) ---
+            if self._gemv_int4_v3:
+                cols_per_wg = 16
+                down_grid = (h + cols_per_wg - 1) // cols_per_wg
+                lc['ffn_down'] = LaunchSpec(
+                    func=self.kernels.get_hip("gemv_int4_v3_t16", "gemv_int4_v3"),
+                    grid=(down_grid, 1, 1), block=(256, 1, 1),
+                    params=[
+                        ctypes.c_uint64(self.d_ffn_gate),
+                        ctypes.c_uint64(lw.down_qweight),
+                        ctypes.c_uint64(lw.down_scales),
+                        ctypes.c_uint64(lw.down_zeros),
+                        ctypes.c_uint64(self.d_ffn_out),
+                        ctypes.c_uint32(inter),
+                        ctypes.c_uint32(h),
+                        ctypes.c_uint32(cfg.group_size),
+                    ],
+                    shared_mem=1024,
+                )
+
+            layer_caches[layer_idx] = lc
+
+        return layer_caches

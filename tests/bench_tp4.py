@@ -98,12 +98,14 @@ class AllreduceProfiler:
 # Main benchmark
 # ---------------------------------------------------------------------------
 
-def run_benchmark(engine, emb, warmup_steps, bench_steps, threaded: bool, label: str):
-    """Run a benchmark with the given mode (serial or threaded).
+def run_benchmark(engine, emb, warmup_steps, bench_steps, threaded: bool, label: str,
+                  cached: bool = False):
+    """Run a benchmark with the given mode (serial, threaded, or cached).
 
     Returns (tok_per_sec, ms_per_tok, mean_ar_ms, mean_compute_ms).
     """
     engine.set_threaded_dispatch(threaded)
+    engine.set_cached_dispatch(cached)
 
     profiler = AllreduceProfiler(engine)
     profiler.install()
@@ -148,7 +150,7 @@ def run_benchmark(engine, emb, warmup_steps, bench_steps, threaded: bool, label:
 
 def main():
     print("=" * 70)
-    print("TP=4 Decode Benchmark — P2P Allreduce + Threaded Dispatch")
+    print("TP=4 Decode Benchmark — P2P Allreduce + Cached Dispatch")
     print("=" * 70)
     print(f"Model:        {MODEL_DIR}")
     print(f"GPUs:         {DEVICE_IDS}")
@@ -192,49 +194,66 @@ def main():
     t_load_elapsed = time.perf_counter() - t_load
     print(f"Weights loaded in {t_load_elapsed:.1f}s")
 
+    # Build dispatch cache
+    print("\nBuilding dispatch cache...")
+    engine.build_dispatch_cache()
+
     # Fixed input embedding
     np.random.seed(42)
     emb = np.random.randn(config.hidden_size).astype(np.float16)
 
     # ----------- Serial benchmark -----------
     print(f"\n{'=' * 70}")
-    print("SERIAL DISPATCH (baseline)")
+    print("SERIAL DISPATCH (baseline — original ctypes construction per launch)")
     print("=" * 70)
     serial_tps, serial_ms, serial_ar_ms, serial_compute_ms = run_benchmark(
-        engine, emb, WARMUP_STEPS, BENCH_STEPS, threaded=False,
+        engine, emb, WARMUP_STEPS, BENCH_STEPS, threaded=False, cached=False,
         label="SERIAL")
 
-    # ----------- Threaded benchmark -----------
+    # ----------- Cached dispatch benchmark -----------
     print(f"\n{'=' * 70}")
-    print("THREADED DISPATCH (multi-threaded, one thread per GPU)")
+    print("CACHED DISPATCH (pre-built parameter arrays — reduced ctypes overhead)")
+    print("=" * 70)
+    cached_tps, cached_ms, cached_ar_ms, cached_compute_ms = run_benchmark(
+        engine, emb, WARMUP_STEPS, BENCH_STEPS, threaded=False, cached=True,
+        label="CACHED")
+
+    # ----------- Threaded benchmark (for reference) -----------
+    print(f"\n{'=' * 70}")
+    print("THREADED DISPATCH (reference — known to be SLOWER than serial)")
     print("=" * 70)
     threaded_tps, threaded_ms, threaded_ar_ms, threaded_compute_ms = run_benchmark(
-        engine, emb, WARMUP_STEPS, BENCH_STEPS, threaded=True,
+        engine, emb, WARMUP_STEPS, BENCH_STEPS, threaded=True, cached=False,
         label="THREADED")
 
     # ----------- Summary -----------
-    speedup = serial_ms / threaded_ms if threaded_ms > 0 else float('nan')
+    cached_speedup = serial_ms / cached_ms if cached_ms > 0 else float('nan')
+    threaded_speedup = serial_ms / threaded_ms if threaded_ms > 0 else float('nan')
 
     print()
     print("=" * 70)
     print("BENCHMARK SUMMARY")
     print("=" * 70)
-    print(f"{'Mode':<20} {'tok/s':>10} {'ms/tok':>10} {'AR ms':>10} {'Compute ms':>12}")
-    print("-" * 65)
-    print(f"{'Serial':<20} {serial_tps:>10.1f} {serial_ms:>10.1f} "
+    print(f"{'Mode':<22} {'tok/s':>10} {'ms/tok':>10} {'AR ms':>10} {'Compute ms':>12}")
+    print("-" * 68)
+    print(f"{'Serial':<22} {serial_tps:>10.1f} {serial_ms:>10.1f} "
           f"{serial_ar_ms:>10.2f} {serial_compute_ms:>12.2f}")
-    print(f"{'Threaded':<20} {threaded_tps:>10.1f} {threaded_ms:>10.1f} "
+    print(f"{'Cached':<22} {cached_tps:>10.1f} {cached_ms:>10.1f} "
+          f"{cached_ar_ms:>10.2f} {cached_compute_ms:>12.2f}")
+    print(f"{'Threaded (FYI)':<22} {threaded_tps:>10.1f} {threaded_ms:>10.1f} "
           f"{threaded_ar_ms:>10.2f} {threaded_compute_ms:>12.2f}")
-    print("-" * 65)
-    print(f"  Speedup (threaded/serial): {speedup:.3f}x")
+    print("-" * 68)
+    print(f"  Speedup (cached/serial):   {cached_speedup:.3f}x")
+    print(f"  Speedup (threaded/serial): {threaded_speedup:.3f}x")
     print()
     print("BASELINES FOR COMPARISON:")
     print(f"  Single-GPU:         20.3 tok/s  (49.3 ms/tok)")
     print(f"  vLLM TP=4:          46.9 tok/s")
     print(f"  Theoretical TP=4:  ~81.2 tok/s  (20.3 * 4)")
-    if threaded_tps > 20.3:
-        vs_single = threaded_tps / 20.3
-        print(f"  Threaded vs single: {vs_single:.2f}x")
+    best_tps = max(serial_tps, cached_tps)
+    if best_tps > 20.3:
+        vs_single = best_tps / 20.3
+        print(f"  Best mode vs single: {vs_single:.2f}x")
     print("=" * 70)
 
     # Cleanup
@@ -243,4 +262,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
