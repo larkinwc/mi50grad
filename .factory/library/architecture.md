@@ -1331,3 +1331,35 @@ This was confirmed by scrutiny validation: `test_graph_decode.py` segfaulted at 
 - `allreduce_residual_kernel()` is on `P2PAllreduce` (not a separate class)
 - `TPInferenceEngine.set_kernel_p2p_allreduce(True)` routes highest priority in `_allreduce_residual()`
 - `FusedP2PReduce` (gemv_p2p_reduce.hip) is functionally identical but in a separate class; kernel P2P allreduce is preferred for new code
+
+---
+
+## Kernel P2P TP=4 Integration (Milestone: kernel-p2p-allreduce, 2026-03-16)
+
+**Implementation:** `src/runtime/c_dispatch.c`, `src/runtime/c_dispatch_v2.c`, `src/inference/tp_engine.py` (`_build_c_dispatch_plan()`, `set_kernel_p2p_allreduce()`)
+
+**What was added:**
+- `CAllreduceSpec` in c_dispatch.c/v2 extended with `use_kernel_p2p` (uint32) and `kernel_p2p_tp4_fn` (function pointer) fields. Old `_pad` field replaced. Size: 272→280 bytes.
+- New function `do_allreduce_kernel_p2p` in c_dispatch.c: launches `kernel_p2p_allreduce_residual_tp4` on each GPU's AR stream after cross-device event synchronization.
+- `dispatch_allreduce` routes to `do_allreduce_kernel_p2p` (when `use_kernel_p2p=1`) or `do_allreduce_async` (star topology, fallback).
+- Python `_build_c_dispatch_plan()` populates `use_kernel_p2p` and `kernel_p2p_tp4_fn` when `_kernel_p2p_allreduce=True`.
+- `set_kernel_p2p_allreduce(True/False)` now auto-invalidates and rebuilds the C dispatch plan immediately (no need to manually call `_build_c_dispatch_plan()`).
+
+**C dispatch kernel P2P allreduce sync protocol (per allreduce call, TP=4):**
+1. Record compute_events[i] on null stream (reverse loop, ends on GPU0)
+2. Each GPU's AR stream waits for ALL 4 compute events (cross-device `hipStreamWaitEvent`)
+3. Launch `kernel_p2p_allreduce_residual_tp4` on each GPU's AR stream
+4. Record ar_done_events[i] on AR streams (reverse loop, ends on GPU0)
+5. `wait_for_allreduce`: each null stream waits for its ar_done_event
+
+**Performance (4×gfx906 MI50, 2026-03-16):**
+- Star topology C dispatch: 15.3 tok/s
+- Kernel P2P C dispatch: 21.1 tok/s = **1.39x speedup**
+- NOTE: Sprint 3 baseline (38.0 tok/s) was on different hardware (3×MI50 + 1×MI100). Current HW = 4×MI50 only.
+
+**Correctness (TP=4 vs single-GPU, 15 steps):**
+- Kernel P2P path: min cosine_sim = 0.9981 ≥ 0.99
+- Star topology fallback: min cosine_sim = 0.9972 ≥ 0.99
+
+**HW difference note:**
+Sprint 3 baseline (38 tok/s) was measured on 3×gfx906 + 1×gfx908 configuration. Current hardware is 4×gfx906. The gfx908 has higher compute throughput, so mixed-hardware TP=4 achieves higher tok/s. On pure 4×gfx906, baseline is ~15 tok/s (star) vs ~21 tok/s (kernel P2P).

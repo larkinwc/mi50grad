@@ -727,6 +727,17 @@ class TPInferenceEngine:
                   f"single kernel per GPU, no host round-trips)")
         else:
             print(f"Kernel P2P allreduce disabled")
+        # Invalidate C dispatch plan so it gets rebuilt with the new allreduce mode
+        # when set_c_dispatch(True) is called or _build_c_dispatch_plan() is invoked.
+        if self._c_dispatch_plan is not None:
+            self._c_dispatch_plan = None
+            if self._c_dispatch_enabled:
+                # Rebuild immediately so decode_step continues to work
+                try:
+                    self._c_dispatch_plan = self._build_c_dispatch_plan()
+                except Exception as e:
+                    print(f"WARNING: Failed to rebuild C dispatch plan after "
+                          f"set_kernel_p2p_allreduce({enabled}): {e}")
 
     def set_cached_dispatch(self, cached: bool):
         """Enable or disable cached (pre-built parameter) dispatch.
@@ -2686,7 +2697,9 @@ class TPInferenceEngine:
                 ('ar_done_events',  ct.c_uint64 * 4),
                 ('compute_streams', ct.c_uint64 * 4),
                 ('num_elems',       ct.c_uint32),
-                ('_pad',            ct.c_uint32),
+                # Kernel P2P allreduce fields (kernel-p2p-tp4-integration)
+                ('use_kernel_p2p',  ct.c_uint32),
+                ('kernel_p2p_tp4_fn', ct.c_void_p),  # kernel_p2p_tp4_fn_t function pointer
             ]
 
         class CDispatchPlan(ct.Structure):
@@ -2809,6 +2822,25 @@ class TPInferenceEngine:
         reduce_tp4 = ReduceTp4Func(
             ct.cast(p2p_lib.p2p_reduce_residual_tp4, ct.c_void_p).value)
 
+        # Get kernel P2P allreduce function pointer (if available and enabled)
+        kernel_p2p_fn_ptr = None
+        use_kernel_p2p_in_c = (
+            self._kernel_p2p_allreduce
+            and p2p_ar._kernel_p2p_lib is not None
+            and self.tp_size == 4
+        )
+        if use_kernel_p2p_in_c:
+            kernel_p2p_fn_ptr = ct.cast(
+                p2p_ar._kernel_p2p_lib.kernel_p2p_allreduce_residual_tp4,
+                ct.c_void_p
+            ).value
+            print(f"C dispatch: kernel P2P allreduce enabled "
+                  f"(fn_ptr=0x{kernel_p2p_fn_ptr:016x})")
+        else:
+            print(f"C dispatch: using star topology allreduce "
+                  f"(kernel_p2p_enabled={self._kernel_p2p_allreduce}, "
+                  f"tp_size={self.tp_size})")
+
         def fill_ar_spec(c_ar, partial_attr):
             """Fill a CAllreduceSpec for one layer."""
             c_ar.reduce_tp2 = reduce_tp2
@@ -2820,7 +2852,7 @@ class TPInferenceEngine:
                 c_ar.partial_ptrs[i]  = getattr(engine, partial_attr)
                 c_ar.hidden_ptrs[i]   = engine.d_hidden
                 c_ar.compute_streams[i] = 0  # null stream (default)
-            # Gather bufs (on GPU0, for TP>1)
+            # Gather bufs (on GPU0, for TP>1) — used by star topology path
             for i, ptr in enumerate(p2p_ar._gather_bufs):
                 c_ar.gather_bufs[i] = ptr
             # Allreduce streams and events from p2p_ar
@@ -2829,6 +2861,9 @@ class TPInferenceEngine:
                 c_ar.compute_events[i]    = p2p_ar._compute_events[i]
                 c_ar.ar_done_events[i]    = p2p_ar._ar_done_events[i]
             c_ar.num_elems = self.config.hidden_size
+            # Kernel P2P allreduce fields
+            c_ar.use_kernel_p2p = 1 if use_kernel_p2p_in_c else 0
+            c_ar.kernel_p2p_tp4_fn = kernel_p2p_fn_ptr
 
         for layer_idx in range(num_layers):
             fill_ar_spec(attn_ar_array[layer_idx], 'd_proj_out')

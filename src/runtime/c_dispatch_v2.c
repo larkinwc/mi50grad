@@ -62,6 +62,17 @@ typedef int (*hipMemcpyPeerAsync_t)(void*, int, void*, int, size_t, void*);
 typedef int (*hipMemcpyAsync_t)(void*, void*, size_t, int, void*);
 typedef int (*hipGetLastError_t)(void);
 
+/* kernel_p2p_allreduce_residual_tp4 function pointer (for kernel P2P path) */
+typedef int (*kernel_p2p_tp4_fn_t)(
+    void* hidden,
+    const void* partial_local,
+    const void* partial_peer0,
+    const void* partial_peer1,
+    const void* partial_peer2,
+    unsigned int n,
+    void* stream
+);
+
 /* ---------------------------------------------------------------------- */
 /* Data structures (identical to c_dispatch.c — binary compatible)         */
 /* ---------------------------------------------------------------------- */
@@ -125,6 +136,12 @@ typedef struct {
     uint32_t use_direct_kv_write;
 } CEngineLayerSpec;
 
+/*
+ * CAllreduceSpec: parameters for one async allreduce call.
+ *
+ * Binary-compatible with c_dispatch.c: use_kernel_p2p and kernel_p2p_tp4_fn
+ * added at the end (replaces old _pad field with use_kernel_p2p + fn ptr).
+ */
 typedef struct {
     int (*reduce_tp2)(void *hidden, void *p0, void *p1,
                       uint32_t n, void *stream);
@@ -143,7 +160,10 @@ typedef struct {
     uint64_t ar_done_events[4];
     uint64_t compute_streams[4];
     uint32_t num_elems;
-    uint32_t _pad;
+
+    /* Kernel P2P allreduce fields */
+    uint32_t use_kernel_p2p;           /* 1=use kernel P2P, 0=use star topology */
+    kernel_p2p_tp4_fn_t kernel_p2p_tp4_fn; /* ptr to kernel_p2p_allreduce_residual_tp4 */
 } CAllreduceSpec;
 
 typedef struct {
@@ -355,6 +375,92 @@ static void wait_for_allreduce(CAllreduceSpec *ar, CDispatchPlan *plan)
     }
 }
 
+/*
+ * do_allreduce_kernel_p2p_v2: kernel P2P allreduce for v2 dispatch.
+ *
+ * Replaces gather/reduce/broadcast with a single kernel launch per GPU.
+ * Each GPU's kernel reads all 4 partials (1 local + 3 remote via BAR1 P2P).
+ * Uses optimized hipSetDevice sequencing (reverse loop → end on GPU0).
+ *
+ * Supports TP=4 only. Falls back to do_allreduce_async_v2 for TP!=4.
+ */
+static int do_allreduce_kernel_p2p_v2(CAllreduceSpec *ar, CDispatchPlan *plan)
+{
+    int tp = ar->tp_size;
+    if (tp <= 1) return 0;
+
+    if (tp != 4 || ar->kernel_p2p_tp4_fn == NULL) {
+        return do_allreduce_async_v2(ar, plan);
+    }
+
+    int i, j, err;
+    uint32_t n = ar->num_elems;
+
+    /* Step 1: Record compute events — reverse loop so we end on GPU0 */
+    for (i = tp - 1; i >= 0; i--) {
+        plan->hipSetDevice_fn(ar->device_ids[i]);
+        plan->hipEventRecord_fn(
+            (void *)(uintptr_t)ar->compute_events[i],
+            (void *)(uintptr_t)ar->compute_streams[i]);
+    }
+    /* Now on GPU0 */
+
+    /* Step 2: Each GPU's AR stream waits for ALL compute events */
+    for (j = 0; j < tp; j++) {
+        plan->hipStreamWaitEvent_fn(
+            (void *)(uintptr_t)ar->allreduce_streams[0],
+            (void *)(uintptr_t)ar->compute_events[j], 0);
+    }
+    for (i = 1; i < tp; i++) {
+        plan->hipSetDevice_fn(ar->device_ids[i]);
+        for (j = 0; j < tp; j++) {
+            plan->hipStreamWaitEvent_fn(
+                (void *)(uintptr_t)ar->allreduce_streams[i],
+                (void *)(uintptr_t)ar->compute_events[j], 0);
+        }
+    }
+
+    /* Step 3: Launch kernel P2P on each GPU's AR stream */
+    for (i = 0; i < tp; i++) {
+        plan->hipSetDevice_fn(ar->device_ids[i]);
+        int p0 = (i + 1) % 4;
+        int p1 = (i + 2) % 4;
+        int p2 = (i + 3) % 4;
+        err = ar->kernel_p2p_tp4_fn(
+            (void *)(uintptr_t)ar->hidden_ptrs[i],
+            (const void *)(uintptr_t)ar->partial_ptrs[i],
+            (const void *)(uintptr_t)ar->partial_ptrs[p0],
+            (const void *)(uintptr_t)ar->partial_ptrs[p1],
+            (const void *)(uintptr_t)ar->partial_ptrs[p2],
+            n,
+            (void *)(uintptr_t)ar->allreduce_streams[i]
+        );
+        if (err) return err;
+    }
+
+    /* Step 4: Record AR done events — reverse loop so we end on GPU0 */
+    for (i = tp - 1; i >= 0; i--) {
+        plan->hipSetDevice_fn(ar->device_ids[i]);
+        plan->hipEventRecord_fn(
+            (void *)(uintptr_t)ar->ar_done_events[i],
+            (void *)(uintptr_t)ar->allreduce_streams[i]);
+    }
+
+    return 0;
+}
+
+/*
+ * dispatch_allreduce_v2: route to kernel P2P or star topology allreduce.
+ */
+static int dispatch_allreduce_v2(CAllreduceSpec *ar, CDispatchPlan *plan)
+{
+    if (ar->use_kernel_p2p && ar->kernel_p2p_tp4_fn != NULL && ar->tp_size == 4) {
+        return do_allreduce_kernel_p2p_v2(ar, plan);
+    }
+    return do_allreduce_async_v2(ar, plan);
+}
+
+
 /* ---------------------------------------------------------------------- */
 /* Main dispatch function (optimized v2)                                    */
 /* ---------------------------------------------------------------------- */
@@ -504,7 +610,7 @@ int c_dispatch_step_v2(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
 
         /* Async allreduce for attention partials (optimized: fewer hipSetDevice calls) */
         if (use_overlap) {
-            err = do_allreduce_async_v2(attn_ar, plan);
+            err = dispatch_allreduce_v2(attn_ar, plan);
             if (err) return err;
             /* Non-blocking: queues GPU-side wait; host continues to FFN dispatch */
             wait_for_allreduce(attn_ar, plan);
@@ -525,7 +631,7 @@ int c_dispatch_step_v2(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
 
         /* Async allreduce for FFN partials (deferred: next layer waits at start) */
         if (use_overlap) {
-            err = do_allreduce_async_v2(ffn_ar, plan);
+            err = dispatch_allreduce_v2(ffn_ar, plan);
             if (err) return err;
         }
     }
