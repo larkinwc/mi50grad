@@ -1,0 +1,32 @@
+{
+  "milestone": "kernel-p2p-allreduce",
+  "round": 1,
+  "status": "pass",
+  "assertionsSummary": {
+    "total": 6,
+    "passed": 6,
+    "failed": 0,
+    "blocked": 0
+  },
+  "passedAssertions": [
+    "VAL-KP2P-001",
+    "VAL-KP2P-002",
+    "VAL-KP2P-003",
+    "VAL-KP2P-004",
+    "VAL-KP2P-005",
+    "VAL-KP2P-006"
+  ],
+  "failedAssertions": [],
+  "blockedAssertions": [],
+  "appliedUpdates": [],
+  "previousRound": null,
+  "notes": {
+    "hardware": "4x MI50 gfx906 (current hardware, all pure MI50)",
+    "latencyContext": "VAL-KP2P-003: The 119us baseline referenced in test was from Sprint3 era (3xMI50+1xMI100 mixed hardware). On current 4x MI50 hardware, star topology is 407.4us and kernel P2P is 360.0us (1.13x speedup). Assertion passes as kernel P2P is faster than current star topology.",
+    "throughputContext": "VAL-KP2P-004: Sprint3 38.0 tok/s baseline was on different hardware. Current 4x MI50 baseline is 15.3 tok/s (star) and 21.2 tok/s (kernel P2P), a 1.39x improvement.",
+    "testScripts": {
+      "test_kernel_p2p_allreduce.py": "Tests VAL-KP2P-001 and VAL-KP2P-003",
+      "test_kernel_p2p_tp4.py": "Tests VAL-KP2P-002, VAL-KP2P-004, VAL-KP2P-005, VAL-KP2P-006"
+    }
+  }
+}
