@@ -1306,3 +1306,28 @@ This was confirmed by scrutiny validation: `test_graph_decode.py` segfaulted at 
 
 
 
+---
+
+## Kernel P2P Allreduce (Milestone: kernel-p2p-allreduce, 2026-03-15)
+
+**Implementation:** `src/kernels/kernel_p2p_allreduce.hip` + `src/runtime/p2p_allreduce.py` (`P2PAllreduce.allreduce_residual_kernel()`) + `src/inference/tp_engine.py` (`set_kernel_p2p_allreduce()`)
+
+**Core idea:** Each GPU runs a single kernel that reads all 4 partial buffers (1 local + 3 remote via BAR1 P2P), reduces with local hidden, writes result. No gather/broadcast/host sync. Requires `hipDeviceEnablePeerAccess` for all pairs (done at P2PAllreduce init time).
+
+**Performance on gfx906/PCIe (hidden_size=5120, TP=4):**
+- Star topology (existing): ~119us/call
+- Kernel P2P (new): ~79us/call = **1.50x speedup**
+- Win: eliminating 4x hipSetDevice + 3x hipMemcpyPeerAsync gather + 2x hipStreamSynchronize + 3x hipMemcpyPeerAsync broadcast = ~5 host sync points removed
+
+**Correctness:** max_abs_error = 0.0 vs host reference (FP16 accumulation is exact for this payload)
+
+**Key design decisions:**
+1. All hidden buffers must have the **same** initial value across all GPUs. In inference, always true. Don't init only GPU0 with a value while others have zeros.
+2. Uses non-blocking allreduce streams so kernels can overlap with compute on default stream.
+3. BAR1 P2P reads are ~12 GB/s on PCIe, but for 10KB payloads latency dominates over bandwidth.
+
+**Integration:**
+- `P2PAllreduce._kernel_p2p_lib` loaded lazily; builds/loads `build/kernels/kernel_p2p_allreduce.so`
+- `allreduce_residual_kernel()` is on `P2PAllreduce` (not a separate class)
+- `TPInferenceEngine.set_kernel_p2p_allreduce(True)` routes highest priority in `_allreduce_residual()`
+- `FusedP2PReduce` (gemv_p2p_reduce.hip) is functionally identical but in a separate class; kernel P2P allreduce is preferred for new code
