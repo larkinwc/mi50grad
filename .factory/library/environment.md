@@ -7,6 +7,35 @@ Environment variables, external dependencies, and setup notes.
 
 ---
 
+## Hardware
+- Dev server: root@192.168.1.198
+- 4x AMD MI50 (gfx906), 32GB HBM2 each
+- PCIe x16 Gen4, P2P via BAR1 aperture (~12 GB/s), no XGMI
+- All 4 GPUs are gfx906 (homogeneous)
+
+## ROCm
+- Container: mixa3607/rocm-gfx906:7.1.0-complete
+- ROCm 7.1.0 (gfx906 dropped from official support in 7.0.1, this is a community patched image)
+- LLVM tools: /opt/rocm/llvm/bin/{clang++, llvm-mc, ld.lld}
+- hipcc: /opt/rocm/bin/hipcc
+
+## Docker
+- Build: `docker build -t mi50grad .` on dev server
+- Run: `docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad`
+- TP=4: add `-e HIP_VISIBLE_DEVICES=0,1,2,3` (Dockerfile defaults to 3 GPUs)
+
+## Model
+- Qwen3.5-27B-GPTQ-Int4 at /opt/models/Qwen3.5-27B-GPTQ-Int4
+- 64 layers: 16 full-attention (GQA) + 48 DeltaNet linear attention
+- hidden_size=5120, head_dim=256, num_heads=48, num_kv_heads=8
+- INT4 quantized with group_size=128
+
+## vLLM
+- Container: vllm-mobydick (must be stopped for GPU testing, restarted after)
+- AWQ model reference: 46.9 tok/s TP=4
+
+---
+
 ## Dev Server (TP=4 Optimization Mission)
 
 **Server:** root@192.168.1.198 (direct SSH, key auth, no jump host)

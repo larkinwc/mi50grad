@@ -1,5 +1,34 @@
 # User Testing
 
+## Validation Surface
+
+All validation happens via SSH to the dev server (root@192.168.1.198), running benchmark and test scripts inside Docker containers. No browser, GUI, or API endpoint testing -- this is a pure GPU kernel optimization project.
+
+**Testing tool:** SSH + Docker exec
+**Testing pattern:** 
+1. Stop vLLM: `ssh root@192.168.1.198 "docker stop vllm-mobydick 2>/dev/null || true"`
+2. Deploy: rsync to /opt/mi50grad/
+3. Build: hipcc for .hip kernels, gcc for C extensions
+4. Run test: `ssh root@192.168.1.198 "docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c 'cd /opt/mi50grad && python3 tests/<test>.py'"`
+5. Restart vLLM: `ssh root@192.168.1.198 "docker start vllm-mobydick 2>/dev/null || true"`
+
+**Validation output:** Terminal text output from benchmark scripts. Look for:
+- `tok/s` values for throughput
+- `cosine_sim` values for correctness (>= 0.99)
+- `max_abs_error` values for kernel correctness
+- `PASS`/`FAIL` indicators
+
+## Validation Concurrency
+
+Max concurrent validators: **1**
+Rationale: Only one dev server with 4 GPUs. All tests need exclusive GPU access (vLLM must be stopped). Cannot run multiple GPU test sessions simultaneously.
+
+## Resource Cost
+- Each test run uses all 4 GPUs (TP=4)
+- Model weights (~14GB) loaded into GPU VRAM per test
+- Tests typically run 10-100 decode steps
+- Total test time: 30-120 seconds per test script
+
 Testing surface, resource cost classification, and validation strategy.
 
 ## Validation Surface

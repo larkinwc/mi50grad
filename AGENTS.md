@@ -1,7 +1,7 @@
 
 This project is dedicated to optimizing token throughput for qwen3.5 27B and similar models running of gfx906 architecture.
 
-We have a development ML server (root@192.168.1.198, accessible via ssh key (default ssh auth)) that has 3x mi50s (gfx906) and 1x mi100(gfx908). The mi50s are the main focus, and should be used to validate all of our work here.
+We have a development ML server (root@192.168.1.198, accessible via ssh key (default ssh auth)) that has 4x mi50s (gfx906, 32GB HBM2 each). These are the focus, and should be used to validate all of our work here.
 
 ## References (Primary Sources)
 AMD ROCm GPU architecture specs (Instinct table):
