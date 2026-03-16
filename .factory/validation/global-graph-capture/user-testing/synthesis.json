@@ -1,0 +1,42 @@
+{
+  "milestone": "global-graph-capture",
+  "round": 1,
+  "status": "fail",
+  "assertionsSummary": {
+    "total": 6,
+    "passed": 4,
+    "failed": 2,
+    "blocked": 0
+  },
+  "passedAssertions": ["VAL-GGC-001", "VAL-GGC-002", "VAL-GGC-003", "VAL-GGC-006"],
+  "failedAssertions": [
+    {
+      "id": "VAL-GGC-004",
+      "reason": "Global graph throughput (15.1 tok/s) is only 0.72x vs C dispatch (21.1 tok/s), below the 95% threshold. C_PLAN_OK=False means the C graph dispatch extension is not active — Python replay loop eliminates the performance benefit of graph capture."
+    },
+    {
+      "id": "VAL-GGC-005",
+      "reason": "C_PLAN_OK=False — c_graph_dispatch.so C extension not wired into global graph decode state. Global graph replay uses Python fallback loop instead of C extension, causing the same overhead as cached+stream dispatch."
+    }
+  ],
+  "blockedAssertions": [],
+  "appliedUpdates": [],
+  "previousRound": null,
+  "testDetails": {
+    "script": "tests/test_global_graph_bench.py",
+    "durationSeconds": 472,
+    "throughputResults": {
+      "cachedStream": 15.14,
+      "cDispatchKernelP2P": 21.06,
+      "globalGraph": 15.08
+    },
+    "correctnessResults": {
+      "globalGraphMinCosine": 0.999721,
+      "cDispatchMinCosine": 0.999849,
+      "cachedStreamMinCosine": 0.998630
+    },
+    "captureOk": true,
+    "cPlanOk": false,
+    "toggleOk": true
+  }
+}

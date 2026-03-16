@@ -1,0 +1,60 @@
+{
+  "groupId": "ggc-all",
+  "milestone": "global-graph-capture",
+  "testScript": "tests/test_global_graph_bench.py",
+  "assertions": {
+    "VAL-GGC-001": {
+      "status": "pass",
+      "evidence": "CAPTURE_OK=True — Capturing full-layer HIP graphs for 4 GPUs × 64 layers × 2 segments. Layer 0 (linear_attention): attn_seg=5 nodes, ffn_seg=3 nodes. Layer 1 (linear_attention): attn_seg=5 nodes, ffn_seg=3 nodes.",
+      "details": "Graph capture succeeded without errors on all 4 GPUs. [PASS] capture_global_graph — All layers captured"
+    },
+    "VAL-GGC-002": {
+      "status": "pass",
+      "evidence": "Global graph: min_cosine_sim=0.999721 (PASS). Steps 0-9: cosine_sim all >= 0.999721 (threshold 0.99).",
+      "details": "[PASS] global_graph_correctness — min=0.999721. All 10 decode steps pass >= 0.99 threshold."
+    },
+    "VAL-GGC-003": {
+      "status": "pass",
+      "evidence": "Per-step cosine_sim values: step0=0.999995, step1=0.999978, step2=0.999983, step3=0.999956, step4=0.999921, step5=0.999760, step6=0.999899, step7=0.999721, step8=0.999865, step9=0.999838. All >= 0.99.",
+      "details": "[PASS] global_graph_mutable_params — all 10 steps pass >= 0.99. Position-dependent parameters (RoPE cos/sin offsets, seq_len, KV positions) correctly updated between graph replays."
+    },
+    "VAL-GGC-004": {
+      "status": "fail",
+      "evidence": "Global graph dispatch: 15.1 tok/s vs C dispatch + kernel P2P: 21.1 tok/s. Speedup vs C dispatch: 0.72x. Required: >= 95% of C dispatch (>= 20.0 tok/s). Got: 15.1 tok/s (71.6%).",
+      "details": "[FAIL] global_graph_throughput — global=15.1 tok/s vs c_dispatch=21.1 tok/s (0.72x). C_PLAN_OK=False indicates C graph dispatch extension not active; Python replay loop overhead eliminates the benefit of graph capture. Global graph running at same speed as cached+stream (15.1 tok/s)."
+    },
+    "VAL-GGC-005": {
+      "status": "fail",
+      "evidence": "C_PLAN_OK=False — [FAIL] c_graph_dispatch_active — Python fallback used. The C graph dispatch plan was not built, meaning the C extension for graph replay (c_graph_dispatch.so) is not active.",
+      "details": "The global graph replay is using the Python loop fallback rather than the C extension. This explains why throughput (15.1 tok/s) equals cached+stream rather than the expected C dispatch level (~21 tok/s). The c_graph_dispatch.so extension needs to be properly wired/loaded."
+    },
+    "VAL-GGC-006": {
+      "status": "pass",
+      "evidence": "C dispatch fallback: min_cosine_sim=0.999849 (PASS). Cached+stream fallback: min_cosine_sim=0.998630 (PASS). [PASS] fallback_chain_all_modes — All 3 modes produce cosine_sim >= 0.99.",
+      "details": "When graph dispatch is disabled (TOGGLE_OK=True), falls back to C dispatch with cosine_sim >= 0.99. Cached+stream also produces cosine_sim >= 0.99. All fallback modes work correctly."
+    }
+  },
+  "frictions": [
+    "The flow validator subagent (user-testing-flow-validator) could not be spawned due to model unavailability. Tests were run directly by the orchestrator instead."
+  ],
+  "blockers": [
+    {
+      "id": "B1",
+      "description": "C graph dispatch plan not built (C_PLAN_OK=False). The c_graph_dispatch.so C extension for graph replay is not being loaded/used, causing global graph dispatch to fall back to Python loop with the same performance as cached+stream (~15 tok/s vs expected ~21 tok/s).",
+      "rootCause": "c_graph_dispatch.so not being wired into the global graph decode state. The global graph capture itself works (CAPTURE_OK=True) but replay uses Python overhead.",
+      "affectedAssertions": ["VAL-GGC-004", "VAL-GGC-005"]
+    }
+  ],
+  "toolsUsed": ["ssh", "docker", "python3"],
+  "rawOutput": {
+    "captureOk": true,
+    "cPlanOk": false,
+    "tpsGlobalGraph": 15.08,
+    "tpsCDispatch": 21.06,
+    "tpsCachedStream": 15.14,
+    "minCosineSimGlobalGraph": 0.999721,
+    "minCosineSimCDispatch": 0.999849,
+    "minCosineSimCachedStream": 0.998630,
+    "toggleOk": true
+  }
+}
