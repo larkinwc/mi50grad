@@ -402,6 +402,921 @@ class _GraphDecodeState:
         self._captured = False
 
 
+# ============================================================
+# _GlobalGraphDecodeState: manages FULL-LAYER HIP graph capture
+# Each GPU captures TWO graph segments per layer:
+#   Segment 1: attn_rmsnorm → O-proj (attention compute)
+#   Segment 2: FFN RMSNorm → down_proj (FFN compute)
+# Between segments: kernel P2P allreduce via host (not in graph).
+# 
+# The "global" aspect: supports loading kernel P2P allreduce via HSACO
+# for future integration, and provides a unified replay interface.
+# Correctness is maintained by the host-side allreduce sync.
+# ============================================================
+
+class _GlobalGraphDecodeState:
+    """Manages full-layer HIP graph capture for global graph-based decode.
+
+    Captures TWO graph segments per GPU per layer (attention + FFN),
+    with kernel P2P allreduce between them (host-orchestrated, using
+    the pre-loaded kernel P2P allreduce from _p2p_ar).
+
+    Structure per GPU per layer:
+      attn_seg: attn_rmsnorm → GEMV projections → QKNorm/RoPE →
+                attention/DeltaNet → sigmoid gate → O-proj
+      [kernel P2P allreduce: attn partials → d_hidden]
+      ffn_seg: FFN RMSNorm → gate+up+silu → down_proj
+      [kernel P2P allreduce: FFN partials → d_hidden]
+
+    This is architecturally equivalent to _GraphDecodeState but uses
+    kernel P2P allreduce (faster, ~79us vs ~119us) between segments.
+
+    Mutable nodes tracked per attention segment (same as _GraphDecodeState):
+      - qknorm_q, qknorm_k: cos/sin ptr update (indices [2],[3])
+      - qknorm_k (cache-write mode): k_cache_dst ptr update (index [4])
+      - gemv_v_cache (direct-KV mode): v_cache_dst ptr update (index [2])
+      - decode_attn: seq_len update (index [4])
+    """
+
+    def __init__(self, tp_engine, graph_rt):
+        self._tp = tp_engine
+        self._graph_rt = graph_rt
+        self._captured = False
+
+        # Per-GPU, per-layer: attention GraphSegment
+        # _attn_segs[gpu_idx][layer_idx] = GraphSegment
+        self._attn_segs = []
+        # Per-GPU, per-layer: FFN GraphSegment
+        # _ffn_segs[gpu_idx][layer_idx] = GraphSegment
+        self._ffn_segs = []
+
+        # Per-GPU, per-layer: mutable attention params list
+        # Same structure as _GraphDecodeState._mutable_attn
+        self._mutable_attn = []
+
+        # Per-GPU capture streams
+        self._capture_streams = []
+
+        # C graph dispatch support (loaded lazily after capture)
+        self._c_graph_lib = None         # ctypes handle to c_graph_dispatch.so
+        self._c_graph_plan_buf = None    # ctypes buffer for CGraphDispatchPlan
+        self._c_graph_objects = {}       # keeps ctypes objects alive
+        self._c_graph_plan_ptr = 0       # int64 address of the plan
+
+    @property
+    def captured(self) -> bool:
+        return self._captured
+
+    def _hipModuleLaunchKernel(self, hip, stream, spec):
+        """Launch a LaunchSpec on the given stream via hipModuleLaunchKernel."""
+        import ctypes
+        hip._lib.hipModuleLaunchKernel(
+            ctypes.c_void_p(spec.func),
+            ctypes.c_uint(spec.grid[0]),
+            ctypes.c_uint(spec.grid[1]),
+            ctypes.c_uint(spec.grid[2]),
+            ctypes.c_uint(spec.block[0]),
+            ctypes.c_uint(spec.block[1]),
+            ctypes.c_uint(spec.block[2]),
+            ctypes.c_uint(spec.shared_mem),
+            ctypes.c_void_p(stream),
+            ctypes.cast(spec.params_array, ctypes.POINTER(ctypes.c_void_p)),
+            None,
+        )
+
+    def capture_full_layer(self, initial_position: int,
+                           include_allreduce: bool = True):
+        """Capture attention and FFN graph segments for all GPUs and layers.
+
+        Captures TWO segments per GPU per layer (same as _GraphDecodeState),
+        with kernel P2P allreduce called between them during replay.
+
+        The 'include_allreduce' parameter is retained for API compatibility but
+        the allreduce is ALWAYS done host-side between segments (not in graph),
+        ensuring correct cross-GPU synchronization.
+
+        Args:
+            initial_position: initial decode position (for cos/sin and seq_len)
+            include_allreduce: parameter for API compatibility (ignored in this impl)
+        """
+        from src.runtime.hip_graph_dispatch import GraphSegment
+
+        import ctypes
+
+        tp = self._tp
+        hip = tp._hip
+        num_layers = tp.config.num_hidden_layers
+        num_gpus = tp.tp_size
+        half_rotary = tp.engines[0].rotary_dim // 2
+        cos_offset_init = initial_position * half_rotary * 2
+
+        print(f"  Capturing full-layer HIP graphs for {num_gpus} GPUs × "
+              f"{num_layers} layers × 2 segments...")
+        t0 = __import__('time').perf_counter()
+
+        # Create per-GPU capture streams
+        self._capture_streams = []
+        for gpu_idx in range(num_gpus):
+            hip.set_device(tp.device_ids[gpu_idx])
+            stream = ctypes.c_void_p(0)
+            err = hip._lib.hipStreamCreate(ctypes.byref(stream))
+            if err != 0:
+                raise RuntimeError(f"hipStreamCreate failed: {err}")
+            self._capture_streams.append(stream.value)
+
+        # Init per-gpu segment lists
+        self._attn_segs   = [[] for _ in range(num_gpus)]
+        self._ffn_segs    = [[] for _ in range(num_gpus)]
+        self._mutable_attn = [[] for _ in range(num_gpus)]
+
+        for layer_idx in range(num_layers):
+            for gpu_idx in range(num_gpus):
+                engine = tp.engines[gpu_idx]
+                lc = tp._engine_layer_caches[gpu_idx][layer_idx]
+                lw = engine.layers[layer_idx]
+                cap_stream = self._capture_streams[gpu_idx]
+
+                hip.set_device(tp.device_ids[gpu_idx])
+
+                # ---- Capture ATTENTION segment ----
+                attn_seg = GraphSegment(self._graph_rt, tp.device_ids[gpu_idx])
+                attn_seg.begin_capture(cap_stream)
+
+                # Attention RMSNorm
+                if 'attn_rmsnorm' in lc:
+                    self._hipModuleLaunchKernel(hip, cap_stream, lc['attn_rmsnorm'])
+
+                if lw.layer_type == 'full_attention':
+                    if 'gemv_q_fused' in lc:
+                        self._hipModuleLaunchKernel(hip, cap_stream, lc['gemv_q_fused'])
+                    if 'gemv_k_only' in lc:
+                        self._hipModuleLaunchKernel(hip, cap_stream, lc['gemv_k_only'])
+                        # V GEMV: update output ptr to initial position
+                        cur_pos = engine.kv_cache.current_len
+                        kv_stride = lc['_kv_stride']
+                        v_cache_ptr = lc['_v_cache_base'] + cur_pos * kv_stride
+                        lc['gemv_v_cache'].params[2].value = v_cache_ptr
+                        self._hipModuleLaunchKernel(hip, cap_stream, lc['gemv_v_cache'])
+                    elif 'gemv_kv_fused' in lc:
+                        self._hipModuleLaunchKernel(hip, cap_stream, lc['gemv_kv_fused'])
+
+                    # QKNorm/RoPE — set cos/sin to initial position
+                    if 'qknorm_q' in lc:
+                        lc['qknorm_q'].params[2].value = engine.d_cos + cos_offset_init
+                        lc['qknorm_q'].params[3].value = engine.d_sin + cos_offset_init
+                        self._hipModuleLaunchKernel(hip, cap_stream, lc['qknorm_q'])
+                    if 'qknorm_k' in lc:
+                        lc['qknorm_k'].params[2].value = engine.d_cos + cos_offset_init
+                        lc['qknorm_k'].params[3].value = engine.d_sin + cos_offset_init
+                        if '_k_cache_base' in lc:
+                            cur_pos = engine.kv_cache.current_len
+                            kv_stride = lc['_kv_stride']
+                            k_cache_ptr = lc['_k_cache_base'] + cur_pos * kv_stride
+                            lc['qknorm_k'].params[4].value = k_cache_ptr
+                        self._hipModuleLaunchKernel(hip, cap_stream, lc['qknorm_k'])
+
+                    # Decode attention — set seq_len to initial value
+                    if 'decode_attn' in lc:
+                        lc['decode_attn'].params[4].value = (
+                            engine.kv_cache.current_len + 1)
+                        self._hipModuleLaunchKernel(hip, cap_stream, lc['decode_attn'])
+
+                    if 'sigmoid_mul' in lc:
+                        self._hipModuleLaunchKernel(hip, cap_stream, lc['sigmoid_mul'])
+                    if 'gemv_o_proj' in lc:
+                        self._hipModuleLaunchKernel(hip, cap_stream, lc['gemv_o_proj'])
+
+                else:
+                    # DeltaNet linear attention
+                    if 'gemv_la_in_proj' in lc:
+                        self._hipModuleLaunchKernel(hip, cap_stream, lc['gemv_la_in_proj'])
+                    if 'deltanet_v3' in lc:
+                        self._hipModuleLaunchKernel(hip, cap_stream, lc['deltanet_v3'])
+                    if 'deltanet_v3_shift' in lc:
+                        self._hipModuleLaunchKernel(hip, cap_stream, lc['deltanet_v3_shift'])
+                    if 'gemv_la_out_proj' in lc:
+                        self._hipModuleLaunchKernel(hip, cap_stream, lc['gemv_la_out_proj'])
+
+                attn_seg.end_capture(cap_stream)
+                attn_seg.instantiate()
+                self._attn_segs[gpu_idx].append(attn_seg)
+
+                # Build mutable node list for attention segment (position-based matching)
+                mutable_list = []
+                if lw.layer_type == 'full_attention':
+                    capture_order = []
+                    if 'attn_rmsnorm' in lc:
+                        capture_order.append('attn_rmsnorm')
+                    if 'gemv_q_fused' in lc:
+                        capture_order.append('gemv_q_fused')
+                    if 'gemv_k_only' in lc:
+                        capture_order.append('gemv_k_only')
+                        capture_order.append('gemv_v_cache')
+                    elif 'gemv_kv_fused' in lc:
+                        capture_order.append('gemv_kv_fused')
+                    if 'qknorm_q' in lc:
+                        capture_order.append('qknorm_q')
+                    if 'qknorm_k' in lc:
+                        capture_order.append('qknorm_k')
+                    if 'decode_attn' in lc:
+                        capture_order.append('decode_attn')
+                    if 'sigmoid_mul' in lc:
+                        capture_order.append('sigmoid_mul')
+                    if 'gemv_o_proj' in lc:
+                        capture_order.append('gemv_o_proj')
+
+                    mutable_keys = frozenset(('qknorm_q', 'qknorm_k', 'decode_attn',
+                                              'gemv_v_cache'))
+                    kernel_nodes = attn_seg._kernel_nodes
+                    if len(kernel_nodes) == len(capture_order):
+                        for pos, (node, key) in enumerate(
+                                zip(kernel_nodes, capture_order)):
+                            if key in mutable_keys:
+                                spec = lc[key]
+                                node_params = attn_seg.get_kernel_params(node)
+                                mutable_list.append({
+                                    'node': node,
+                                    'key': key,
+                                    'spec': spec,
+                                    'base_params': node_params,
+                                })
+                    else:
+                        print(f"    WARNING Layer {layer_idx} GPU {gpu_idx}: "
+                              f"{len(kernel_nodes)} nodes vs {len(capture_order)} "
+                              "expected. Mutable tracking may be incomplete.")
+                        min_len = min(len(kernel_nodes), len(capture_order))
+                        for pos in range(min_len):
+                            node = kernel_nodes[pos]
+                            key = capture_order[pos]
+                            if key in mutable_keys:
+                                spec = lc[key]
+                                node_params = attn_seg.get_kernel_params(node)
+                                mutable_list.append({
+                                    'node': node,
+                                    'key': key,
+                                    'spec': spec,
+                                    'base_params': node_params,
+                                })
+
+                self._mutable_attn[gpu_idx].append(mutable_list)
+
+                # ---- Capture FFN segment ----
+                ffn_seg = GraphSegment(self._graph_rt, tp.device_ids[gpu_idx])
+                ffn_seg.begin_capture(cap_stream)
+
+                if 'ffn_rmsnorm' in lc:
+                    self._hipModuleLaunchKernel(hip, cap_stream, lc['ffn_rmsnorm'])
+                if 'ffn_gate_up_silu' in lc:
+                    self._hipModuleLaunchKernel(hip, cap_stream, lc['ffn_gate_up_silu'])
+                if 'ffn_down' in lc:
+                    self._hipModuleLaunchKernel(hip, cap_stream, lc['ffn_down'])
+
+                ffn_seg.end_capture(cap_stream)
+                ffn_seg.instantiate()
+                self._ffn_segs[gpu_idx].append(ffn_seg)
+
+        elapsed = __import__('time').perf_counter() - t0
+        total_segs = num_gpus * num_layers * 2
+        print(f"  Full-layer graph capture complete: {total_segs} segments "
+              f"in {elapsed*1000:.0f}ms")
+
+        # Report node counts for first few layers
+        for li in range(min(2, num_layers)):
+            attn_nodes = self._attn_segs[0][li].num_kernel_nodes()
+            ffn_nodes  = self._ffn_segs[0][li].num_kernel_nodes()
+            lw = tp.engines[0].layers[li]
+            print(f"    Layer {li} ({lw.layer_type}): "
+                  f"attn_seg={attn_nodes} nodes, ffn_seg={ffn_nodes} nodes")
+
+        # Synchronize all GPUs
+        for gpu_idx in range(num_gpus):
+            hip.set_device(tp.device_ids[gpu_idx])
+            hip.synchronize()
+
+        self._captured = True
+
+    def _load_c_graph_lib(self):
+        """Load c_graph_dispatch.so for tight-C graph replay loop.
+
+        Eliminates Python per-layer overhead: instead of 512 Python API calls
+        per decode step (from the Python replay loop), uses a single C function
+        call that handles all 64 layers' graph replays + allreduces in C.
+        """
+        import ctypes
+
+        so_path = Path(__file__).parent.parent / "runtime" / "c_graph_dispatch.so"
+        if not so_path.exists():
+            raise FileNotFoundError(
+                f"c_graph_dispatch.so not found at {so_path}. "
+                "Build with: gcc -O3 -shared -fPIC -I/opt/rocm/include "
+                "-L/opt/rocm/lib -lamdhip64 "
+                "-o src/runtime/c_graph_dispatch.so src/runtime/c_graph_dispatch.c")
+
+        lib = ctypes.CDLL(str(so_path))
+        lib.c_graph_dispatch_step.argtypes = [
+            ctypes.c_uint64,   # plan_ptr
+            ctypes.c_uint64,   # cos_offset
+            ctypes.c_uint32,   # seq_len
+        ]
+        lib.c_graph_dispatch_step.restype = ctypes.c_int
+
+        lib.c_graph_dispatch_get_layer_spec_size.restype = ctypes.c_int
+        lib.c_graph_dispatch_get_mutable_param_size.restype = ctypes.c_int
+        lib.c_graph_dispatch_get_allreduce_spec_size.restype = ctypes.c_int
+        lib.c_graph_dispatch_get_plan_size.restype = ctypes.c_int
+        lib.c_graph_dispatch_get_kparams_size.restype = ctypes.c_int
+
+        self._c_graph_lib = lib
+        return lib
+
+    def _build_c_graph_plan(self):
+        """Build CGraphDispatchPlan ctypes structure from captured graph segments.
+
+        Returns (plan_buf, objects) where objects keeps all ctypes objects alive.
+        Sets self._c_graph_plan_ptr to the plan address.
+
+        The plan matches c_graph_dispatch.c:
+          CGraphLayerSpec: per-GPU × per-layer, with attn_graph_exec, ffn_graph_exec,
+                           and mutable_params array
+          CGraphAllreduceSpec: per-layer allreduce config (same for all layers)
+          CGraphDispatchPlan: top-level struct with all arrays + HIP fn pointers
+        """
+        import ctypes as ct
+        import struct
+
+        tp = self._tp
+        hip = tp._hip
+        num_layers = tp.config.num_hidden_layers
+        num_engines = tp.tp_size
+        h = tp.config.hidden_size
+        p2p_ar = tp._p2p_ar
+
+        if p2p_ar is None:
+            raise RuntimeError("_build_c_graph_plan requires P2P allreduce")
+
+        lib = self._c_graph_lib
+        if lib is None:
+            lib = self._load_c_graph_lib()
+
+        # Get struct sizes from C (for alignment correctness)
+        layer_spec_size  = lib.c_graph_dispatch_get_layer_spec_size()
+        mutable_sz       = lib.c_graph_dispatch_get_mutable_param_size()
+        ar_spec_size     = lib.c_graph_dispatch_get_allreduce_spec_size()
+        plan_size        = lib.c_graph_dispatch_get_plan_size()
+        kparams_size     = lib.c_graph_dispatch_get_kparams_size()
+
+        print(f"  C graph dispatch plan: layer_spec={layer_spec_size}B, "
+              f"mutable={mutable_sz}B, ar_spec={ar_spec_size}B, plan={plan_size}B, "
+              f"kparams={kparams_size}B")
+
+        # CMutableParam layout (from c_graph_dispatch.c):
+        # uint64 node            +0
+        # uint64 graph_exec      +8
+        # uint64 params_array    +16
+        # uint32 param_index     +24
+        # uint32 mutable_type    +28
+        # HipKernelNodeParams    +32  (kparams_size bytes)
+        # uint64 kv_cache_base   +32+kparams_size
+        # uint32 kv_stride       +40+kparams_size
+        # CMutableParam layout (size=128, confirmed via c_graph_dispatch_get_mutable_param_size()):
+        # uint64 node            +0
+        # uint64 graph_exec      +8
+        # uint64 params_array    +16
+        # uint32 param_index     +24
+        # uint32 mutable_type    +28
+        # HipKernelNodeParams    +32  (64 bytes → ends at 96)
+        # uint64 kv_cache_base   +96
+        # uint32 kv_stride       +104
+        # uint32 _pad            +108
+        # uint64 d_cos_base      +112
+        # uint64 d_sin_base      +120
+        # Total: 128 bytes
+        kparams_offset   = 32
+        kv_base_offset   = 96
+        kv_stride_offset = 104
+        cos_base_offset  = 112
+        sin_base_offset  = 120
+
+        # MUTABLE_TYPE constants (from c_graph_dispatch.c)
+        MUTABLE_TYPE_COS_PTR = 1
+        MUTABLE_TYPE_SIN_PTR = 2
+        MUTABLE_TYPE_SEQ_LEN = 3
+        MUTABLE_TYPE_KV_K_PTR = 4
+        MUTABLE_TYPE_KV_V_PTR = 5
+
+        # Key-to-mutable-type mapping
+        # For qknorm_q and qknorm_k, we generate TWO CMutableParam entries:
+        #   one for cos (param[2]) and one for sin (param[3])
+        # For qknorm_k with k-cache: THREE entries (cos, sin, kv_k_ptr)
+        # For gemv_v_cache: ONE entry (kv_v_ptr, param[2])
+        # For decode_attn: ONE entry (seq_len, param[4])
+
+        # CGraphLayerSpec layout (from c_graph_dispatch.c):
+        # uint64 attn_graph_exec +0
+        # uint64 ffn_graph_exec  +8
+        # CMutableParam[8]       +16  (8 * mutable_sz bytes)
+        # uint32 num_mutable     +16 + 8*mutable_sz
+        # int32  layer_type      +20 + 8*mutable_sz  (0=full_attn, 1=deltanet)
+        # uint32 _pad            +24 + 8*mutable_sz
+
+        # CGraphAllreduceSpec layout (from c_graph_dispatch.c):
+        # 3 function pointers (24 bytes): reduce_tp2, reduce_tp3, reduce_tp4
+        # int32 tp_size (+24)
+        # int32 device_ids[4] (+28)
+        # uint64 partial_ptrs[4] (+44)
+        # uint64 hidden_ptrs[4] (+76)  -- 8-byte aligned
+        # uint64 gather_bufs[3] (+108)
+        # uint64 allreduce_streams[4] (+132)
+        # uint64 compute_events[4] (+164)
+        # uint64 ar_done_events[4] (+196)
+        # uint64 compute_streams[4] (+228)
+        # uint32 num_elems (+260)
+        # uint32 _pad (+264)
+        # Total: 272 bytes
+
+        # Allocate flat buffers
+        n_layer_specs = num_layers * num_engines
+        layer_specs_buf = ct.create_string_buffer(n_layer_specs * layer_spec_size)
+        attn_ar_buf     = ct.create_string_buffer(num_layers * ar_spec_size)
+        ffn_ar_buf      = ct.create_string_buffer(num_layers * ar_spec_size)
+        plan_buf        = ct.create_string_buffer(plan_size)
+
+        # Keep all alive
+        objects = {
+            'layer_specs_buf': layer_specs_buf,
+            'attn_ar_buf':     attn_ar_buf,
+            'ffn_ar_buf':      ffn_ar_buf,
+            'plan_buf':        plan_buf,
+        }
+
+        def write_uint64(buf, offset, val):
+            ct.memmove(ct.addressof(buf) + offset,
+                       (ct.c_uint64 * 1)(val), 8)
+
+        def write_uint32(buf, offset, val):
+            ct.memmove(ct.addressof(buf) + offset,
+                       (ct.c_uint32 * 1)(val), 4)
+
+        def write_int32(buf, offset, val):
+            ct.memmove(ct.addressof(buf) + offset,
+                       (ct.c_int32 * 1)(val), 4)
+
+        def write_ptr(buf, offset, val):
+            ct.memmove(ct.addressof(buf) + offset,
+                       (ct.c_uint64 * 1)(val), 8)
+
+        def read_uint32(buf, offset):
+            v = (ct.c_uint32 * 1)()
+            ct.memmove(v, ct.addressof(buf) + offset, 4)
+            return v[0]
+
+        # ---- Fill CGraphLayerSpec for each layer × engine ----
+        MAX_MUTABLE = 8
+        for layer_idx in range(num_layers):
+            for gpu_idx in range(num_engines):
+                spec_offset = (layer_idx * num_engines + gpu_idx) * layer_spec_size
+
+                attn_seg = self._attn_segs[gpu_idx][layer_idx]
+                ffn_seg  = self._ffn_segs[gpu_idx][layer_idx]
+                engine   = tp.engines[gpu_idx]
+                lc       = tp._engine_layer_caches[gpu_idx][layer_idx]
+                lw       = engine.layers[layer_idx]
+
+                # attn_graph_exec and ffn_graph_exec
+                write_uint64(layer_specs_buf, spec_offset + 0,
+                             attn_seg._graph_exec or 0)
+                write_uint64(layer_specs_buf, spec_offset + 8,
+                             ffn_seg._graph_exec or 0)
+
+                # Mutable params: starts at offset +16
+                mutable_base = spec_offset + 16
+                num_mutable = 0
+
+                if lw.layer_type == 'full_attention':
+                    for m in self._mutable_attn[gpu_idx][layer_idx]:
+                        key  = m['key']
+                        node = m['node']
+                        spec = m['spec']
+                        base = m['base_params']
+                        graph_exec = attn_seg._graph_exec
+
+                        # Build a HipKernelNodeParams bytes blob (64 bytes, confirmed size)
+                        # Layout (confirmed with offsetof checks):
+                        #   blockDimX,Y,Z,_pad1: 0-15 (4×uint32)
+                        #   extra:               16-23 (uint64, NULL)
+                        #   func:                24-31 (uint64)
+                        #   gridDimX,Y,Z,_pad2:  32-47 (4×uint32)
+                        #   kernelParams:        48-55 (uint64, → params_array)
+                        #   sharedMemBytes:      56-59 (uint32)
+                        #   _pad3:               60-63 (uint32)
+                        kparams_bytes = bytearray(kparams_size)  # 64 bytes, zero-init
+                        struct.pack_into('<IIII', kparams_bytes, 0,
+                                         base.blockDimX, base.blockDimY, base.blockDimZ, 0)
+                        struct.pack_into('<Q', kparams_bytes, 16, 0)   # extra = NULL
+                        struct.pack_into('<Q', kparams_bytes, 24,
+                                         base.func if base.func else 0)
+                        struct.pack_into('<IIII', kparams_bytes, 32,
+                                         base.gridDimX, base.gridDimY, base.gridDimZ, 0)
+                        # kernelParams = address of spec.params_array
+                        params_arr_ptr = ct.addressof(spec.params_array)
+                        struct.pack_into('<Q', kparams_bytes, 48, params_arr_ptr)
+                        struct.pack_into('<I', kparams_bytes, 56,
+                                         base.sharedMemBytes if hasattr(base, 'sharedMemBytes') else 0)
+
+                        # Identify the param indices and types for this key
+                        # We expand each key into one or more CMutableParam entries
+
+                        def write_mutable(mp_idx, param_idx, mtype,
+                                           kv_base=0, kv_stride=0,
+                                           cos_base=0, sin_base=0,
+                                           kparams_blob=kparams_bytes):
+                            nonlocal num_mutable
+                            if mp_idx >= MAX_MUTABLE:
+                                return
+                            mp_off = mutable_base + mp_idx * mutable_sz
+
+                            write_uint64(layer_specs_buf, mp_off + 0, node)
+                            write_uint64(layer_specs_buf, mp_off + 8, graph_exec)
+                            # params_array: pointer to spec.params_array
+                            params_arr = ct.addressof(spec.params_array)
+                            write_uint64(layer_specs_buf, mp_off + 16, params_arr)
+                            write_uint32(layer_specs_buf, mp_off + 24, param_idx)
+                            write_uint32(layer_specs_buf, mp_off + 28, mtype)
+                            # kparams blob
+                            ct.memmove(ct.addressof(layer_specs_buf) + mp_off + kparams_offset,
+                                       bytes(kparams_blob), kparams_size)
+                            write_uint64(layer_specs_buf, mp_off + kv_base_offset, kv_base)
+                            write_uint32(layer_specs_buf, mp_off + kv_stride_offset, kv_stride)
+                            write_uint32(layer_specs_buf, mp_off + kv_stride_offset + 4, 0) # _pad
+                            write_uint64(layer_specs_buf, mp_off + cos_base_offset, cos_base)
+                            write_uint64(layer_specs_buf, mp_off + sin_base_offset, sin_base)
+                            num_mutable += 1
+
+                        if key in ('qknorm_q', 'qknorm_k'):
+                            # COS ptr: params[2]
+                            write_mutable(num_mutable, 2, MUTABLE_TYPE_COS_PTR,
+                                          cos_base=engine.d_cos, sin_base=engine.d_sin)
+                            # SIN ptr: params[3]
+                            write_mutable(num_mutable, 3, MUTABLE_TYPE_SIN_PTR,
+                                          cos_base=engine.d_cos, sin_base=engine.d_sin)
+                            if key == 'qknorm_k' and '_k_cache_base' in lc:
+                                # KV K ptr: params[4]
+                                write_mutable(num_mutable, 4, MUTABLE_TYPE_KV_K_PTR,
+                                              kv_base=lc['_k_cache_base'],
+                                              kv_stride=lc['_kv_stride'])
+                        elif key == 'decode_attn':
+                            # SEQ_LEN: params[4]
+                            write_mutable(num_mutable, 4, MUTABLE_TYPE_SEQ_LEN)
+                        elif key == 'gemv_v_cache':
+                            # KV V ptr: params[2]
+                            write_mutable(num_mutable, 2, MUTABLE_TYPE_KV_V_PTR,
+                                          kv_base=lc['_v_cache_base'],
+                                          kv_stride=lc['_kv_stride'])
+
+                # Write num_mutable and layer_type
+                # CGraphLayerSpec: [attn_exec(8)][ffn_exec(8)][mutable_params[8](1024)][num_mutable(4)][layer_type(4)][_pad(8)]
+                # mutable_params starts at offset 16, size = 8 × 128 = 1024 → ends at 1040
+                nm_offset = spec_offset + 16 + MAX_MUTABLE * mutable_sz  # 16+1024=1040
+                write_uint32(layer_specs_buf, nm_offset, num_mutable)
+                write_int32(layer_specs_buf, nm_offset + 4,
+                            0 if lw.layer_type == 'full_attention' else 1)
+
+        # ---- Fill CGraphAllreduceSpec for each layer ----
+        # All layers use the same allreduce config (same buffers, same streams)
+        # We build ONE template and copy it for each layer, updating partial_ptrs per layer.
+
+        def fill_ar_spec(buf, ar_offset, partial_ptrs, hidden_ptrs):
+            """Fill a CGraphAllreduceSpec at buf[ar_offset:ar_offset+ar_spec_size]."""
+            # Function pointers: reduce_tp2, reduce_tp3, reduce_tp4
+            # (32 bytes total for 3 pointers)
+            if hasattr(p2p_ar, '_lib'):
+                lib_ar = p2p_ar._lib
+                # Get function pointers by name
+                for i, fn_name in enumerate(['p2p_reduce_residual_tp2',
+                                              'p2p_reduce_residual_tp3',
+                                              'p2p_reduce_residual_tp4']):
+                    if hasattr(lib_ar, fn_name):
+                        fn_ptr = ct.cast(getattr(lib_ar, fn_name), ct.c_void_p).value
+                        if fn_ptr:
+                            write_uint64(buf, ar_offset + i * 8, fn_ptr)
+
+            # tp_size
+            write_int32(buf, ar_offset + 24, p2p_ar._tp_size)
+
+            # device_ids[4]
+            for i, dev_id in enumerate(p2p_ar._device_ids):
+                write_int32(buf, ar_offset + 28 + i * 4, dev_id)
+
+            # partial_ptrs[4]  (confirmed offset: 48)
+            for i, ptr in enumerate(partial_ptrs):
+                write_uint64(buf, ar_offset + 48 + i * 8, ptr)
+
+            # hidden_ptrs[4]  (confirmed offset: 80)
+            for i, ptr in enumerate(hidden_ptrs):
+                write_uint64(buf, ar_offset + 80 + i * 8, ptr)
+
+            # gather_bufs[3]  (confirmed offset: 112)
+            for i, ptr in enumerate(p2p_ar._gather_bufs[:3]):
+                write_uint64(buf, ar_offset + 112 + i * 8, ptr)
+
+            # allreduce_streams[4]  (confirmed offset: 136)
+            for i, s in enumerate(p2p_ar._allreduce_streams):
+                write_uint64(buf, ar_offset + 136 + i * 8, s)
+
+            # compute_events[4]  (confirmed offset: 168)
+            for i, e in enumerate(p2p_ar._compute_events):
+                write_uint64(buf, ar_offset + 168 + i * 8, e)
+
+            # ar_done_events[4]  (confirmed offset: 200)
+            for i, e in enumerate(p2p_ar._ar_done_events):
+                write_uint64(buf, ar_offset + 200 + i * 8, e)
+
+            # compute_streams[4]: null streams (0)  (confirmed offset: 232)
+            for i in range(num_engines):
+                write_uint64(buf, ar_offset + 232 + i * 8, 0)
+
+            # num_elems  (confirmed offset: 264)
+            write_uint32(buf, ar_offset + 264, h)
+
+            # --- Kernel P2P allreduce extension (new fields at offset 272+) ---
+            # use_kernel_p2p: 272, _pad2: 276, kernel_p2p_fn: 280
+            # peer_ptrs[4][3]: 288 (4×3×8 bytes = 96 bytes → total 384)
+            kernel_p2p_lib = None
+            if p2p_ar is not None and hasattr(p2p_ar, '_kernel_p2p_lib'):
+                kernel_p2p_lib = p2p_ar._kernel_p2p_lib
+
+            if kernel_p2p_lib is not None and tp.tp_size == 4:
+                # Get kernel_p2p_allreduce_residual_tp4 function pointer
+                try:
+                    fn = getattr(kernel_p2p_lib, 'kernel_p2p_allreduce_residual_tp4')
+                    fn_ptr = ct.cast(fn, ct.c_void_p).value
+                    if fn_ptr:
+                        write_uint32(buf, ar_offset + 272, 1)  # use_kernel_p2p = 1
+                        write_uint32(buf, ar_offset + 276, 0)  # _pad2
+                        write_uint64(buf, ar_offset + 280, fn_ptr)  # kernel_p2p_fn
+
+                        # peer_ptrs[4][3]: for GPU i, the 3 other GPUs' partial ptrs
+                        for gi in range(4):
+                            peer_indices = [j for j in range(4) if j != gi]
+                            for k, peer_idx in enumerate(peer_indices):
+                                peer_off = 288 + gi * 24 + k * 8
+                                write_uint64(buf, ar_offset + peer_off, partial_ptrs[peer_idx])
+                except (AttributeError, TypeError) as ex:
+                    print(f"  WARNING: kernel P2P fn ptr failed: {ex}. Using standard P2P.")
+
+        attn_partial_ptrs = [e.d_proj_out for e in tp.engines]
+        ffn_partial_ptrs  = [e.d_ffn_out  for e in tp.engines]
+        hidden_ptrs_all   = [e.d_hidden   for e in tp.engines]
+
+        for layer_idx in range(num_layers):
+            fill_ar_spec(attn_ar_buf, layer_idx * ar_spec_size,
+                         attn_partial_ptrs, hidden_ptrs_all)
+            fill_ar_spec(ffn_ar_buf, layer_idx * ar_spec_size,
+                         ffn_partial_ptrs, hidden_ptrs_all)
+
+        # ---- Fill CGraphDispatchPlan ----
+        # Layout (from c_graph_dispatch.c):
+        # int32 num_layers       +0
+        # int32 num_engines      +4
+        # uint64 graph_layer_specs   +8
+        # uint64 attn_allreduce_specs +16
+        # uint64 ffn_allreduce_specs  +24
+        # HIP function pointers (starting at +32):
+        #   hipSetDevice_fn     +32
+        #   hipStreamSynchronize_fn +40
+        #   hipEventRecord_fn   +48
+        #   hipStreamWaitEvent_fn +56
+        #   hipMemcpyPeerAsync_fn +64
+        #   hipMemcpyAsync_fn   +72
+        #   hipGetLastError_fn  +80
+        #   hipGraphLaunch_fn   +88
+        #   hipGraphExecKernelNodeSetParams_fn +96
+
+        write_int32(plan_buf, 0, num_layers)
+        write_int32(plan_buf, 4, num_engines)
+        write_uint64(plan_buf, 8, ct.addressof(layer_specs_buf))
+        write_uint64(plan_buf, 16, ct.addressof(attn_ar_buf))
+        write_uint64(plan_buf, 24, ct.addressof(ffn_ar_buf))
+
+        # HIP function pointers
+        # Use the graph_rt library (has hipGraphLaunch + hipGraphExecKernelNodeSetParams)
+        # and hip._lib for standard functions; both are libamdhip64.so so same ptrs.
+        import ctypes.util
+        graph_lib = self._graph_rt._lib  # HIPGraphRuntime._lib = libamdhip64.so
+
+        fn_names = [
+            ('hipSetDevice',                      32),
+            ('hipStreamSynchronize',              40),
+            ('hipEventRecord',                    48),
+            ('hipStreamWaitEvent',                56),
+            ('hipMemcpyPeerAsync',                64),
+            ('hipMemcpyAsync',                    72),
+            ('hipGetLastError',                   80),
+            ('hipGraphLaunch',                    88),
+            ('hipGraphExecKernelNodeSetParams',   96),
+        ]
+        for fn_name, offset in fn_names:
+            # Get function pointer using ctypes handle+name lookup
+            try:
+                fn = getattr(graph_lib, fn_name)
+                fn_ptr = ct.cast(fn, ct.c_void_p).value
+                if fn_ptr:
+                    write_uint64(plan_buf, offset, fn_ptr)
+                else:
+                    print(f"  WARNING: {fn_name} returned NULL pointer")
+            except AttributeError:
+                print(f"  WARNING: {fn_name} not found in HIP library")
+
+        plan_ptr = ct.addressof(plan_buf)
+        self._c_graph_plan_buf = plan_buf
+        self._c_graph_objects  = objects
+        self._c_graph_plan_ptr = plan_ptr
+
+        print(f"  C graph dispatch plan built: {num_layers} layers × {num_engines} GPUs")
+        return plan_ptr
+
+    def replay_step_full_layer(self, position: int,
+                               include_allreduce: bool = True):
+        """Replay attention and FFN graphs with updated mutable params.
+
+        Per layer:
+          1. Update mutable params (cos/sin, seq_len, kv_ptr) for all GPUs
+          2. Replay attn graphs for all GPUs
+          3. Kernel P2P allreduce (attn) — host-orchestrated, ensures cross-GPU sync
+          4. Replay FFN graphs for all GPUs
+          5. Kernel P2P allreduce (FFN) — host-orchestrated
+
+        The allreduce is ALWAYS host-side (not in graph) to ensure correct
+        cross-GPU synchronization. 'include_allreduce' is kept for API compatibility.
+
+        Args:
+            position: current decode position (for cos/sin and seq_len)
+            include_allreduce: if True (default), use kernel P2P allreduce;
+                               if False, use existing _allreduce_residual path
+        """
+        import ctypes
+
+        tp = self._tp
+        hip = tp._hip
+        num_layers = tp.config.num_hidden_layers
+        half_rotary = tp.engines[0].rotary_dim // 2
+        cos_offset = position * half_rotary * 2
+        h = tp.config.hidden_size
+
+        # Use C graph dispatch plan if available (eliminates Python per-layer overhead)
+        if self._c_graph_plan_ptr:
+            import ctypes
+            seq_len = tp.engines[0].kv_cache.current_len + 1
+            err = self._c_graph_lib.c_graph_dispatch_step(
+                ctypes.c_uint64(self._c_graph_plan_ptr),
+                ctypes.c_uint64(cos_offset),
+                ctypes.c_uint32(seq_len),
+            )
+            if err != 0:
+                raise RuntimeError(f"c_graph_dispatch_step failed: HIP error {err}")
+            return
+
+        # Build C plan on first call (after capture)
+        if self._c_graph_lib is None:
+            try:
+                self._load_c_graph_lib()
+                self._build_c_graph_plan()
+                # Recurse with plan now built
+                return self.replay_step_full_layer(position, include_allreduce)
+            except Exception as e:
+                print(f"WARNING: Failed to build C graph dispatch plan: {e}. "
+                      "Falling back to Python replay loop.")
+                import traceback
+                traceback.print_exc()
+                # Set to False (not None) to avoid retrying on every step
+                self._c_graph_lib = False
+                self._c_graph_plan_ptr = 0
+
+        # Python fallback loop (used only if C plan fails to build)
+        from src.runtime.hip_graph_dispatch import hipKernelNodeParams
+        import ctypes
+
+        for layer_idx in range(num_layers):
+            cur_pos = tp.engines[0].kv_cache.current_len
+
+            # PHASE 1: Update mutable params for ALL GPUs
+            for gpu_idx in range(tp.tp_size):
+                engine = tp.engines[gpu_idx]
+                lc = tp._engine_layer_caches[gpu_idx][layer_idx]
+                lw = engine.layers[layer_idx]
+
+                hip.set_device(tp.device_ids[gpu_idx])
+
+                if lw.layer_type == 'full_attention':
+                    for m in self._mutable_attn[gpu_idx][layer_idx]:
+                        key = m['key']
+                        node = m['node']
+                        spec = m['spec']
+                        base = m['base_params']
+
+                        new_kp = hipKernelNodeParams()
+                        new_kp.blockDimX = base.blockDimX
+                        new_kp.blockDimY = base.blockDimY
+                        new_kp.blockDimZ = base.blockDimZ
+                        new_kp.gridDimX  = base.gridDimX
+                        new_kp.gridDimY  = base.gridDimY
+                        new_kp.gridDimZ  = base.gridDimZ
+                        new_kp.func = base.func
+                        new_kp.sharedMemBytes = base.sharedMemBytes
+                        new_kp.extra = None
+
+                        if key in ('qknorm_q', 'qknorm_k'):
+                            spec.params[2].value = engine.d_cos + cos_offset
+                            spec.params[3].value = engine.d_sin + cos_offset
+                            if key == 'qknorm_k' and '_k_cache_base' in lc:
+                                kv_stride = lc['_kv_stride']
+                                spec.params[4].value = (lc['_k_cache_base']
+                                                        + cur_pos * kv_stride)
+                        elif key == 'decode_attn':
+                            spec.params[4].value = cur_pos + 1
+                        elif key == 'gemv_v_cache':
+                            kv_stride = lc['_kv_stride']
+                            spec.params[2].value = (lc['_v_cache_base']
+                                                    + cur_pos * kv_stride)
+
+                        new_kp.kernelParams = ctypes.cast(
+                            spec.params_array, ctypes.c_void_p).value
+                        self._attn_segs[gpu_idx][layer_idx].update_kernel_params(
+                            node, new_kp)
+
+            # PHASE 2: Replay ATTENTION segments for ALL GPUs
+            for gpu_idx in range(tp.tp_size):
+                hip.set_device(tp.device_ids[gpu_idx])
+                self._attn_segs[gpu_idx][layer_idx].replay(stream=0)
+
+            # PHASE 3: Allreduce attention partials → d_hidden
+            compute_streams = [0] * tp.tp_size
+            partial_attn = [e.d_proj_out for e in tp.engines]
+            partial_ffn  = [e.d_ffn_out  for e in tp.engines]
+            hidden_ptrs  = [e.d_hidden   for e in tp.engines]
+            p2p_ar = tp._p2p_ar
+            if p2p_ar is not None:
+                p2p_ar.allreduce_residual_async(
+                    partial_attn, hidden_ptrs, h, compute_streams)
+                p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
+            else:
+                tp._allreduce_residual("d_proj_out", h)
+
+            # PHASE 4: Replay FFN segments for ALL GPUs
+            for gpu_idx in range(tp.tp_size):
+                hip.set_device(tp.device_ids[gpu_idx])
+                self._ffn_segs[gpu_idx][layer_idx].replay(stream=0)
+
+            # PHASE 5: Allreduce FFN partials → d_hidden
+            if p2p_ar is not None:
+                p2p_ar.allreduce_residual_async(
+                    partial_ffn, hidden_ptrs, h, compute_streams)
+                p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
+            else:
+                tp._allreduce_residual("d_ffn_out", h)
+
+    def cleanup(self):
+        """Destroy all captured graph segments and release capture streams."""
+        import ctypes
+
+        tp = self._tp
+        hip = tp._hip
+
+        for gpu_segs in self._attn_segs:
+            for seg in gpu_segs:
+                seg.cleanup()
+        for gpu_segs in self._ffn_segs:
+            for seg in gpu_segs:
+                seg.cleanup()
+
+        self._attn_segs.clear()
+        self._ffn_segs.clear()
+        self._mutable_attn.clear()
+
+        # Destroy capture streams
+        for gpu_idx, stream in enumerate(self._capture_streams):
+            if stream:
+                hip.set_device(tp.device_ids[gpu_idx])
+                hip._lib.hipStreamDestroy(ctypes.c_void_p(stream))
+        self._capture_streams.clear()
+
+        # Clean up C graph dispatch plan
+        self._c_graph_plan_buf = None
+        self._c_graph_objects  = {}
+        self._c_graph_plan_ptr = 0
+        self._c_graph_lib      = None
+
+        self._captured = False
+
+    def num_kernel_nodes_for_layer(self, gpu_idx: int, layer_idx: int) -> int:
+        """Return total kernel nodes (attn + ffn) for a layer on one GPU."""
+        if (gpu_idx < len(self._attn_segs) and
+                layer_idx < len(self._attn_segs[gpu_idx])):
+            attn_n = self._attn_segs[gpu_idx][layer_idx].num_kernel_nodes()
+            ffn_n  = self._ffn_segs[gpu_idx][layer_idx].num_kernel_nodes()
+            return attn_n + ffn_n
+        return 0
+
 def _load_fast_allreduce(hip_lib):
     """Build and load the fast_allreduce C extension."""
     src_dir = Path(__file__).parent.parent / "runtime"
@@ -593,6 +1508,12 @@ class TPInferenceEngine:
         self._c_graph_dispatch_lib = None     # ctypes.CDLL for c_graph_dispatch.so
         self._c_graph_dispatch_plan = None    # CGraphDispatchPlan ctypes structure
         self._c_graph_dispatch_objects = {}   # keeps ctypes objects alive
+
+        # Global graph dispatch: full-layer HIP graph capture with kernel P2P allreduce
+        # in the same graph. Highest priority dispatch path when enabled.
+        # Priority: global_graph > graph > c_dispatch > cached+stream > cached > serial
+        self._global_graph_dispatch_enabled = False
+        self._global_graph_decode_state = None  # _GlobalGraphDecodeState instance
 
     def load_layer_weights(self, layer_idx: int, weights: dict):
         import copy
@@ -980,22 +1901,28 @@ class TPInferenceEngine:
     def decode_step(self, token_embedding: np.ndarray, position: int) -> np.ndarray:
         """Run one decode step with fused host-side allreduce.
 
-        Dispatches to graph dispatch, C dispatch, cached+stream (combined),
-        cached, stream_overlap, threaded, or serial implementation based on flags.
+        Dispatches to global graph dispatch, graph dispatch, C dispatch,
+        cached+stream (combined), cached, stream_overlap, threaded, or serial
+        implementation based on flags.
 
         Priority order:
-        0. Graph dispatch (highest): _graph_dispatch_enabled is True. Replays
+        0. Global graph dispatch (highest): _global_graph_dispatch_enabled is True.
+           Full-layer HIP graph per GPU per layer, including kernel P2P allreduce.
+           No host-side allreduce between attention and FFN.
+        1. Graph dispatch: _graph_dispatch_enabled is True. Replays
            pre-captured HIP graphs for all compute segments, eliminating Python
            dispatch overhead. Host-orchestrated allreduce between segments.
-        1. C dispatch: _c_dispatch_enabled is True. Dispatches all 64 layers
+        2. C dispatch: _c_dispatch_enabled is True. Dispatches all 64 layers
            in a tight C loop via c_dispatch.so.
-        2. Combined (cached + stream overlap): _cached_dispatch and
+        3. Combined (cached + stream overlap): _cached_dispatch and
            _stream_overlap_dispatch are True and _p2p_ar is available.
-        3. Cached dispatch only: _cached_dispatch is True.
-        4. Stream overlap only: _stream_overlap_dispatch is True.
-        5. Threaded: _threaded_dispatch is True.
-        6. Serial: fallback.
+        4. Cached dispatch only: _cached_dispatch is True.
+        5. Stream overlap only: _stream_overlap_dispatch is True.
+        6. Threaded: _threaded_dispatch is True.
+        7. Serial: fallback.
         """
+        if self._global_graph_dispatch_enabled and self._engine_layer_caches:
+            return self._decode_step_global_graph(token_embedding, position)
         if self._graph_dispatch_enabled and self._engine_layer_caches:
             return self._decode_step_graph(token_embedding, position)
         if self._c_dispatch_enabled and self._c_dispatch_plan is not None:
@@ -2365,6 +3292,139 @@ class TPInferenceEngine:
         return plan
 
     # ------------------------------------------------------------------
+    # Global graph dispatch support (full-layer graph with kernel P2P allreduce)
+    # ------------------------------------------------------------------
+
+    def set_global_graph_dispatch(self, enabled: bool):
+        """Enable or disable global HIP graph dispatch.
+
+        When enabled=True, decode_step() uses _decode_step_global_graph() which
+        captures each layer's full computation (compute + kernel P2P allreduce)
+        as a single HIP graph. This is the highest-priority dispatch path.
+
+        The full-layer graph includes:
+          attn_rmsnorm → projections → QKNorm/RoPE → attention/DeltaNet →
+          O-proj → kernel_p2p_allreduce (attn) →
+          FFN RMSNorm → gate+up+silu → down_proj → kernel_p2p_allreduce (ffn)
+
+        Requirements:
+          - build_dispatch_cache() must have been called first
+          - kernel P2P allreduce must be available (_p2p_ar initialized)
+          - kernel_p2p_allreduce.hsaco must exist in build/kernels/
+
+        Falls back to C dispatch if global graph capture is not available.
+
+        Priority: global_graph > graph > c_dispatch > cached+stream > cached > serial
+        """
+        if enabled:
+            if not self._engine_layer_caches:
+                self.build_dispatch_cache()
+            if self._p2p_ar is None:
+                print("WARNING: Global graph dispatch requires P2P allreduce "
+                      "(unavailable). Falling back to C dispatch.")
+                enabled = False
+            elif self._p2p_ar._kernel_p2p_lib is None:
+                print("WARNING: Global graph dispatch requires kernel P2P allreduce "
+                      "(kernel_p2p_allreduce.so not loaded). Falling back to C dispatch.")
+                enabled = False
+        if not enabled and self._global_graph_decode_state is not None:
+            self._global_graph_decode_state.cleanup()
+            self._global_graph_decode_state = None
+        self._global_graph_dispatch_enabled = enabled
+        if enabled:
+            print(f"Global graph dispatch enabled (full-layer graph + kernel P2P allreduce)")
+        else:
+            print(f"Global graph dispatch disabled")
+
+    def _decode_step_global_graph(self, token_embedding: np.ndarray,
+                                   position: int) -> np.ndarray:
+        """Decode step using full-layer HIP graph capture and replay.
+
+        On first call: captures per-GPU full-layer graphs (compute + kernel P2P allreduce)
+        for all layers.
+        On subsequent calls: replays graphs with updated mutable params.
+
+        Structure per layer (per GPU):
+          Graph contains:
+            attn_rmsnorm → GEMV projections → QKNorm/RoPE →
+            attention/DeltaNet → O-proj → kernel_p2p_allreduce (attn) →
+            FFN RMSNorm → gate+up+silu → down_proj → kernel_p2p_allreduce (ffn)
+
+          All GPUs run their full-layer graphs independently (no host-side sync
+          between attention and FFN — the allreduce is in the graph).
+          After all layer graphs complete, advance KV caches and compute final norm.
+
+        Falls back to C dispatch on error.
+        """
+        from src.runtime.hip_graph_dispatch import HIPGraphRuntime
+
+        h = self.config.hidden_size
+
+        # Upload embedding to all GPUs
+        emb_bytes = token_embedding.tobytes()
+        for engine in self.engines:
+            engine.device.upload(engine.d_hidden, emb_bytes)
+
+        # Lazy init: create global graph state on first use
+        if self._global_graph_decode_state is None:
+            try:
+                self._global_graph_decode_state = _GlobalGraphDecodeState(
+                    self, HIPGraphRuntime())
+                print("Global graph decode state initialized")
+            except Exception as e:
+                print(f"WARNING: Failed to init global graph decode state: {e}. "
+                      "Falling back to C dispatch.")
+                self._global_graph_dispatch_enabled = False
+                return self._decode_step_c_dispatch(token_embedding, position)
+
+        gds = self._global_graph_decode_state
+
+        # First call: capture all full-layer graphs
+        if not gds.captured:
+            try:
+                gds.capture_full_layer(position, include_allreduce=True)
+            except Exception as e:
+                print(f"WARNING: Global graph capture failed: {e}. "
+                      "Falling back to C dispatch.")
+                import traceback
+                traceback.print_exc()
+                self._global_graph_dispatch_enabled = False
+                gds.cleanup()
+                self._global_graph_decode_state = None
+                return self._decode_step_c_dispatch(token_embedding, position)
+
+        # Replay all full-layer graphs with updated mutable params
+        try:
+            gds.replay_step_full_layer(position, include_allreduce=True)
+        except Exception as e:
+            print(f"WARNING: Global graph replay failed at position={position}: {e}. "
+                  "Falling back to C dispatch.")
+            import traceback
+            traceback.print_exc()
+            self._global_graph_dispatch_enabled = False
+            gds.cleanup()
+            self._global_graph_decode_state = None
+            return self._decode_step_c_dispatch(token_embedding, position)
+
+        # Synchronize all GPUs to ensure all GPU work is complete
+        for dev_id in self.device_ids:
+            self._hip.set_device(dev_id)
+            self._hip.synchronize()
+
+        # Advance KV caches
+        for engine in self.engines:
+            engine.kv_cache.advance()
+
+        # Final norm and logits (GPU0 only)
+        e0 = self.engines[0]
+        if e0.d_final_norm:
+            e0._launch_rmsnorm(e0.d_hidden2, e0.d_hidden, e0.d_final_norm, h)
+            return np.frombuffer(e0.device.download(e0.d_hidden2, h * 2),
+                                 dtype=np.float16)
+        return np.frombuffer(e0.device.download(e0.d_hidden, h * 2),
+                             dtype=np.float16)
+
+    # ------------------------------------------------------------------
     # Graph dispatch support
     # ------------------------------------------------------------------
 
@@ -3026,6 +4086,10 @@ class TPInferenceEngine:
         # Release C graph dispatch objects (ctypes keeps them alive)
         self._c_graph_dispatch_plan = None
         self._c_graph_dispatch_objects = {}
+        # Cleanup global graph decode state
+        if self._global_graph_decode_state is not None:
+            self._global_graph_decode_state.cleanup()
+            self._global_graph_decode_state = None
         if self._p2p_ar:
             self._p2p_ar.cleanup()
             self._p2p_ar = None

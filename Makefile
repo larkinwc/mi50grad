@@ -79,12 +79,25 @@ $(BUILD_DIR)/probes $(BUILD_DIR)/bench $(BUILD_DIR)/kernels:
 	mkdir -p $@
 
 # ============================================================
+# C Extensions (host-side C shared libraries)
+# ============================================================
+
+.PHONY: c_extensions
+c_extensions: src/runtime/c_graph_dispatch.so
+
+src/runtime/c_graph_dispatch.so: src/runtime/c_graph_dispatch.c
+	gcc -O3 -shared -fPIC -I$(ROCM_PATH)/include \
+	    -L$(ROCM_PATH)/lib -lamdhip64 \
+	    -o $@ $<
+	@echo "Built $@"
+
+# ============================================================
 # All / Clean
 # ============================================================
 
 .PHONY: all clean
 
-all: probes bench kernels
+all: probes bench kernels c_extensions
 
 clean:
 	rm -rf $(BUILD_DIR)

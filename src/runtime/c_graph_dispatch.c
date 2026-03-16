@@ -163,6 +163,16 @@ typedef struct {
 /* CAllreduceSpec: same as in c_dispatch.c (copy for independence)         */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * kernel_p2p_allreduce_residual_tp4 signature:
+ *   (hidden, partial_local, peer0, peer1, peer2, n, stream) → int
+ * One call per GPU on its allreduce stream; all 4 run concurrently.
+ */
+typedef int (*kernel_p2p_ar_tp4_t)(void *hidden,
+                                    void *partial_local,
+                                    void *peer0, void *peer1, void *peer2,
+                                    uint32_t n, void *stream);
+
 typedef struct {
     int (*reduce_tp2)(void *hidden, void *p0, void *p1,
                       uint32_t n, void *stream);
@@ -182,6 +192,14 @@ typedef struct {
     uint64_t compute_streams[4];
     uint32_t num_elems;
     uint32_t _pad;
+
+    /* Kernel P2P allreduce support (use_kernel_p2p = 1 → use this path) */
+    uint32_t use_kernel_p2p;   /* 0=standard P2P, 1=kernel P2P */
+    uint32_t _pad2;
+    kernel_p2p_ar_tp4_t kernel_p2p_fn;  /* function ptr (NULL if not available) */
+    /* peer_ptrs[gpu][peer]: partial_ptrs of OTHER GPUs from each GPU's perspective */
+    /* For GPU i: peer_ptrs[i][0..2] = partial_ptrs of the 3 OTHER GPUs */
+    uint64_t peer_ptrs[4][3];  /* peer partial ptrs for kernel P2P allreduce */
 } CGraphAllreduceSpec;
 
 /* ---------------------------------------------------------------------- */
@@ -218,11 +236,57 @@ static int do_graph_allreduce_async(CGraphAllreduceSpec *ar,
     if (tp <= 1) return 0;
 
     int i, err;
-    void *ar_stream0 = (void *)(uintptr_t)ar->allreduce_streams[0];
     uint32_t n = ar->num_elems;
     size_t size = (size_t)n * 2;
 
-    /* Step 1: Record compute events on each GPU's default stream */
+    /* === Kernel P2P allreduce path (fast: single kernel per GPU, no copies) === */
+    if (ar->use_kernel_p2p && ar->kernel_p2p_fn && tp == 4) {
+        /* Step 1: Record compute events on each GPU's compute stream */
+        for (i = 0; i < tp; i++) {
+            plan->hipSetDevice_fn(ar->device_ids[i]);
+            plan->hipEventRecord_fn(
+                (void *)(uintptr_t)ar->compute_events[i],
+                (void *)(uintptr_t)ar->compute_streams[i]);
+        }
+
+        /* Step 2: Each GPU's allreduce stream waits for ALL compute events
+         * (required so no GPU reads peer partials before ALL GPUs have finished
+         * their compute) */
+        for (i = 0; i < tp; i++) {
+            void *ar_si = (void *)(uintptr_t)ar->allreduce_streams[i];
+            plan->hipSetDevice_fn(ar->device_ids[i]);
+            int j;
+            for (j = 0; j < tp; j++) {
+                plan->hipStreamWaitEvent_fn(
+                    ar_si,
+                    (void *)(uintptr_t)ar->compute_events[j], 0);
+            }
+        }
+
+        /* Step 3: Launch kernel P2P allreduce on each GPU's allreduce stream */
+        for (i = 0; i < tp; i++) {
+            plan->hipSetDevice_fn(ar->device_ids[i]);
+            void *ar_si = (void *)(uintptr_t)ar->allreduce_streams[i];
+            err = ar->kernel_p2p_fn(
+                (void *)(uintptr_t)ar->hidden_ptrs[i],
+                (void *)(uintptr_t)ar->partial_ptrs[i],
+                (void *)(uintptr_t)ar->peer_ptrs[i][0],
+                (void *)(uintptr_t)ar->peer_ptrs[i][1],
+                (void *)(uintptr_t)ar->peer_ptrs[i][2],
+                n, ar_si);
+            if (err) return err;
+            /* Record done event on each GPU's allreduce stream */
+            plan->hipEventRecord_fn(
+                (void *)(uintptr_t)ar->ar_done_events[i], ar_si);
+        }
+
+        return 0;
+    }
+
+    /* === Standard P2P allreduce path (gather-reduce-broadcast via GPU0) === */
+    void *ar_stream0 = (void *)(uintptr_t)ar->allreduce_streams[0];
+
+    /* Step 1: Record compute events on each GPU's compute stream */
     for (i = 0; i < tp; i++) {
         plan->hipSetDevice_fn(ar->device_ids[i]);
         plan->hipEventRecord_fn(
