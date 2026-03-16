@@ -425,6 +425,9 @@ def test_multistep_mutable_params(config, single_ref_15, emb_multi: np.ndarray,
 
     # TP=4 graph decode (graph captured on step 0, replayed on steps 1–14)
     print(f"  TP=4 graph decode ({num_steps} steps)...")
+    # Force fresh graph capture: disable then re-enable to destroy any prior graph
+    # state (graphs captured in earlier tests may have accumulated replay history).
+    tp4_engine.set_graph_dispatch(False)
     tp4_engine.set_c_dispatch(True)
     tp4_engine.set_graph_dispatch(True)
 

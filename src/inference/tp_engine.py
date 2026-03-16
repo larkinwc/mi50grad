@@ -2337,6 +2337,11 @@ class TPInferenceEngine:
         if not enabled and self._graph_decode_step is not None:
             self._graph_decode_step.cleanup()
             self._graph_decode_step = None
+        if not enabled:
+            # Also reset C graph dispatch plan so re-enabling creates fresh graphs
+            # (old plan holds destroyed graph exec handles, causing segfault on re-enable)
+            self._c_graph_dispatch_plan = None
+            self._c_graph_dispatch_objects = {}
         self._graph_dispatch_enabled = enabled
 
     def _decode_step_graph(self, token_embedding: np.ndarray,
