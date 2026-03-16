@@ -1,0 +1,45 @@
+{
+  "featureId": "kernel-p2p-allreduce-impl",
+  "reviewedAt": "2026-03-16T16:00:00.000Z",
+  "commitId": "e754e66",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "Implementation is clean and correct. The HIP kernel correctly eliminates host round-trips by using BAR1 P2P pointers to read peer GPU partials directly in-kernel. FP32 accumulation is used as required on gfx906. The Python integration in P2PAllreduce and TPInferenceEngine follows existing project conventions. Tests pass on real hardware with max_abs_error=0.0 and 1.50x latency speedup. One non-blocking concern: there are two nearly-identical implementations (kernel_p2p_allreduce.hip vs gemv_p2p_reduce.hip/FusedP2PReduce), which the worker already noted as a pre-existing issue.",
+    "issues": [
+      {
+        "file": "src/kernels/kernel_p2p_allreduce.hip",
+        "line": 67,
+        "severity": "non_blocking",
+        "description": "The odd-element scalar path at `else if (idx < n)` only fires for the very last element when n is odd. Since hidden_size=5120 in Qwen 3.5 27B (always even), this is never exercised in practice. Not a bug, but dead code for the current model. No issue for production."
+      },
+      {
+        "file": "src/runtime/p2p_allreduce.py",
+        "line": 290,
+        "severity": "non_blocking",
+        "description": "allreduce_residual_kernel() calls hip.synchronize() (device-sync) on ALL GPUs before launching kernels (lines 291-293). This is overly conservative — the non-blocking allreduce streams and event-based synchronization used by the C dispatch path handle this more efficiently. For the Python path (non-C-dispatch), this sync prevents overlap and adds host overhead. Could use event-based sync instead, but this is performance-only and the Python path is not the primary hot path."
+      },
+      {
+        "file": "src/runtime/p2p_allreduce.py",
+        "line": 68,
+        "severity": "non_blocking",
+        "description": "The try/except around _load_kernel_p2p_lib() silently ignores all exceptions (`pass`). This means a failed build (e.g., hipcc not found, compilation error) will silently leave _kernel_p2p_lib=None. Only a print warning is shown if the lib is unavailable. Adding a debug log of the exception would aid diagnosis."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "library",
+      "observation": "The Kernel P2P Allreduce section in .factory/library/architecture.md was added by the worker and is comprehensive. It documents the performance numbers, design decisions, and integration details correctly.",
+      "evidence": ".factory/library/architecture.md lines documenting kernel-p2p-allreduce milestone (2026-03-15 section)"
+    },
+    {
+      "area": "services",
+      "observation": "No new commands were needed in services.yaml for this feature. The existing build_all and test_tp4 commands suffice.",
+      "evidence": "Feature only uses hipcc (via _load_kernel_p2p_lib auto-build) and existing test runner"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS. Kernel P2P allreduce implementation is correct and complete. VAL-KP2P-001 (max_abs_error < 1e-3, achieved: 0.0) and VAL-KP2P-003 (latency < 119us, achieved: 79.2us = 1.50x speedup) are both satisfied. The kernel design is appropriate for gfx906/PCIe (FP32 accumulation, half2 vectorization, correct grid sizing). The Python integration follows project conventions. Non-blocking issues noted are informational only."
+}
