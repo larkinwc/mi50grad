@@ -695,22 +695,88 @@ class _GlobalGraphDecodeState:
 
         self._captured = True
 
+        # Eagerly build C graph dispatch plan after capture completes.
+        # This eliminates the per-step lazy-build overhead and ensures
+        # _c_graph_plan_ptr is set before the first replay call.
+        try:
+            self._load_c_graph_lib()
+            self._build_c_graph_plan()
+            print(f"  C graph dispatch plan ready: plan_ptr=0x{self._c_graph_plan_ptr:x}")
+        except Exception as e:
+            print(f"  WARNING: Failed to build C graph dispatch plan during capture: {e}")
+            print(f"  Will fall back to Python replay loop.")
+            import traceback
+            traceback.print_exc()
+            # Ensure _c_graph_lib is not None so lazy-build won't retry in replay
+            if self._c_graph_lib is None:
+                self._c_graph_lib = False
+            self._c_graph_plan_ptr = 0
+
     def _load_c_graph_lib(self):
         """Load c_graph_dispatch.so for tight-C graph replay loop.
 
         Eliminates Python per-layer overhead: instead of 512 Python API calls
         per decode step (from the Python replay loop), uses a single C function
         call that handles all 64 layers' graph replays + allreduces in C.
+
+        Auto-builds c_graph_dispatch.so if it is missing or stale.
         """
         import ctypes
 
-        so_path = Path(__file__).parent.parent / "runtime" / "c_graph_dispatch.so"
+        src_dir = Path(__file__).parent.parent / "runtime"
+        c_path  = src_dir / "c_graph_dispatch.c"
+        so_path = src_dir / "c_graph_dispatch.so"
+
+        if not c_path.exists():
+            raise FileNotFoundError(
+                f"c_graph_dispatch.c not found at {c_path}.")
+
+        # Auto-build if .so is missing or .c is newer
+        if not so_path.exists() or os.path.getmtime(c_path) > os.path.getmtime(so_path):
+            # Try multiple ROCm paths (container vs host)
+            rocm_include = None
+            rocm_lib = None
+            for rocm_root in ['/opt/rocm', '/usr/local/rocm', '/usr/rocm']:
+                inc = f"{rocm_root}/include"
+                lib = f"{rocm_root}/lib"
+                if os.path.isdir(inc):
+                    rocm_include = inc
+                    rocm_lib = lib
+                    break
+
+            build_cmd = [
+                "gcc", "-O3", "-shared", "-fPIC",
+                "-o", str(so_path), str(c_path),
+            ]
+            if rocm_include:
+                build_cmd += [f"-I{rocm_include}", f"-L{rocm_lib}", "-lamdhip64"]
+
+            try:
+                print(f"  Auto-building c_graph_dispatch.so ...")
+                result = subprocess.run(build_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    # Try without ROCm flags (pure types, no HIP calls at build time)
+                    build_cmd_simple = [
+                        "gcc", "-O3", "-shared", "-fPIC",
+                        "-o", str(so_path), str(c_path),
+                    ]
+                    result2 = subprocess.run(build_cmd_simple, capture_output=True,
+                                             text=True)
+                    if result2.returncode != 0:
+                        raise RuntimeError(
+                            f"gcc failed: {result.stderr}\n{result2.stderr}")
+                print(f"  c_graph_dispatch.so built successfully.")
+            except Exception as build_err:
+                raise RuntimeError(
+                    f"Failed to auto-build c_graph_dispatch.so: {build_err}. "
+                    "Build manually with: gcc -O3 -shared -fPIC "
+                    "-I/opt/rocm/include -L/opt/rocm/lib -lamdhip64 "
+                    "-o src/runtime/c_graph_dispatch.so "
+                    "src/runtime/c_graph_dispatch.c") from build_err
+
         if not so_path.exists():
             raise FileNotFoundError(
-                f"c_graph_dispatch.so not found at {so_path}. "
-                "Build with: gcc -O3 -shared -fPIC -I/opt/rocm/include "
-                "-L/opt/rocm/lib -lamdhip64 "
-                "-o src/runtime/c_graph_dispatch.so src/runtime/c_graph_dispatch.c")
+                f"c_graph_dispatch.so not found at {so_path} after build attempt.")
 
         lib = ctypes.CDLL(str(so_path))
         lib.c_graph_dispatch_step.argtypes = [
