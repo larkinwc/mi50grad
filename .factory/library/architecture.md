@@ -1452,3 +1452,30 @@ Results are essentially identical to v4 (within ±5% measurement noise):
 - LDS reduction overhead is negligible compared to weight bandwidth cost
 
 **shfl_down correctness note:** Only leading threads (k_split_id % TPC_PER_WF == 0) write to LDS. Non-leading threads may read garbage from out-of-wavefront shfl_down, but their values are discarded. Correctness confirmed by max_abs_err < 2.44e-4 on all shapes.
+
+---
+
+## GEMV v5 E2E Integration (gemv-dpp-e2e-integration milestone, 2026-03-16)
+
+**Implementation:** `src/inference/engine.py` updated to load and use gemv_int4_v5 as default for non-residual INT4 GEMV. Tests in `tests/test_gemv_v5_e2e.py`.
+
+**Changes:**
+- `_init_gemv_v2()`: Added v5 loading (t4, t8, t16 variants); v3 now loads as fallback only.
+  Load order: v2 → v5 (default, if v5.hip exists) → v3 (fallback) → v2_fused (residual GEMV).
+- `_launch_gemv_int4()`: Uses v5_t16 when `_gemv_int4_v5=True` and no residual; else v3_t16 fallback.
+- `build_decode_launch_cache()`: `ffn_down` LaunchSpec uses v5_t16 when available, v3_t16 as fallback.
+  `shared_mem=0` for v5 (static shared memory only, 64 floats for t16), `shared_mem=1024` for v3.
+- C dispatch plan automatically picks up v5 via the `ffn_down` LaunchSpec (no separate C code changes).
+
+**v4 fallback:** v4 is NOT separately wired as fallback (v3 is fallback instead). Both v3 and v5
+have the same interface and the same t16 grid (ceil(N/16)). If v5.hip is missing, v3 is used.
+
+**E2E performance results (4x MI50 gfx906, 100 steps, Qwen3.5-27B-GPTQ-Int4):**
+- Single-GPU (v5 default): **21.6 tok/s** ≥ 18.3 tok/s floor [PASS]
+- TP=4 correctness: min cosine_sim = 0.999974 ≥ 0.99 [PASS]
+- TP=4 throughput (C dispatch + kernel P2P): **20.2 tok/s** ≥ 20.0 tok/s threshold [PASS]
+- Reference baseline (v3 kernel P2P + C dispatch): ~21.1 tok/s (within noise, ~4% diff)
+
+**No regression:** v5 delivers identical throughput to v3 (both are bandwidth-limited).
+The small difference (~4%) is within measurement noise (same kernel architecture, same LDS layout).
+

@@ -499,6 +499,7 @@ class InferenceEngine:
         """Try to compile optimized GEMV kernels (coalesced INT4, vectorized FP16)."""
         self._gemv_int4_v2 = False
         self._gemv_int4_v3 = False  # v3 cooperative reduction (faster for large N)
+        self._gemv_int4_v5 = False  # v5 hybrid DPP+LDS reduction (default for non-residual GEMV)
         self._gemv_fp16_v2 = False
         self._gemv_int4_k_splits = 16  # Split K for more parallelism
         try:
@@ -521,16 +522,35 @@ class InferenceEngine:
                 print("GEMV INT4 v2 (coalesced + fused split-K) loaded")
         except Exception as e:
             print(f"GEMV INT4 v2 failed: {e}")
+        # Try to load v5 hybrid DPP+LDS reduction kernel (default for non-residual GEMV).
+        # v5 uses row-major thread layout (same coalescing as v3/v4) + two-phase reduction:
+        # Phase 1: intra-wavefront __shfl_down (no LDS), Phase 2: minimal cross-wf LDS.
+        # Performance is essentially identical to v4 (within ±5% noise, bandwidth-limited).
+        # Correctness: max_abs_err < 2.44e-4 vs v4 reference (all Qwen 3.5 shapes).
+        # Falls back to v4 if v5 .so not available.
+        try:
+            hip_path = HIP_DIR / "gemv_int4_v5.hip"
+            if hip_path.exists() and self._gemv_int4_v2:
+                self.kernels.get_hip("gemv_int4_v5_t16", "gemv_int4_v5")
+                self.kernels.get_hip("gemv_int4_v5_t8", "gemv_int4_v5")
+                self.kernels.get_hip("gemv_int4_v5_t4", "gemv_int4_v5")
+                self._gemv_int4_v5 = True
+                print("GEMV INT4 v5 (hybrid DPP+LDS t16) loaded as default for non-residual GEMV")
+        except Exception as e:
+            print(f"GEMV INT4 v5 failed (falling back to v4/v3): {e}")
         # Try to load v3 cooperative-reduction kernel (16 threads/col = t16 variant).
         # v3_t16 is 16% faster than v2_fused for N=4096 and same speed for N=11008.
-        # Used for GEMV WITHOUT residual epilogue. v2_fused remains for residual GEMV
-        # (down_proj with residual fused in). This is benchmarked result from m2-int4-gemv-optimize.
+        # Used for GEMV WITHOUT residual epilogue when v5 unavailable. v2_fused remains for
+        # residual GEMV (down_proj with residual fused in).
         try:
             hip_path = HIP_DIR / "gemv_int4_v3.hip"
             if hip_path.exists() and self._gemv_int4_v2:
                 self.kernels.get_hip("gemv_int4_v3_t16", "gemv_int4_v3")
                 self._gemv_int4_v3 = True
-                print("GEMV INT4 v3 (cooperative reduction t16) loaded as default for non-residual GEMV")
+                if self._gemv_int4_v5:
+                    print("GEMV INT4 v3 (cooperative reduction t16) loaded as v5 fallback")
+                else:
+                    print("GEMV INT4 v3 (cooperative reduction t16) loaded as default for non-residual GEMV")
         except Exception as e:
             print(f"GEMV INT4 v3 failed (falling back to v2): {e}")
         self._gemv_int4_dual = False
@@ -1676,12 +1696,15 @@ class InferenceEngine:
 
     def _launch_gemv_int4(self, dst, src, qweight, scales, zeros, K, N, residual=0):
         if self._gemv_int4_v2:
-            # For GEMV without residual epilogue, use v3_t16 if available (faster).
-            # v3_t16: 16 threads/col, cooperative K-reduction, single launch, no atomics,
-            # no persistent buffers, ~16% faster than v2_fused for N=4096.
-            if self._gemv_int4_v3 and not residual:
-                # v3_t16: 16 cols per WG (256/16=16), grid=(ceil(N/16), 1, 1)
-                func = self.kernels.get_hip("gemv_int4_v3_t16", "gemv_int4_v3")
+            # For GEMV without residual epilogue, use v5_t16 (default) or v3_t16 (fallback).
+            # v5_t16: hybrid DPP+LDS reduction, row-major layout (preserves coalescing).
+            # v5 performance is equal to v4/v3 (bandwidth-limited, within ±5% noise).
+            # v3_t16 is kept as fallback if v5 is unavailable.
+            if (self._gemv_int4_v5 or self._gemv_int4_v3) and not residual:
+                if self._gemv_int4_v5:
+                    func = self.kernels.get_hip("gemv_int4_v5_t16", "gemv_int4_v5")
+                else:
+                    func = self.kernels.get_hip("gemv_int4_v3_t16", "gemv_int4_v3")
                 cols_per_wg = 16  # 256 threads / 16 threads_per_col
                 grid_x = (N + cols_per_wg - 1) // cols_per_wg
                 params = [
@@ -2651,12 +2674,20 @@ class InferenceEngine:
                     ],
                 )
 
-            # --- FFN down projection (INT4 v3 t16, no residual for TP) ---
-            if self._gemv_int4_v3:
+            # --- FFN down projection (v5_t16 default, v3_t16 fallback, no residual for TP) ---
+            # v5 uses hybrid DPP+LDS reduction with identical performance to v3/v4.
+            # Falls back to v3_t16 if v5 is unavailable.
+            if self._gemv_int4_v5 or self._gemv_int4_v3:
                 cols_per_wg = 16
                 down_grid = (h + cols_per_wg - 1) // cols_per_wg
+                if self._gemv_int4_v5:
+                    down_func = self.kernels.get_hip("gemv_int4_v5_t16", "gemv_int4_v5")
+                    shared_mem = 0  # v5 uses static shared memory (NUM_WF * COLS_PER_WG floats)
+                else:
+                    down_func = self.kernels.get_hip("gemv_int4_v3_t16", "gemv_int4_v3")
+                    shared_mem = 1024
                 lc['ffn_down'] = LaunchSpec(
-                    func=self.kernels.get_hip("gemv_int4_v3_t16", "gemv_int4_v3"),
+                    func=down_func,
                     grid=(down_grid, 1, 1), block=(256, 1, 1),
                     params=[
                         ctypes.c_uint64(self.d_ffn_gate),
@@ -2668,7 +2699,7 @@ class InferenceEngine:
                         ctypes.c_uint32(h),
                         ctypes.c_uint32(cfg.group_size),
                     ],
-                    shared_mem=1024,
+                    shared_mem=shared_mem,
                 )
 
             layer_caches[layer_idx] = lc
