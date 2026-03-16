@@ -1363,3 +1363,40 @@ This was confirmed by scrutiny validation: `test_graph_decode.py` segfaulted at 
 
 **HW difference note:**
 Sprint 3 baseline (38 tok/s) was measured on 3×gfx906 + 1×gfx908 configuration. Current hardware is 4×gfx906. The gfx908 has higher compute throughput, so mixed-hardware TP=4 achieves higher tok/s. On pure 4×gfx906, baseline is ~15 tok/s (star) vs ~21 tok/s (kernel P2P).
+
+---
+
+## Global Graph + C Graph Dispatch Benchmark (Milestone: global-graph-capture, global-graph-c-dispatch-bench, 2026-03-16)
+
+**Implementation:** `tests/test_global_graph_bench.py` — 100-step TP=4 throughput + fallback chain benchmark.
+
+**Performance results (4×gfx906 MI50, 100 steps, Qwen3.5-27B-GPTQ-Int4, MAX_SEQ_LEN=256):**
+- Cached + stream (fallback): 15.1 tok/s
+- C dispatch + kernel P2P (baseline): 21.1 tok/s
+- Global graph dispatch (C plan): 20.4 tok/s (0.97× vs C dispatch)
+
+**Key finding:** Global graph throughput is essentially equal to C dispatch (0.97×), not faster.
+Root cause: allreduce overhead (~15.2 ms/token from 128× kernel P2P) is the bottleneck,
+not kernel dispatch overhead (~1 ms/token). Graph capture + C loop replay reduces dispatch
+overhead by ~7.9×, but this only saves ~0.9 ms per token (~5%) — below measurement noise.
+
+**Correctness results:**
+- Global graph: min cosine_sim = 0.9995 (all 10 steps pass ≥ 0.99)
+- C dispatch: min cosine_sim = 0.9998 (all 10 steps pass ≥ 0.99)
+- Cached+stream: min cosine_sim = 0.9984 (all 10 steps pass ≥ 0.99)
+
+**C graph dispatch plan note:**
+The `c_graph_dispatch.so` must be built on the dev server after every rsync (since rsync --delete
+removes it). Build command: `gcc -O3 -shared -fPIC -I/opt/rocm/include -L/opt/rocm/lib -lamdhip64
+-o src/runtime/c_graph_dispatch.so src/runtime/c_graph_dispatch.c`
+If `.so` is missing, global graph falls back to Python replay (15 tok/s, same as cached+stream).
+
+**Fallback chain:**
+global graph (C plan) → C dispatch → cached+stream
+All three modes produce cosine_sim ≥ 0.99. Toggle (`set_global_graph_dispatch(True/False)`)
+correctly enables/disables the global graph mode and cleans up state on disable.
+
+**Test structure:**
+- `tests/test_global_graph_bench.py` runs all modes in ONE subprocess (one engine load)
+  to avoid OOM from loading multiple TP=4 engines. Subprocess internally collects
+  single-GPU reference via a nested subprocess, then runs 3 modes sequentially.
