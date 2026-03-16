@@ -1,42 +1,38 @@
 {
   "milestone": "global-graph-capture",
-  "round": 1,
-  "status": "fail",
+  "round": 2,
+  "status": "pass",
   "assertionsSummary": {
     "total": 6,
-    "passed": 4,
-    "failed": 2,
+    "passed": 6,
+    "failed": 0,
     "blocked": 0
   },
-  "passedAssertions": ["VAL-GGC-001", "VAL-GGC-002", "VAL-GGC-003", "VAL-GGC-006"],
-  "failedAssertions": [
-    {
-      "id": "VAL-GGC-004",
-      "reason": "Global graph throughput (15.1 tok/s) is only 0.72x vs C dispatch (21.1 tok/s), below the 95% threshold. C_PLAN_OK=False means the C graph dispatch extension is not active — Python replay loop eliminates the performance benefit of graph capture."
-    },
-    {
-      "id": "VAL-GGC-005",
-      "reason": "C_PLAN_OK=False — c_graph_dispatch.so C extension not wired into global graph decode state. Global graph replay uses Python fallback loop instead of C extension, causing the same overhead as cached+stream dispatch."
-    }
-  ],
+  "passedAssertions": ["VAL-GGC-001", "VAL-GGC-002", "VAL-GGC-003", "VAL-GGC-004", "VAL-GGC-005", "VAL-GGC-006"],
+  "failedAssertions": [],
   "blockedAssertions": [],
   "appliedUpdates": [],
-  "previousRound": null,
+  "previousRound": ".factory/validation/global-graph-capture/user-testing/synthesis.json (round 1)",
   "testDetails": {
     "script": "tests/test_global_graph_bench.py",
-    "durationSeconds": 472,
+    "durationSeconds": 474,
+    "assertionsTested": ["VAL-GGC-004", "VAL-GGC-005"],
     "throughputResults": {
-      "cachedStream": 15.14,
-      "cDispatchKernelP2P": 21.06,
-      "globalGraph": 15.08
+      "cachedStream": 15.22,
+      "cDispatchKernelP2P": 21.14,
+      "globalGraph": 20.51
     },
     "correctnessResults": {
-      "globalGraphMinCosine": 0.999721,
-      "cDispatchMinCosine": 0.999849,
-      "cachedStreamMinCosine": 0.998630
+      "globalGraphMinCosine": 0.999664,
+      "cDispatchMinCosine": 0.999177,
+      "cachedStreamMinCosine": 0.999918
     },
     "captureOk": true,
-    "cPlanOk": false,
-    "toggleOk": true
-  }
+    "cPlanOk": true,
+    "toggleOk": true,
+    "allTestsPassed": true,
+    "totalTests": 10,
+    "passedTests": 10
+  },
+  "fixApplied": "fix-global-graph-c-plan-wiring: Wire c_graph_dispatch.so into _GlobalGraphDecodeState so _c_graph_plan_ptr is non-zero after capture. C_PLAN_OK now True, global graph 20.5 tok/s (97% of C dispatch 21.1 tok/s)."
 }

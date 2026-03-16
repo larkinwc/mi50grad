@@ -1,0 +1,34 @@
+{
+  "groupId": "ggc-rerun",
+  "milestone": "global-graph-capture",
+  "assertionsTested": ["VAL-GGC-004", "VAL-GGC-005"],
+  "status": "pass",
+  "results": {
+    "VAL-GGC-004": {
+      "status": "pass",
+      "evidence": "global_graph=20.5 tok/s vs c_dispatch=21.1 tok/s (0.97x >= 0.95 threshold). Script: tests/test_global_graph_bench.py. global_graph_throughput: PASS"
+    },
+    "VAL-GGC-005": {
+      "status": "pass",
+      "evidence": "C_PLAN_OK=True — c_graph_dispatch.so wired into _GlobalGraphDecodeState. c_graph_dispatch_active: PASS"
+    }
+  },
+  "toolsUsed": ["ssh", "docker", "python3"],
+  "frictions": [],
+  "blockers": [],
+  "testOutput": {
+    "captureOk": true,
+    "cPlanOk": true,
+    "toggleOk": true,
+    "tpsGlobalGraph": 20.51,
+    "tpsCDispatch": 21.14,
+    "tpsCachedStream": 15.22,
+    "ratioGlobalVsC": 0.97,
+    "minCosineSimGlobalGraph": 0.999664,
+    "minCosineSimCDispatch": 0.999177,
+    "minCosineSimCachedStream": 0.999918,
+    "allTestsPassed": true,
+    "totalTests": 10,
+    "passedTests": 10
+  }
+}
