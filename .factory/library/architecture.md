@@ -1400,3 +1400,55 @@ correctly enables/disables the global graph mode and cleans up state on disable.
 - `tests/test_global_graph_bench.py` runs all modes in ONE subprocess (one engine load)
   to avoid OOM from loading multiple TP=4 engines. Subprocess internally collects
   single-GPU reference via a nested subprocess, then runs 3 modes sequentially.
+
+---
+
+## INT4 GEMV v5: Hybrid DPP + Minimal LDS Reduction (gemv-dpp-reduction milestone, 2026-03-16)
+
+**File:** `src/kernels/gemv_int4_v5.hip`
+**Test:** `tests/test_gemv_int4_v5.py`
+
+**Design: Row-major thread layout (same as v4) + two-phase hybrid reduction.**
+
+The feature spec suggested a "col-major" thread remapping to enable pure intra-wavefront DPP reduction. However, the col-major layout BREAKS memory coalescing for the weight matrix B_q4[K/8, N]:
+- Row-major (v4): adjacent threads access adjacent columns → perfectly coalesced
+- Col-major: all TPC threads for 1 column access the SAME column but different K-rows (huge stride → cache unfriendly) → 5-15x SLOWER
+
+**Final approach: Hybrid DPP + minimal LDS (row-major layout preserved):**
+In the row-major layout, within each wavefront (64 threads), each column has TPC/4 "k-split partners":
+- t16 (COLS_PER_WG=16): 4 k-splits per col per wavefront (threads at offsets 0, 16, 32, 48 within wf)
+- t8 (COLS_PER_WG=32): 2 k-splits per col per wavefront (threads at offsets 0, 32 within wf)
+- t4 (COLS_PER_WG=64): 1 k-split per col per wavefront (no intra-wf partners)
+
+**Phase 1 (intra-wavefront DPP):**
+```cpp
+if (TPC_PER_WF >= 2) acc += __shfl_down(acc, COLS_PER_WG);      // step 1
+if (TPC_PER_WF >= 4) acc += __shfl_down(acc, COLS_PER_WG * 2);  // step 2
+```
+- t16: shfl_down(16) + shfl_down(32) → 4→1 per wavefront, NO LDS for this phase
+- t8:  shfl_down(32) → 2→1 per wavefront, NO LDS for this phase
+- t4:  no intra-wf reduction possible
+
+**Phase 2 (minimal cross-wavefront LDS):**
+After phase 1, only COLS_PER_WG leading threads (one per wavefront, per col) write to LDS.
+Then k_split_id=0 reads 4 values and sums.
+- t16: 64 LDS writes (vs 256 in v4), 4 reads per col (vs 16 in v4) → 4x less LDS work
+- t8:  128 LDS writes (vs 256 in v4), 4 reads per col (vs 8 in v4) → 2x less LDS work
+- t4:  256 LDS writes (same as v4), 4 reads per col (same as v4 for TPC=4)
+
+**Performance vs v4 on MI50 gfx906 (100 iter, K=5120, gs=128):**
+Since the kernel is memory-bandwidth bound (weight reads), the LDS reduction savings are small.
+Results are essentially identical to v4 (within ±5% measurement noise):
+- N=4096: t4=119.5us (1.01x), t8=88.8us (1.00x), t16=85.8us (1.00x)
+- N=5120: t4=121.3us (1.01x), t8=85.5us (1.01x), t16=83.6us (1.00x)
+- N=11008: t4=135.2us (1.00x), t8=124.5us (0.97x), t16=124.0us (1.00x)
+
+**Correctness:** max_abs_err < 2.44e-4 (well below 1e-3 threshold) for all Qwen 3.5 shapes.
+
+**Key lesson:** For bandwidth-limited INT4 GEMV with GPTQ weight format [K/8, N]:
+- Row-major thread layout is MANDATORY for coalescing (adjacent threads → adjacent cols)
+- DPP reduction reduces LDS traffic but doesn't significantly improve wall-clock time
+- The real bottleneck is reading K*N/2 weight bytes from HBM at ~130-160 GB/s vs 857 GB/s peak
+- LDS reduction overhead is negligible compared to weight bandwidth cost
+
+**shfl_down correctness note:** Only leading threads (k_split_id % TPC_PER_WF == 0) write to LDS. Non-leading threads may read garbage from out-of-wavefront shfl_down, but their values are discarded. Correctness confirmed by max_abs_err < 2.44e-4 on all shapes.
