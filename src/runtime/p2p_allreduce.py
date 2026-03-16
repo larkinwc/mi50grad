@@ -63,6 +63,13 @@ class P2PAllreduce:
         self._lib = None
         self._load_lib()
 
+        # Load kernel P2P allreduce library (lazy: loaded on first use)
+        self._kernel_p2p_lib = None
+        try:
+            self._load_kernel_p2p_lib()
+        except Exception:
+            pass  # Kernel P2P lib is optional, falls back to standard P2P
+
         # Allocate temporary gather buffers on GPU0 for remote partials
         # (one per remote GPU: tp_size - 1 buffers)
         size = hidden_size * 2  # FP16 = 2 bytes
@@ -190,6 +197,139 @@ class P2PAllreduce:
     def _stream_ptr(self, stream: int):
         """Convert Python int stream handle to ctypes c_void_p."""
         return ctypes.c_void_p(stream) if stream else None
+
+    def _load_kernel_p2p_lib(self):
+        """Build and load the kernel_p2p_allreduce.hip kernel as shared library.
+
+        This is the new kernel-based P2P allreduce that eliminates host round-trips.
+        Each GPU launches a single kernel that reads peer GPU memory via P2P (BAR1)
+        and computes the full reduce locally — no gather/broadcast needed.
+        """
+        src_dir = Path(__file__).parent.parent / "kernels"
+        hip_path = src_dir / "kernel_p2p_allreduce.hip"
+        build_dir = Path(__file__).parent.parent.parent / "build" / "kernels"
+        so_path = build_dir / "kernel_p2p_allreduce.so"
+
+        if not hip_path.exists():
+            raise FileNotFoundError(f"Kernel not found: {hip_path}")
+
+        # Build if missing or stale
+        build_dir.mkdir(parents=True, exist_ok=True)
+        if not so_path.exists() or (
+                os.path.getmtime(hip_path) > os.path.getmtime(so_path)):
+            subprocess.check_call([
+                "/opt/rocm/bin/hipcc",
+                "-O3", "--offload-arch=gfx906", "-std=c++17",
+                "-shared", "-fPIC",
+                "-o", str(so_path),
+                str(hip_path),
+            ])
+
+        lib = ctypes.CDLL(str(so_path))
+
+        # kernel_p2p_allreduce_residual_tp4(hidden, partial_local, peer0, peer1, peer2, n, stream)
+        lib.kernel_p2p_allreduce_residual_tp4.argtypes = [
+            ctypes.c_void_p,                                         # hidden
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,      # partial_local, peer0, peer1
+            ctypes.c_void_p,                                         # peer2
+            ctypes.c_uint, ctypes.c_void_p                          # n, stream
+        ]
+        lib.kernel_p2p_allreduce_residual_tp4.restype = ctypes.c_int
+
+        # kernel_p2p_allreduce_residual_tp2(hidden, partial_local, peer0, n, stream)
+        lib.kernel_p2p_allreduce_residual_tp2.argtypes = [
+            ctypes.c_void_p,                    # hidden
+            ctypes.c_void_p, ctypes.c_void_p,   # partial_local, peer0
+            ctypes.c_uint, ctypes.c_void_p      # n, stream
+        ]
+        lib.kernel_p2p_allreduce_residual_tp2.restype = ctypes.c_int
+
+        # kernel_p2p_allreduce_sum_tp4(partial_local, peer0, peer1, peer2, n, stream)
+        lib.kernel_p2p_allreduce_sum_tp4.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,  # partial_local, peer0, peer1
+            ctypes.c_void_p,                                      # peer2
+            ctypes.c_uint, ctypes.c_void_p                       # n, stream
+        ]
+        lib.kernel_p2p_allreduce_sum_tp4.restype = ctypes.c_int
+
+        self._kernel_p2p_lib = lib
+
+    def allreduce_residual_kernel(self, partial_ptrs: list, hidden_ptrs: list,
+                                  num_elems: int):
+        """Kernel-based P2P allreduce + residual add.
+
+        Eliminates host round-trips by having each GPU run a single kernel that
+        directly reads peer GPU partial buffers via BAR1-mapped P2P pointers.
+
+        Unlike allreduce_residual() (which uses gather→reduce→broadcast on GPU0),
+        this method launches one kernel per GPU simultaneously. Each GPU independently
+        reads all 4 partials (local + 3 remote) and writes the reduced result to its
+        own hidden buffer.
+
+        Requires P2P access to be enabled (done in __init__ via _enable_p2p()).
+        On gfx906/PCIe, this uses BAR1 aperture (~12 GB/s), which is sufficient
+        for 10KB payloads where latency dominates over bandwidth.
+
+        Args:
+            partial_ptrs: per-GPU partial result pointers (partial_ptrs[i] on device i)
+            hidden_ptrs:  per-GPU hidden buffer pointers (hidden_ptrs[i] on device i)
+            num_elems:    number of FP16 elements
+        """
+        tp = self._tp_size
+        if tp == 1:
+            return
+
+        if self._kernel_p2p_lib is None:
+            raise RuntimeError(
+                "kernel_p2p_allreduce.so not loaded. "
+                "Check that kernel_p2p_allreduce.hip was compiled.")
+
+        hip = self._hip
+
+        # Sync all GPUs to ensure GEMV kernels have completed
+        # (all partials must be ready before kernel reads peer memory)
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            hip.synchronize()
+
+        # Launch fused kernel on each GPU simultaneously.
+        # Each GPU reads its own partial + peer partials via P2P pointers.
+        lib = self._kernel_p2p_lib
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            ar_stream = self._allreduce_streams[i]
+            ar_stream_ptr = ctypes.c_void_p(ar_stream)
+
+            if tp == 2:
+                peer_i = 1 - i
+                err = lib.kernel_p2p_allreduce_residual_tp2(
+                    ctypes.c_void_p(hidden_ptrs[i]),
+                    ctypes.c_void_p(partial_ptrs[i]),
+                    ctypes.c_void_p(partial_ptrs[peer_i]),
+                    ctypes.c_uint(num_elems),
+                    ar_stream_ptr)
+            elif tp == 4:
+                peer_indices = [j for j in range(tp) if j != i]
+                err = lib.kernel_p2p_allreduce_residual_tp4(
+                    ctypes.c_void_p(hidden_ptrs[i]),
+                    ctypes.c_void_p(partial_ptrs[i]),
+                    ctypes.c_void_p(partial_ptrs[peer_indices[0]]),
+                    ctypes.c_void_p(partial_ptrs[peer_indices[1]]),
+                    ctypes.c_void_p(partial_ptrs[peer_indices[2]]),
+                    ctypes.c_uint(num_elems),
+                    ar_stream_ptr)
+            else:
+                raise ValueError(f"tp_size={tp} not supported (2 or 4 only)")
+
+            if err != 0:
+                raise HIPError(
+                    f"kernel_p2p_allreduce_residual_tp{tp} kernel failed on GPU {i}: "
+                    f"HIP error {err}")
+
+        # Sync all allreduce streams
+        for i in range(tp):
+            hip.set_device(self._device_ids[i])
+            hip.stream_synchronize(self._allreduce_streams[i])
 
     def allreduce_residual(self, partial_ptrs: list, hidden_ptrs: list,
                            num_elems: int, skip_device_sync: bool = False):

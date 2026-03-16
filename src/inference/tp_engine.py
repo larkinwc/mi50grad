@@ -543,6 +543,10 @@ class TPInferenceEngine:
                 print(f"Ring allreduce unavailable ({e}), using P2P allreduce fallback")
                 self._ring_ar = None
 
+        # Kernel P2P allreduce flag: use allreduce_residual_kernel() on _p2p_ar
+        # (new kernel that directly reads peer GPU memory via BAR1, no host round-trips)
+        self._kernel_p2p_allreduce = False  # flag to enable kernel P2P path
+
         # Fallback host buffers
         h = config.hidden_size
         self._host_bufs = [ctypes.create_string_buffer(h * 2)
@@ -687,6 +691,42 @@ class TPInferenceEngine:
             print(f"Ring allreduce enabled (TP={self.tp_size})")
         else:
             print(f"Ring allreduce disabled, using {'fused P2P' if self._fused_p2p_reduce else 'standard P2P'} allreduce")
+
+    def set_kernel_p2p_allreduce(self, enabled: bool):
+        """Enable or disable kernel-based P2P allreduce path.
+
+        When enabled=True, allreduce operations use allreduce_residual_kernel()
+        from the P2PAllreduce class, which launches a single HIP kernel per GPU
+        that directly reads peer GPU partial buffers via BAR1-mapped P2P pointers.
+
+        This eliminates all host synchronization points per allreduce call:
+        - No hipSetDevice x4
+        - No hipMemcpyPeerAsync gather x3
+        - No hipStreamSynchronize (before reduce)
+        - No reduce kernel on GPU0 only
+        - No hipStreamSynchronize (after reduce)
+        - No hipMemcpyPeerAsync broadcast x3
+        - No sync all
+        Instead: 1 kernel launch per GPU + 1 stream sync per GPU
+
+        Requires _p2p_ar to be initialized and kernel_p2p_allreduce.so to be compiled.
+        Falls back to standard P2P allreduce if kernel P2P is unavailable.
+        """
+        if enabled:
+            if self._p2p_ar is None:
+                print("WARNING: Kernel P2P allreduce requires P2P allreduce (unavailable). "
+                      "Falling back to standard allreduce.")
+                enabled = False
+            elif self._p2p_ar._kernel_p2p_lib is None:
+                print("WARNING: kernel_p2p_allreduce.so not loaded. "
+                      "Falling back to standard P2P allreduce.")
+                enabled = False
+        self._kernel_p2p_allreduce = enabled
+        if enabled:
+            print(f"Kernel P2P allreduce enabled (TP={self.tp_size}, "
+                  f"single kernel per GPU, no host round-trips)")
+        else:
+            print(f"Kernel P2P allreduce disabled")
 
     def set_cached_dispatch(self, cached: bool):
         """Enable or disable cached (pre-built parameter) dispatch.
@@ -1594,9 +1634,20 @@ class TPInferenceEngine:
     def _allreduce_residual(self, buffer_name: str, hidden_size: int):
         """Allreduce + residual add to d_hidden.
 
-        Tries fused P2P reduce first (when enabled), then standard P2P GPU allreduce,
-        then fast_ar C extension, then Python fallback.
+        Tries kernel P2P allreduce first (when enabled), then fused P2P reduce,
+        then ring allreduce, then standard P2P GPU allreduce, then fast_ar C
+        extension, then Python fallback.
         """
+        # Kernel P2P allreduce (new path): each GPU runs a single kernel that reads
+        # peer GPU partials directly via BAR1 P2P — no host round-trips, no gather/broadcast.
+        if (self._kernel_p2p_allreduce and self._p2p_ar is not None
+                and self._p2p_ar._kernel_p2p_lib is not None
+                and self.tp_size in (2, 4)):
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            hidden_ptrs = [e.d_hidden for e in self.engines]
+            self._p2p_ar.allreduce_residual_kernel(partial_ptrs, hidden_ptrs, hidden_size)
+            return
+
         # Fused P2P reduce (new path): each GPU reads all peer partials directly via P2P
         # and updates its own hidden, all simultaneously. Eliminates gather+broadcast steps.
         if (self._fused_p2p_reduce and self._fused_p2p_ar is not None
