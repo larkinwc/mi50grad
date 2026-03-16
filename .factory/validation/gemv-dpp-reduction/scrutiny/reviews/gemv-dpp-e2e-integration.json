@@ -1,0 +1,50 @@
+{
+  "featureId": "gemv-dpp-e2e-integration",
+  "reviewedAt": "2026-03-16T19:20:00.000Z",
+  "commitId": "26c4961",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "gemv_int4_v5 is correctly wired as the default non-residual INT4 GEMV in engine.py. The implementation preserves the fallback chain (v5 → v3 → v2), and the C dispatch plan picks up v5 automatically via LaunchSpec without requiring C code changes. The shared_mem=0 for v5 (using static shared memory) is correct since gemv_int4_v5 uses __shared__ float s_reduce[NUM_WF * COLS_PER_WG] which is statically allocated. E2E results are solid: 21.6 tok/s single-GPU, 20.2 tok/s TP=4, cosine_sim 0.9999.",
+    "issues": [
+      {
+        "file": "src/inference/engine.py",
+        "line": 556,
+        "severity": "non_blocking",
+        "description": "The feature description says 'Keep v4 as fallback if v5 is unavailable' but the implementation uses v3 as fallback (not v4). This is a deliberate and reasonable choice (v3 and v5 have identical interfaces), but it diverges from the feature spec. The commit message documents this decision clearly: 'v4 is NOT separately wired as fallback (v3 is fallback instead)'. No correctness issue, but future readers of the feature spec may be confused."
+      },
+      {
+        "file": "src/inference/engine.py",
+        "line": 529,
+        "severity": "non_blocking",
+        "description": "v5 loading depends on self._gemv_int4_v2 being True (line: 'if hip_path.exists() and self._gemv_int4_v2'). This means v5 won't load if v2 fails. This dependency is inherited from v3 loading and is consistent with the existing pattern. However, it's worth noting: if v2 fails but v5.hip exists, v5 will be silently skipped. This is an existing pattern in the codebase (not newly introduced), just propagated to v5."
+      },
+      {
+        "file": "tests/test_gemv_v5_e2e.py",
+        "line": 15,
+        "severity": "non_blocking",
+        "description": "Test uses hardcoded path '/opt/mi50grad' (sys.path.insert) instead of a relative project root path. This ties the test to the Docker container environment. Other test files in the project use different path strategies. Minor: the test runs correctly in Docker and the comment explains the usage, but it's not portable for local testing."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "library",
+      "observation": "The shared_mem=0 for v5 (static shared memory) vs shared_mem=1024 for v3 is documented in architecture.md and in the code comment. This is important for C dispatch plan correctness — the LaunchSpec shared_mem field controls the dynamic LDS allocation hint passed to the kernel, and v5's static allocation doesn't need it. This is well-documented.",
+      "evidence": "engine.py comment: 'shared_mem=0  # v5 uses static shared memory (NUM_WF * COLS_PER_WG floats)'"
+    },
+    {
+      "area": "skills",
+      "observation": "The test timeout for TP=4 E2E tests may be insufficient. The worker noted in skillFeedback that the 600s default timeout is too short for the full TP=4 E2E test which takes ~800s. This suggests the services.yaml or skill should document the expected runtime for E2E tests to avoid premature timeouts.",
+      "evidence": "Handoff skillFeedback: 'The test script timeout (600s) is too short for the full TP=4 E2E test which takes ~800s. Consider increasing the default or documenting this in the skill.'"
+    },
+    {
+      "area": "library",
+      "observation": "The integration confirms that v5/v3/v4 all deliver essentially identical throughput (~20-21 tok/s TP=4) because the GEMV is bandwidth-limited. The TP=4 throughput ceiling is determined by the allreduce and C dispatch overhead, not GEMV kernel quality. This insight (GEMV is not the TP=4 bottleneck) should guide future optimization priorities.",
+      "evidence": "architecture.md: 'No regression: v5 delivers identical throughput to v3 (both are bandwidth-limited). The small difference (~4%) is within measurement noise.'"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "Feature passes. gemv_int4_v5 is correctly wired as default GEMV in engine.py with proper fallback chain (v5→v3→v2). C dispatch plan picks up v5 automatically via LaunchSpec. VAL-DPP-003 satisfied: TP=4 20.2 tok/s >= 20.0 floor, single-GPU 21.6 tok/s >= 18.3 floor, cosine sim 0.9999 >= 0.99. Three minor non-blocking issues: fallback uses v3 not v4 (intentional deviation from spec), v5 loading depends on v2, hardcoded Docker path in test. Key insight documented: GEMV is not the TP=4 bottleneck (bandwidth-limited), so GEMV optimizations don't meaningfully improve TP=4 throughput."
+}

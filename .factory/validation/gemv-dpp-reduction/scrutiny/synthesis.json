@@ -1,0 +1,68 @@
+{
+  "milestone": "gemv-dpp-reduction",
+  "round": 1,
+  "status": "pass",
+  "validatorsRun": {
+    "test": {
+      "passed": true,
+      "command": "ssh root@192.168.1.198 \"docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /opt/mi50grad:/opt/mi50grad mi50grad bash -c 'cd /opt/mi50grad && python3 tests/test_gemv_int4_v5.py'\"",
+      "exitCode": 0,
+      "notes": "VAL-DPP-001 PASS (max_abs_err < 2.44e-4 for all 4 Qwen 3.5 shapes), VAL-DPP-002 PASS (all primary shapes within 5% margin). Python syntax check also passed for all src/ and tests/ files."
+    },
+    "typecheck": {
+      "passed": true,
+      "command": "python3 -c \"import ast, os, sys; ...(all src/ and tests/ .py files)\"",
+      "exitCode": 0,
+      "notes": "No syntax errors found in src/ or tests/ Python files. Project uses HIP C++ kernels which require remote compilation; hipcc build also succeeded (gemv_int4_v4.so and gemv_int4_v5.so both compiled without errors)."
+    },
+    "lint": {
+      "passed": true,
+      "command": "python3 -m py_compile src/inference/engine.py src/kernels/launcher.py",
+      "exitCode": 0,
+      "notes": "No local linting tools (flake8/pylint) are configured in the project. Python syntax compilation check passed for key modified files."
+    }
+  },
+  "reviewsSummary": {
+    "total": 2,
+    "passed": 2,
+    "failed": 0,
+    "failedFeatures": []
+  },
+  "blockingIssues": [],
+  "appliedUpdates": [],
+  "suggestedGuidanceUpdates": [
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Update the 'GEMV Kernel' section in Architecture Notes to reflect that gemv_int4_v5 is now the default. Currently says 'gemv_int4_v4 with... LDS tree reduction'. Should read: 'gemv_int4_v5 (default, hybrid DPP+LDS) / v3 (fallback) with v_dot2_f32_f16, v_bfe_u32, cooperative reduction (t4/t8/t16 variants). v5 uses intra-wavefront shfl_down + minimal cross-wavefront LDS (row-major layout preserved for coalescing).'",
+      "evidence": "gemv-dpp-e2e-integration (commit 26c4961) wired v5 as default in engine.py, but AGENTS.md still references v4 as the current GEMV kernel in its Architecture Notes section.",
+      "isSystemic": false
+    },
+    {
+      "target": "skills",
+      "suggestion": "Add a step to kernel-optimization-worker skill: before investing in compute-side optimizations (DPP, shfl, vectorization), verify whether the kernel is compute-bound or bandwidth-bound. For INT4 GEMV on MI50 (857 GB/s peak HBM2), the kernel is strictly bandwidth-limited, so compute-side optimizations (DPP reduction) cannot improve wall-clock time. A quick roofline analysis (arithmetic intensity × peak bandwidth vs peak compute) would identify this upfront.",
+      "evidence": "gemv-dpp-reduction worker spent iteration time on DPP implementation that delivered no measured speedup. Worker documented: 'the kernel is memory-bandwidth bound and LDS reduction is not the bottleneck.' skillFeedback explicitly requested this addition.",
+      "isSystemic": false
+    },
+    {
+      "target": "skills",
+      "suggestion": "Document that TP=4 E2E tests (test_gemv_v5_e2e.py, similar patterns) take ~800s to complete on 4x MI50. The default 600s timeout is insufficient. Workers should use a 900s+ timeout for SSH Docker commands running full TP=4 E2E tests.",
+      "evidence": "gemv-dpp-e2e-integration worker skillFeedback: 'The test script timeout (600s) is too short for the full TP=4 E2E test which takes ~800s. Consider increasing the default or documenting this in the skill.'",
+      "isSystemic": true
+    }
+  ],
+  "rejectedObservations": [
+    {
+      "observation": "col-major vs row-major coalescing insight should be documented in library",
+      "reason": "already-documented — committed in f666457 to .factory/library/architecture.md with full detail"
+    },
+    {
+      "observation": "shared_mem=0 for v5 (static) vs v3 should be documented",
+      "reason": "already-documented — captured in architecture.md commit 26c4961 and code comments"
+    },
+    {
+      "observation": "GEMV not the TP=4 bottleneck (bandwidth-limited) should be documented",
+      "reason": "already-documented — architecture.md clearly states 'No regression: v5 delivers identical throughput to v3 (both are bandwidth-limited)'"
+    }
+  ],
+  "previousRound": null
+}
