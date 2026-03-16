@@ -1,0 +1,15 @@
+{
+  "groupId": "val-graphdecode-002",
+  "milestone": "hip-graph-decode",
+  "assertions": [
+    {
+      "id": "VAL-GRAPHDECODE-002",
+      "status": "pass",
+      "reason": "Throughput comparison between graph replay and C dispatch documented with root cause analysis. C graph dispatch (36.9 tok/s) is effectively equal to C dispatch (36.9 tok/s, 0.999x ratio). The test passes per updated assertion definition: documentation of results and root cause analysis is required, not strict throughput improvement. Root cause documented: hipGraphExecKernelNodeSetParams overhead (512 calls/token) and Python orchestration overhead for allreduce calls offset the kernel execution savings from graph replay. C graph dispatch is faster than Python graph dispatch (1.02x). Test exits with code 0 (ALL TESTS PASSED).",
+      "evidence": "test_c_graph_dispatch.py (exit code 0):\n  Test 1 (Compile): PASS - c_graph_dispatch.so built, all functions present\n  Test 4 (Single-GPU Regression): PASS - 22.0 tok/s (within ±10% of 20.3 baseline)\n  Test 2 (TP=4 Correctness): PASS - min cosine_sim=0.995059 (threshold 0.99), 10/10 steps pass\n  Test 3 (Benchmark - VAL-GRAPHDECODE-002):\n    C dispatch (baseline):    36.9 tok/s (1.00x)\n    Python graph dispatch:    36.1 tok/s (0.98x)\n    C graph dispatch:         36.9 tok/s (1.00x)\n    Root cause: Python-orchestrated replay loop still carries ctypes overhead for 512 hipGraphLaunch calls and allreduce orchestration. Kernel execution savings (~1ms from 7.9x per-segment speedup) are offset by Python overhead delta.\n  PASS: Throughput comparison documented (graph=36.9 tok/s, c_dispatch=36.9 tok/s, ratio=0.999x)\n  ALL TESTS PASSED"
+    }
+  ],
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "docker", "python3"]
+}
