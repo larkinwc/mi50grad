@@ -1752,3 +1752,78 @@ gcc -O3 -shared -fPIC -I/opt/rocm/include -L/opt/rocm/lib -lamdhip64 -o src/runt
 gcc -O3 -shared -fPIC -I/opt/rocm/include -L/opt/rocm/lib -lamdhip64 -o src/runtime/c_graph_dispatch.so src/runtime/c_graph_dispatch.c
 ```
 See `.factory/services.yaml` for the individual build commands (build_c, build_c_dispatch, build_c_dispatch_v2, build_c_graph_dispatch).
+
+---
+
+## Double-Buffer Hidden State (allreduce-optimization milestone, 2026-03-17)
+
+**Implementation files:**
+- `src/inference/tp_engine.py`: `_decode_step_cached_stream()` and `_decode_step_serial()` with double-buffer support
+- `src/inference/engine.py`: `d_hidden_A`/`d_hidden_B` allocation, `_swap_hidden_buffers()` helper
+- `tests/test_overlap_double_buffer.py`: Correctness and benchmark tests
+- `DOUBLE_BUFFER_IMPLEMENTATION.md`: Detailed implementation notes
+
+**Core mechanism:**
+- Even layers (0, 2, 4, ...): RMSNorm reads from `d_hidden_A`, allreduce writes to `d_hidden_B`
+- Odd layers (1, 3, 5, ...): RMSNorm reads from `d_hidden_B`, allreduce writes to `d_hidden_A`
+- Buffer swap after each layer via `_swap_hidden_buffers()`
+- Removed `wait_for_allreduce_on_compute_stream()` at layer start for overlap
+
+**Key requirement:** Double-buffer mode only provides throughput benefit when combined with `set_stream_overlap_dispatch(True)`. Without stream overlap, it just alternates buffers without hiding latency. The set_double_buffer_enabled() method docstring should mention this dependency.
+
+**Dispatch path coverage:**
+Double-buffer is implemented in 2 of 7 dispatch paths:
+- `_decode_step_cached_stream()` ✓ (primary path with overlap)
+- `_decode_step_serial()` ✓
+- `_decode_step_c_dispatch()` ✗ (C dispatch doesn't support double-buffer)
+- `_decode_step_graph()` ✗
+- `_decode_step_global_graph()` ✗
+- `_decode_step_threaded()` ✗
+- `_decode_step_stream_overlap()` ✗ (replaced by cached+stream)
+
+**Dispatch priority note:** The dispatch path priority order in `decode_step()` determines which optimizations take effect. When multiple optimizations are enabled, higher-priority paths (global_graph > graph > c_dispatch > batched_allreduce > cached+stream > cached > stream > threaded > serial) take precedence, which can silently disable lower-priority optimizations like double-buffer.
+
+**Correctness status:**
+- Minimal buffer swap test: PASSED (validates alternation mechanism)
+- Full TP=4 correctness test: Not executed due to time constraints (requires 10+ minutes for weight loading)
+- Recommended: Run full test before considering production-ready
+
+**Allreduce fallback chain:**
+The `_allreduce_residual_double_buffer()` method supports multiple allreduce implementations:
+1. Kernel P2P allreduce (fastest when available)
+2. Fused P2P reduce
+3. Ring allreduce
+4. Standard P2P allreduce
+5. fast_ar C extension
+6. Python fallback
+All write to `d_hidden_write` buffer.
+
+---
+
+## Batched Allreduce Investigation (allreduce-optimization milestone, 2026-03-17) — INFEASIBLE
+
+**Status:** Cancelled after investigation proved approach infeasible.
+
+**Commit:** 0d79bdc
+**Test file:** `tests/test_batched_allreduce.py`
+
+**Approach investigated:**
+Conservative FFN-only deferral within 3-layer DeltaNet blocks:
+- Layer 0-2 (DeltaNet): attention allreduce each layer, skip FFN allreduce
+- After block: batched allreduce of accumulated FFN partials
+- Expected: reduce allreduce count from 128 to 96 per step
+
+**Result: INFEASIBLE**
+- Allreduce count: 128 → 96 (target met ✓)
+- Cosine similarity: ~0.68 (threshold 0.99, FAIL ✗)
+- Performance: 15.52 tok/s batched vs 32.45 tok/s standard (SLOWER)
+
+**Root cause:** FFN inputs depend on previous layer's allreduced hidden state through the residual connection. The FFN computation at layer N uses `d_hidden` which includes the FFN residual from layer N-1. Deferring the FFN allreduce means layer N's FFN operates on stale partial hidden state, breaking the mathematical equivalence.
+
+**Key lesson:** Allreduce operations CANNOT be batched/deferred across layers for transformer architectures with residual connections. The residual connection creates a strict data dependency: layer N needs the globally-reduced hidden state from layer N-1.
+
+**Alternative approaches for allreduce optimization:**
+1. Optimize allreduce kernel itself (target: reduce from 79us to ~50us per call)
+2. Double-buffer hidden state for compute-communication overlap (implemented)
+3. Speculative decoding to amortize allreduce across multiple tokens
+4. Continue with dispatch optimization (C dispatch, graph capture)
