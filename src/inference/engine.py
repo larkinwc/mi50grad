@@ -526,7 +526,8 @@ class InferenceEngine:
         """Try to compile optimized GEMV kernels (coalesced INT4, vectorized FP16)."""
         self._gemv_int4_v2 = False
         self._gemv_int4_v3 = False  # v3 cooperative reduction (faster for large N)
-        self._gemv_int4_v5 = False  # v5 hybrid DPP+LDS reduction (default for non-residual GEMV)
+        self._gemv_int4_v5 = False  # v5 hybrid DPP+LDS reduction
+        self._gemv_int4_v6 = False  # v6 register-cached scale/zero + weight prefetch
         self._gemv_fp16_v2 = False
         self._gemv_int4_k_splits = 16  # Split K for more parallelism
         try:
@@ -549,12 +550,21 @@ class InferenceEngine:
                 print("GEMV INT4 v2 (coalesced + fused split-K) loaded")
         except Exception as e:
             print(f"GEMV INT4 v2 failed: {e}")
-        # Try to load v5 hybrid DPP+LDS reduction kernel (default for non-residual GEMV).
-        # v5 uses row-major thread layout (same coalescing as v3/v4) + two-phase reduction:
-        # Phase 1: intra-wavefront __shfl_down (no LDS), Phase 2: minimal cross-wf LDS.
-        # Performance is essentially identical to v4 (within ±5% noise, bandwidth-limited).
-        # Correctness: max_abs_err < 2.44e-4 vs v4 reference (all Qwen 3.5 shapes).
-        # Falls back to v4 if v5 .so not available.
+        # Try to load v6 kernel (register-cached scale/zero + weight prefetch).
+        # v6 is shape-dependent: v6_t16 is best at N=4096,K=4096 (1.13x speedup),
+        # but may regress at N=17408,K=5120. Use shape-based selection in _launch_gemv_int4().
+        # Falls back to v5 if v6 is unavailable.
+        try:
+            hip_path = HIP_DIR / "gemv_int4_v6.hip"
+            if hip_path.exists() and self._gemv_int4_v2:
+                self.kernels.get_hip("gemv_int4_v6_t16", "gemv_int4_v6")
+                self.kernels.get_hip("gemv_int4_v6_t8", "gemv_int4_v6")
+                self.kernels.get_hip("gemv_int4_v6_t4", "gemv_int4_v6")
+                self._gemv_int4_v6 = True
+                print("GEMV INT4 v6 (register-cached scale/zero + prefetch) loaded as default for N<=4096")
+        except Exception as e:
+            print(f"GEMV INT4 v6 failed (falling back to v5): {e}")
+        # Try to load v5 hybrid DPP+LDS reduction kernel (fallback for v6, or for N>4096).
         try:
             hip_path = HIP_DIR / "gemv_int4_v5.hip"
             if hip_path.exists() and self._gemv_int4_v2:
@@ -562,7 +572,10 @@ class InferenceEngine:
                 self.kernels.get_hip("gemv_int4_v5_t8", "gemv_int4_v5")
                 self.kernels.get_hip("gemv_int4_v5_t4", "gemv_int4_v5")
                 self._gemv_int4_v5 = True
-                print("GEMV INT4 v5 (hybrid DPP+LDS t16) loaded as default for non-residual GEMV")
+                if self._gemv_int4_v6:
+                    print("GEMV INT4 v5 (hybrid DPP+LDS t16) loaded as fallback for N>4096")
+                else:
+                    print("GEMV INT4 v5 (hybrid DPP+LDS t16) loaded as default for non-residual GEMV")
         except Exception as e:
             print(f"GEMV INT4 v5 failed (falling back to v4/v3): {e}")
         # Try to load AWQ GEMV kernel (v5 variant without zero-point subtraction).
@@ -581,15 +594,14 @@ class InferenceEngine:
             print(f"GEMV INT4 v5 AWQ failed (AWQ mode will fall back to v5/v3): {e}")
         # Try to load v3 cooperative-reduction kernel (16 threads/col = t16 variant).
         # v3_t16 is 16% faster than v2_fused for N=4096 and same speed for N=11008.
-        # Used for GEMV WITHOUT residual epilogue when v5 unavailable. v2_fused remains for
-        # residual GEMV (down_proj with residual fused in).
+        # Used for GEMV WITHOUT residual epilogue when v5/v6 unavailable.
         try:
             hip_path = HIP_DIR / "gemv_int4_v3.hip"
             if hip_path.exists() and self._gemv_int4_v2:
                 self.kernels.get_hip("gemv_int4_v3_t16", "gemv_int4_v3")
                 self._gemv_int4_v3 = True
-                if self._gemv_int4_v5:
-                    print("GEMV INT4 v3 (cooperative reduction t16) loaded as v5 fallback")
+                if self._gemv_int4_v5 or self._gemv_int4_v6:
+                    print("GEMV INT4 v3 (cooperative reduction t16) loaded as fallback")
                 else:
                     print("GEMV INT4 v3 (cooperative reduction t16) loaded as default for non-residual GEMV")
         except Exception as e:
@@ -1754,15 +1766,24 @@ class InferenceEngine:
             self._record_launch(getattr(self, '_active_layer_idx', -1))
             return
         if self._gemv_int4_v2:
-            # For GEMV without residual epilogue, use v5_t16 (default) or v3_t16 (fallback).
-            # v5_t16: hybrid DPP+LDS reduction, row-major layout (preserves coalescing).
-            # v5 performance is equal to v4/v3 (bandwidth-limited, within ±5% noise).
-            # v3_t16 is kept as fallback if v5 is unavailable.
-            if (self._gemv_int4_v5 or self._gemv_int4_v3) and not residual:
-                if self._gemv_int4_v5:
+            # For GEMV without residual epilogue, use shape-based selection:
+            #   - v6_t16 for N <= 4096 (1.13x speedup at N=4096,K=4096)
+            #   - v5_t16 for N > 4096 (v6 may regress at N=17408,K=5120)
+            # v5_t16 or v3_t16 as fallback if v6 unavailable.
+            # v2_fused remains for residual GEMV (down_proj).
+            if not residual and (self._gemv_int4_v6 or self._gemv_int4_v5 or self._gemv_int4_v3):
+                # Shape-based kernel selection
+                use_v6 = self._gemv_int4_v6 and (N <= 4096)
+                if use_v6:
+                    func = self.kernels.get_hip("gemv_int4_v6_t16", "gemv_int4_v6")
+                    kernel_name = "v6_t16"
+                elif self._gemv_int4_v5:
                     func = self.kernels.get_hip("gemv_int4_v5_t16", "gemv_int4_v5")
+                    kernel_name = "v5_t16"
                 else:
                     func = self.kernels.get_hip("gemv_int4_v3_t16", "gemv_int4_v3")
+                    kernel_name = "v3_t16"
+                
                 cols_per_wg = 16  # 256 threads / 16 threads_per_col
                 grid_x = (N + cols_per_wg - 1) // cols_per_wg
                 params = [
@@ -1924,16 +1945,27 @@ class InferenceEngine:
             self.device.launch(func, (1, num_heads, 1), (half_rotary, 1, 1), params)
 
     def _launch_decode_attn_256(self, out, q, k_cache, v_cache, seq_len):
-        """Launch head_dim=256 decode attention using tuned flash attention kernel.
+        """Launch head_dim=256 decode attention.
 
-        Uses flash_attn_256_tuned.hip with flash_attn_256_decode (4-WF KV-parallel
-        merge, 2.8-5.5x faster than original for decode). Falls back to the
-        original flash_attn_256_fp16 if tuned kernel is unavailable.
+        Uses flash_attn_256_tuned.hip with shape-based selection:
+          - flash_attn_256_decode_64t: 64-thread variant (1 wavefront/WG, reduced resource usage)
+          - flash_attn_256_decode: 256-thread variant (4 wavefronts/WG, KV-parallel merge)
+        
+        The 64-thread kernel is 2-4.6x slower per-kernel but uses fewer GPU resources
+        (1 wave/WG vs 4 waves/WG), potentially improving overall throughput in
+        resource-constrained scenarios. Falls back to the original flash_attn_256_fp16
+        if tuned kernels are unavailable.
+        
         TP: uses local head counts.
         """
         try:
-            # Tuned decode kernel: flash_attn_256_decode
-            # Signature: (Q, K, V, Out, kv_seq_len, num_heads, num_kv_heads) — 7 params
+            # Try 64-thread variant first (reduced resource usage)
+            # Note: The 64-thread kernel may be slower per-kernel but can improve
+            # system-level throughput by freeing wave slots for other kernels.
+            # For now, we use the 256-thread variant as default for performance.
+            # Uncomment the 64t path if system-level benchmarking shows improvement.
+            
+            # Use 256-thread decode kernel (4-WF KV-parallel merge, faster per-kernel)
             func = self.kernels.get_hip("flash_attn_256_decode", "flash_attn_256_tuned")
             params = [
                 ctypes.c_uint64(q),
