@@ -31,8 +31,11 @@ EAGLE self-draft: use lm_head weights to generate draft tokens from hidden state
 ### Batch>1 Architecture
 GEMV→GEMM switch at batch=2 boundary. Use existing gemm_int4_prefill_v2.hip (2.07x faster than v1) and gemm_fp16_prefill.hip (18.6 TFLOPS). Batched KV cache: separate cache per sequence, batch dimension in attention grid. Allreduce payload scales linearly: 10KB × batch_size.
 
-### DeltaNet Allreduce Batching
-Qwen 3.5 layer pattern: [DeltaNet, DeltaNet, DeltaNet, FullAttn] × 16. Within each 3-DeltaNet block, FFN allreduces can potentially be deferred. Previous investigation: FULL deferral (both attn+FFN) gave cosine sim ~0.59 (FAILED). Conservative approach: defer only FFN allreduce within DeltaNet blocks.
+### DeltaNet Allreduce Batching — INFEASIBLE
+Qwen 3.5 layer pattern: [DeltaNet, DeltaNet, DeltaNet, FullAttn] × 16. Investigated deferring FFN allreduces
+across 3-layer DeltaNet blocks (conservative approach). Result: INFEASIBLE — cosine sim ~0.68 (threshold 0.99).
+Root cause: FFN inputs depend on previous layer's allreduced hidden state. Cannot defer without changing computation.
+Full analysis: see "Batched FFN Allreduce for DeltaNet Blocks — Infeasible" section below.
 
 ---
 
@@ -1149,6 +1152,74 @@ different FFN outputs. The cumulative effect across 48 DeltaNet layers causes ca
 - Use skip-connection arithmetic: maintain a running "deferred sum" across multiple layers
   — much more complex, unknown numerical properties
 - The 80-allreduce path is correct in count but changes the math fundamentally — not acceptable
+
+---
+
+## Batched FFN Allreduce for DeltaNet Blocks — Infeasible (2026-03-17)
+
+**Feature goal:** Reduce allreduce calls from 128 to ~96 per step (25% reduction) by deferring FFN
+allreduces across consecutive DeltaNet layers within each 3-layer DeltaNet block.
+
+**Proposed mechanism (conservative FFN-only deferral):**
+1. For each DeltaNet layer in a block (layers 0,1,2 of [DeltaNet,DeltaNet,DeltaNet,FullAttn]):
+   - Compute attention → ALLREDUCE(attn_out) → d_hidden += attn_result (CANNOT defer)
+   - Compute FFN → SKIP allreduce, accumulate ffn_out locally
+2. At block boundary (before full-attention layer):
+   - Batched ALLREDUCE(accumulated_FFN_out) → d_hidden += ffn_result_global
+
+**Critical finding: INFEASIBLE due to numerical divergence.**
+
+Measured results from `tests/test_batched_allreduce.py`:
+- Allreduce count reduced: 128 → 96 per step (25% reduction, TARGET MET)
+- Min cosine similarity across 10 decode steps: **0.679** (threshold: 0.99, FAILED)
+- Max absolute difference: ~8-12 FP16 units per element
+- E2E throughput: Standard 32.45 tok/s vs Batched 15.52 tok/s (0.48x, SLOWER)
+
+**Why divergence occurs (fundamental data dependency issue):**
+The FFN computation in each layer depends on the hidden state that includes ALL previous layers' outputs:
+- Layer 0: FFN(attn(d_hidden)) → reduced → d_hidden += FFN0
+- Layer 1: FFN(attn(d_hidden + FFN0)) → reduced → d_hidden += FFN1
+- Layer 2: FFN(attn(d_hidden + FFN0 + FFN1)) → reduced → d_hidden += FFN2
+
+In the batched approach:
+- Layer 0: FFN(attn(d_hidden)) → accumulate FFN0
+- Layer 1: FFN(attn(d_hidden + attn1)) → accumulate FFN1  [WRONG: missing FFN0!]
+- Layer 2: FFN(attn(d_hidden + attn1 + attn2)) → accumulate FFN2  [WRONG: missing FFN0+FFN1!]
+- Block boundary: d_hidden += reduce(FFN0 + FFN1 + FFN2)
+
+The FFN inputs are fundamentally different. While the attention mechanism in DeltaNet may not
+depend on cross-layer state, the FFN **definitely does** through the residual connection.
+Each layer's RMSNorm normalizes a different input, leading to different FFN outputs.
+
+**Why the "accumulation" approach doesn't work:**
+One might think: "what if we accumulate the FFN outputs and add them all at once?" The problem is:
+1. The accumulation buffer would need to store the REDUCED (allreduced) FFN outputs
+2. But to get the reduced output, you need to call allreduce
+3. If you call allreduce after each layer, you haven't reduced the call count
+4. If you don't, you're accumulating unreduced partials that differ across GPUs
+
+The fundamental issue: **allreduce is not just communication — it's the synchronization point
+that ensures all GPUs have the same hidden state**. Without it, each GPU's FFN computes on
+different inputs, and the divergence compounds across layers.
+
+**Why batched approach is SLOWER (15.52 vs 32.45 tok/s):**
+The batched implementation uses a different code path that doesn't benefit from the cached+stream
+optimizations. The `_decode_step_batched_allreduce` method:
+- Uses Python dispatch (no C dispatch or graph capture)
+- Does per-layer kernel launches from Python (high overhead)
+- Doesn't use stream overlap
+This explains why it's 2x slower despite fewer allreduce calls.
+
+**Decision:** Do NOT apply this optimization. The approach is fundamentally flawed because:
+1. FFN allreduces cannot be deferred without changing the computation
+2. The data dependency chain (hidden state → RMSNorm → FFN → residual add) requires synchronization
+3. Even the "conservative" FFN-only deferral gives cosine sim ~0.68, far below 0.99 threshold
+
+**What CAN be optimized instead:**
+- Allreduce kernel optimization (current P2P kernel is ~79us, can we get to ~50us?)
+- Allreduce communication overlap (overlap AR with next layer's compute)
+- Reducing dispatch overhead (C dispatch, graph capture — already implemented)
+- Speculative decoding (amortize allreduce across multiple tokens)
 
 ---
 
