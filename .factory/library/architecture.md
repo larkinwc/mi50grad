@@ -1521,3 +1521,53 @@ prefix variants via `_detect_layer_prefix()`.
 - Matmul correctness: cos_sim=1.0
 - GPTQ compatibility: same dict keys, same dtypes as GPTQ loader output
 
+---
+
+## AWQ GEMV Kernel (awq-gemv-kernel milestone, 2026-03-16)
+
+**File:** `src/kernels/gemv_int4_v5_awq.hip`
+**Test:** `tests/test_awq_gemv.py`
+
+**Design:** AWQ variant of gemv_int4_v5 that omits the zero-point parameter entirely.
+- Function signature: `(A, B_q4, scales, C, K, N, group_size)` — NO `zeros` pointer
+- Dequant inner loop: `w = q * scale` (7 arguments vs 8 for GPTQ)
+- Saves: 8 × v_sub_f32 per uint32 word, eliminates zeros tensor memory traffic
+- Same hybrid DPP+LDS two-phase reduction as v5
+- t4/t8/t16 variants (consistent with v5 naming)
+
+**Engine integration:** `src/inference/engine.py`
+- `_gemv_int4_v5_awq` flag: set True when `gemv_int4_v5_awq.hip` compiles successfully
+- `set_awq_mode(enabled)` method: enables/disables AWQ kernel path
+- `_awq_mode` flag: when True and `_gemv_int4_v5_awq=True`, `_launch_gemv_int4()` uses
+  AWQ kernel for non-residual GEMV (residual path still uses v2_fused with zeros)
+
+**Performance results on gfx906 (100 iters, 10 warmup):**
+
+| Shape (N, K) | Variant | GPTQ (us) | AWQ (us) | Speedup |
+|---|---|---|---|---|
+| N=4096, K=5120 | t16 | 85.9 | 67.8 | **1.27x** |
+| N=5120, K=5120 | t16 | 84.4 | 69.9 | **1.21x** |
+| N=11008, K=5120 | t16 | 124.1 | 105.6 | **1.18x** |
+| N=13696, K=5120 | t16 | 141.5 | 121.9 | **1.16x** |
+| N=17408, K=5120 | t16 | 173.4 | 148.0 | **1.17x** |
+
+t8 variant: 1.05x-1.14x speedup. t4 variant: 1.03x-1.11x speedup.
+
+**Correctness results:** max_abs_err ≈ 0.0007 (well below 1e-2 threshold) for all shapes.
+AWQ kernel == GPTQ(zeros=0) exactly (error = 0.0), confirming arithmetic equivalence.
+
+**Usage:**
+```python
+engine = InferenceEngine(config, ...)
+# ... load AWQ weights ...
+engine.set_awq_mode(True)  # switches to AWQ kernel (no zero-point)
+```
+
+**Notes:**
+- For the residual path (down_proj with `residual != 0`): falls back to `v2_fused` which
+  still passes a zeros pointer. For AWQ, zeros=0 → `(q - 0) * scale = q * scale`, correct.
+- The `_launch_ffn_gate_up_silu` (dual fused kernel) still uses zeros; for AWQ this is fine
+  since zeros=0 in the device buffer. Future work: dual AWQ kernel.
+- No AWQ model is currently available at /opt/models/ — tests use synthetic weights.
+  When an AWQ Qwen 3.5 27B model is deployed, test with real weights.
+
