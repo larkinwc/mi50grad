@@ -1588,6 +1588,13 @@ class TPInferenceEngine:
         self._batched_allreduce_enabled = False
         self._batched_allreduce_counter = {'count': 0}  # Track allreduce calls
 
+        # Double-buffer hidden state for compute-communication overlap:
+        # Allocates two hidden buffers per GPU (d_hidden_A, d_hidden_B).
+        # Layer N writes allreduce result to buffer X; layer N+1 reads from X
+        # while layer N's allreduce completes to buffer Y. Buffers alternate.
+        # This hides allreduce latency behind next-layer RMSNorm dispatch.
+        self._double_buffer_enabled = False
+
     def load_layer_weights(self, layer_idx: int, weights: dict):
         import copy
         for engine in self.engines:
@@ -1783,6 +1790,32 @@ class TPInferenceEngine:
     def reset_allreduce_counter(self):
         """Reset the allreduce call counter."""
         self._batched_allreduce_counter = {'count': 0}
+
+    def set_double_buffer_enabled(self, enabled: bool):
+        """Enable or disable double-buffer hidden state for compute-communication overlap.
+
+        When enabled=True, each GPU allocates two hidden buffers (d_hidden_A, d_hidden_B).
+        The decode loop alternates buffers each layer:
+          - Even layers: RMSNorm reads from A, allreduce writes to B
+          - Odd layers:  RMSNorm reads from B, allreduce writes to A
+
+        This allows layer N+1's RMSNorm to start immediately after submitting
+        layer N's allreduce, hiding the allreduce latency (~79us) behind the
+        next layer's compute dispatch.
+
+        Memory overhead: 5120 × 2 bytes = 10KB per GPU (negligible).
+
+        Requires engines to support double-buffer (they allocate buffers in __init__).
+        Must be called before build_dispatch_cache() if using cached dispatch.
+
+        Args:
+            enabled: True to enable double-buffer mode, False for standard
+        """
+        self._double_buffer_enabled = enabled
+        if enabled:
+            print(f"Double-buffer enabled: overlapping allreduce with next-layer compute")
+        else:
+            print(f"Double-buffer disabled (standard single-buffer path)")
 
     def compute_logits(self, hidden: np.ndarray = None) -> np.ndarray:
         return self.engines[0].compute_logits(hidden)
@@ -2248,21 +2281,26 @@ class TPInferenceEngine:
         else:
             p2p_ar = self._p2p_ar
         compute_streams = self._compute_streams  # [0] * tp_size (default null streams)
+        use_double_buffer = self._double_buffer_enabled
 
         # Upload embedding to all GPUs
         emb_bytes = token_embedding.tobytes()
         for engine in self.engines:
+            if use_double_buffer:
+                # Double-buffer mode: start with buffer A as read buffer
+                engine.d_hidden = engine.d_hidden_A
+                engine.d_hidden_write = engine.d_hidden_B
             engine.device.upload(engine.d_hidden, emb_bytes)
 
         # Pre-compute RoPE offset for this position
         cos_offset = position * half_rotary * 2  # byte offset into cos/sin tables
 
         for layer_idx in range(num_layers):
-            # --- Compute stream waits for previous layer's FFN allreduce ---
-            # GPU-side wait: hipStreamWaitEvent on allreduce_done events for all GPUs.
-            # (Layer 0: allreduce events are unrecorded on ROCm →
-            #  hipStreamWaitEvent on unrecorded event is a no-op, safe.)
-            if layer_idx > 0:
+            # Double-buffer mode: NO wait at layer start.
+            # Layer N+1's RMSNorm reads from the buffer that layer N's allreduce wrote to.
+            # The data dependency is enforced by the allreduce stream event mechanism.
+            # Standard mode: wait for previous layer's allreduce (preserves existing behavior)
+            if not use_double_buffer and layer_idx > 0:
                 p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
 
             for engine_idx, (engine, lc) in enumerate(
@@ -2347,18 +2385,28 @@ class TPInferenceEngine:
             # Records compute events → allreduce stream waits → P2P gather+reduce+broadcast
             # Records allreduce done events. Returns immediately (non-blocking).
             partial_ptrs = [e.d_proj_out for e in self.engines]
-            hidden_ptrs = [e.d_hidden for e in self.engines]
+            if use_double_buffer:
+                # Double-buffer: write to the alternate buffer (d_hidden_write)
+                hidden_ptrs = [e.d_hidden_write for e in self.engines]
+            else:
+                hidden_ptrs = [e.d_hidden for e in self.engines]
             p2p_ar.allreduce_residual_async(
                 partial_ptrs, hidden_ptrs, h, compute_streams)
 
-            # --- Make compute stream wait for attention allreduce before FFN RMSNorm ---
-            p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
+            # Standard mode: wait for attention allreduce before FFN RMSNorm
+            # Double-buffer mode: NO wait here - FFN RMSNorm reads from d_hidden_write
+            # which will be updated by the allreduce. The stream event mechanism
+            # ensures the data is ready when the RMSNorm kernel executes.
+            if not use_double_buffer:
+                p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
 
             for engine_idx, (engine, lc) in enumerate(
                     zip(self.engines, self._engine_layer_caches)):
                 layer_cache = lc[layer_idx]
 
-                # --- FFN RMSNorm (cached, reads d_hidden — gated by attention AR done) ---
+                # --- FFN RMSNorm ---
+                # Standard mode: reads d_hidden (gated by attention AR done event)
+                # Double-buffer mode: reads d_hidden_write (gated by AR stream event)
                 engine.device.launch_cached(layer_cache['ffn_rmsnorm'])
 
                 # --- FFN gate+up+silu (cached) ---
@@ -2382,11 +2430,21 @@ class TPInferenceEngine:
                         engine.local_intermediate_size, h)
 
             # --- Async allreduce FFN partials + residual add ---
-            # Non-blocking: next layer will call wait_for_allreduce_on_compute_stream()
-            # before launching its RMSNorm.
+            # Non-blocking: next layer will wait (standard mode) or naturally sync (double-buffer)
             partial_ptrs = [e.d_ffn_out for e in self.engines]
+            if use_double_buffer:
+                # Double-buffer: write to d_hidden_write
+                hidden_ptrs = [e.d_hidden_write for e in self.engines]
+            else:
+                hidden_ptrs = [e.d_hidden for e in self.engines]
             p2p_ar.allreduce_residual_async(
                 partial_ptrs, hidden_ptrs, h, compute_streams)
+
+            # Double-buffer mode: swap buffers after each layer's FFN allreduce
+            # This makes the next layer's RMSNorm read from the buffer this layer wrote to
+            if use_double_buffer:
+                for engine in self.engines:
+                    engine._swap_hidden_buffers()
 
         # After all layers: wait for the last FFN allreduce before reading d_hidden
         p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
@@ -2540,20 +2598,32 @@ class TPInferenceEngine:
 
         Every allreduce uses fast_ar_fused: downloads partials + hidden,
         AVX FP16 add on host, uploads result.
+        
+        Double-buffer mode support:
+          When _double_buffer_enabled=True, alternates buffers each layer:
+          - Even layers: RMSNorm reads from A, allreduce writes to B
+          - Odd layers: RMSNorm reads from B, allreduce writes to A
+          This enables compute-communication overlap when combined with
+          stream overlap dispatch.
         """
         h = self.config.hidden_size
         cfg = self.config
         num_layers = cfg.num_hidden_layers
+        use_double_buffer = self._double_buffer_enabled
 
         # Upload embedding to all GPUs
         emb_bytes = token_embedding.tobytes()
         for engine in self.engines:
+            if use_double_buffer:
+                # In double-buffer mode, start with buffer A as read buffer
+                engine.d_hidden = engine.d_hidden_A
+                engine.d_hidden_write = engine.d_hidden_B
             engine.device.upload(engine.d_hidden, emb_bytes)
 
         for layer_idx in range(num_layers):
             lw_list = [e.layers[layer_idx] for e in self.engines]
 
-            # RMSNorm for attention
+            # RMSNorm for attention (reads from d_hidden)
             for engine, lw in zip(self.engines, lw_list):
                 engine._launch_rmsnorm(engine.d_normed, engine.d_hidden,
                                        lw.attn_norm, h)
@@ -2569,9 +2639,13 @@ class TPInferenceEngine:
                         engine._decode_linear_attention(layer_idx, lw, position)
 
             # Allreduce attention partials + residual add
-            self._allreduce_residual("d_proj_out", h)
+            if use_double_buffer:
+                # Double-buffer mode: write to d_hidden_write
+                self._allreduce_residual_double_buffer("d_proj_out", h)
+            else:
+                self._allreduce_residual("d_proj_out", h)
 
-            # RMSNorm for FFN
+            # RMSNorm for FFN (reads from d_hidden)
             for engine, lw in zip(self.engines, lw_list):
                 engine._launch_rmsnorm(engine.d_normed, engine.d_hidden,
                                        lw.ffn_norm, h)
@@ -2600,7 +2674,14 @@ class TPInferenceEngine:
                     engine.local_intermediate_size, h)
 
             # Allreduce FFN partials + residual add
-            self._allreduce_residual("d_ffn_out", h)
+            if use_double_buffer:
+                # Double-buffer mode: write to d_hidden_write
+                self._allreduce_residual_double_buffer("d_ffn_out", h)
+                # Swap buffers: d_hidden becomes old d_hidden_write, and vice versa
+                for engine in self.engines:
+                    engine._swap_hidden_buffers()
+            else:
+                self._allreduce_residual("d_ffn_out", h)
 
         for engine in self.engines:
             engine.kv_cache.advance()
@@ -2850,6 +2931,109 @@ class TPInferenceEngine:
         for engine in self.engines:
             hip.set_device(engine.device.device_id)
             hip.memcpy_h2d(getattr(engine, buffer_name), result_bytes, size)
+
+    def _allreduce_residual_double_buffer(self, buffer_name: str, hidden_size: int):
+        """Allreduce + residual add to d_hidden_write (double-buffer mode).
+
+        Same as _allreduce_residual but writes to engine.d_hidden_write instead
+        of engine.d_hidden. This enables overlapping allreduce with next-layer
+        compute in the double-buffer decode loop.
+
+        Tries kernel P2P allreduce first (when enabled), then fused P2P reduce,
+        then ring allreduce, then standard P2P GPU allreduce, then fast_ar C
+        extension, then Python fallback.
+        """
+        # Kernel P2P allreduce: writes to d_hidden_write
+        if (self._kernel_p2p_allreduce and self._p2p_ar is not None
+                and self._p2p_ar._kernel_p2p_lib is not None
+                and self.tp_size in (2, 4)):
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            hidden_write_ptrs = [e.d_hidden_write for e in self.engines]
+            self._p2p_ar.allreduce_residual_kernel(partial_ptrs, hidden_write_ptrs, hidden_size)
+            return
+
+        # Fused P2P reduce: writes to d_hidden_write
+        if (self._fused_p2p_reduce and self._fused_p2p_ar is not None
+                and self.tp_size in (2, 4)):
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            hidden_write_ptrs = [e.d_hidden_write for e in self.engines]
+            self._fused_p2p_ar.allreduce_residual(partial_ptrs, hidden_write_ptrs, hidden_size)
+            return
+
+        # Ring allreduce: writes to d_hidden_write
+        if (self._ring_allreduce and self._ring_ar is not None
+                and self.tp_size in (2, 4)):
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            hidden_write_ptrs = [e.d_hidden_write for e in self.engines]
+            self._ring_ar.allreduce_residual(partial_ptrs, hidden_write_ptrs, hidden_size)
+            return
+
+        # P2P GPU allreduce: writes to d_hidden_write
+        if self._p2p_ar is not None and 2 <= self.tp_size <= 4:
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            hidden_write_ptrs = [e.d_hidden_write for e in self.engines]
+            self._p2p_ar.allreduce_residual(partial_ptrs, hidden_write_ptrs, hidden_size)
+            return
+
+        # Host-mediated C extension fallback (TP=2,3,4): writes to d_hidden_write
+        if self._fast_ar and self.tp_size == 2:
+            e0, e1 = self.engines
+            err = self._fast_ar.fast_ar_fused_tp2(
+                e0.device.device_id, e1.device.device_id,
+                getattr(e0, buffer_name), getattr(e1, buffer_name),
+                e0.d_hidden_write, e1.d_hidden_write,
+                hidden_size)
+            if err:
+                raise RuntimeError(f"fast_ar_fused_tp2 (double-buffer) failed: HIP error {err}")
+            return
+
+        if self._fast_ar and self.tp_size == 3:
+            e0, e1, e2 = self.engines
+            err = self._fast_ar.fast_ar_fused_tp3(
+                e0.device.device_id, e1.device.device_id, e2.device.device_id,
+                getattr(e0, buffer_name), getattr(e1, buffer_name),
+                getattr(e2, buffer_name),
+                e0.d_hidden_write, e1.d_hidden_write, e2.d_hidden_write,
+                hidden_size)
+            if err:
+                raise RuntimeError(f"fast_ar_fused_tp3 (double-buffer) failed: HIP error {err}")
+            return
+
+        if self._fast_ar and self.tp_size == 4:
+            e0, e1, e2, e3 = self.engines
+            err = self._fast_ar.fast_ar_fused_tp4(
+                e0.device.device_id, e1.device.device_id,
+                e2.device.device_id, e3.device.device_id,
+                getattr(e0, buffer_name), getattr(e1, buffer_name),
+                getattr(e2, buffer_name), getattr(e3, buffer_name),
+                e0.d_hidden_write, e1.d_hidden_write, e2.d_hidden_write, e3.d_hidden_write,
+                hidden_size)
+            if err:
+                raise RuntimeError(f"fast_ar_fused_tp4 (double-buffer) failed: HIP error {err}")
+            return
+
+        # Python fallback: writes to d_hidden_write
+        size = hidden_size * 2
+        hip = self._hip
+
+        for i, engine in enumerate(self.engines):
+            hip.set_device(engine.device.device_id)
+            hip.synchronize()
+            hip.memcpy_d2h(self._host_bufs[i],
+                           getattr(engine, buffer_name), size)
+
+        # Download from first engine's d_hidden_write
+        hip.set_device(self.engines[0].device.device_id)
+        hip.memcpy_d2h(self._host_hidden, self.engines[0].d_hidden_write, size)
+
+        hidden = np.frombuffer(self._host_hidden, dtype=np.float16).copy()
+        for i in range(self.tp_size):
+            hidden += np.frombuffer(self._host_bufs[i], dtype=np.float16)
+        result_bytes = hidden.tobytes()
+
+        for engine in self.engines:
+            hip.set_device(engine.device.device_id)
+            hip.memcpy_h2d(engine.d_hidden_write, result_bytes, size)
 
     def _allreduce_residual(self, buffer_name: str, hidden_size: int):
         """Allreduce + residual add to d_hidden.

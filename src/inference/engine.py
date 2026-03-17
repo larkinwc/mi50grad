@@ -762,6 +762,18 @@ class InferenceEngine:
         self._layer_launch_counts = {}
         self._current_count_layer = -1
 
+    # Double-buffer support methods for compute-communication overlap
+    def _swap_hidden_buffers(self):
+        """Swap read and write hidden buffers.
+        
+        After each layer's allreduce completes, call this to swap buffers:
+        - The allreduce write buffer becomes the next layer's read buffer
+        - The previous read buffer becomes the next allreduce write target
+        This enables overlapping layer N+1's RMSNorm with layer N's allreduce.
+        """
+        # Swap: read becomes old write, write becomes old read
+        self.d_hidden, self.d_hidden_write = self.d_hidden_write, self.d_hidden
+
     def _record_launch(self, layer_idx: int):
         """Increment launch count for a layer (only when counting is active)."""
         if self._count_launches:
@@ -807,7 +819,12 @@ class InferenceEngine:
         self.kv_dim = self.local_num_kv_heads * cfg.head_dim
 
         # Scratch for decode (single token)
-        self.d_hidden = self.device.malloc(h * 2)
+        # Double-buffer support: d_hidden_A and d_hidden_B for compute-communication overlap
+        # d_hidden is the current read buffer, d_hidden_write is the current write buffer
+        self.d_hidden_A = self.device.malloc(h * 2)
+        self.d_hidden_B = self.device.malloc(h * 2)
+        self.d_hidden = self.d_hidden_A  # Current read buffer (starts as A)
+        self.d_hidden_write = self.d_hidden_B  # Current write buffer (starts as B)
         self.d_hidden2 = self.device.malloc(h * 2)
         self.d_normed = self.device.malloc(h * 2)
 
