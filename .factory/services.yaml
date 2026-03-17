@@ -12,5 +12,6 @@ commands:
   stop_vllm: "ssh root@192.168.1.198 'docker stop vllm-mobydick 2>/dev/null || true'"
   start_vllm: "ssh root@192.168.1.198 'docker start vllm-mobydick 2>/dev/null || true'"
   remote_shell: "ssh root@192.168.1.198"
+  build_hip_kernel: "ssh root@192.168.1.198 \"docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /opt/mi50grad:/opt/mi50grad mi50grad bash -c 'cd /opt/mi50grad && mkdir -p build/kernels && /opt/rocm/bin/hipcc -O3 --offload-arch=gfx906 -std=c++17 -shared -fPIC'\""
 
 services: {}

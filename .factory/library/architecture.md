@@ -6,6 +6,36 @@ Architectural decisions, patterns discovered, and kernel design notes.
 
 ---
 
+## Sprint 5 Optimization Targets (2026-03-17)
+
+### Current Bottleneck Analysis (38.3 tok/s, TP=4, 4xMI50)
+| Component | Time | % of Total |
+|---|---|---|
+| Allreduce | 10.1ms (128 calls × ~79us) | 39% |
+| GPU compute | ~11ms (64 layers × ~172us) | 42% |
+| Dispatch + sync | ~5ms | 19% |
+
+### GEMV v6 Design Notes
+The v5 kernel (current best) loads scale/zero from global memory every iteration (16 iterations per quantization group). Since group_size=128 and 8 weights per iteration, 16 consecutive iterations share the same scale/zero. Caching in VGPRs eliminates 30 of 32 global loads per group (keep first load + boundary load).
+
+Weight prefetch: use staggered vmcnt like gemm_fp16's inner loop. Issue global_load_dword for next weight word immediately after extracting current word, process current dequant while next load is in flight.
+
+### Decode Attention Thread Waste
+flash_attn_256_tuned decode: launches 256 threads, masks to 64 active. The 4-wavefront KV-range splitting (each wf handles kv_len/4) is the useful parallelism. A 64-thread variant would launch 1 wavefront per WG, freeing 3 wave slots per CU for other heads. With 48 heads and 60 CUs, better CU utilization is expected.
+
+### Speculative Decoding Strategy
+n-gram lookahead (no training): extract n-gram candidates from prompt+generated text. Verification pass processes K draft tokens via prefill-style forward pass. Key win: amortize 10.1ms allreduce across K verified tokens.
+
+EAGLE self-draft: use lm_head weights to generate draft tokens from hidden states. Repeatedly apply embedding → lm_head to generate K candidates. Full model verifies.
+
+### Batch>1 Architecture
+GEMV→GEMM switch at batch=2 boundary. Use existing gemm_int4_prefill_v2.hip (2.07x faster than v1) and gemm_fp16_prefill.hip (18.6 TFLOPS). Batched KV cache: separate cache per sequence, batch dimension in attention grid. Allreduce payload scales linearly: 10KB × batch_size.
+
+### DeltaNet Allreduce Batching
+Qwen 3.5 layer pattern: [DeltaNet, DeltaNet, DeltaNet, FullAttn] × 16. Within each 3-DeltaNet block, FFN allreduces can potentially be deferred. Previous investigation: FULL deferral (both attn+FFN) gave cosine sim ~0.59 (FAILED). Conservative approach: defer only FFN allreduce within DeltaNet blocks.
+
+---
+
 ## Graph-Based Decode Path (Milestone: hip-graph-decode, 2026-03-15)
 
 **Implementation:** `src/inference/tp_engine.py` (`_GraphDecodeState` class + `set_graph_dispatch()` + `_decode_step_graph()`) + `tests/test_graph_decode.py`
