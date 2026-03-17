@@ -1640,3 +1640,14 @@ Skip first 9 warmup steps.
 **Benchmark structure:**
 - Phase 1: Single-GPU subprocess (avoids OOM), collects reference outputs to tempfile
 - Phase 2: TP=4 subprocess (one engine load, sequential mode testing)
+
+**Deploy and rebuild note:**
+All `.so` files are removed by `rsync --delete` on every deploy. After any deploy, rebuild:
+```bash
+# All 4 C runtime extensions:
+gcc -O3 -mf16c -mavx -shared -fPIC -o src/runtime/fast_allreduce.so src/runtime/fast_allreduce.c
+gcc -O3 -shared -fPIC -I/opt/rocm/include -L/opt/rocm/lib -lamdhip64 -o src/runtime/c_dispatch.so src/runtime/c_dispatch.c
+gcc -O3 -shared -fPIC -I/opt/rocm/include -L/opt/rocm/lib -lamdhip64 -o src/runtime/c_dispatch_v2.so src/runtime/c_dispatch_v2.c
+gcc -O3 -shared -fPIC -I/opt/rocm/include -L/opt/rocm/lib -lamdhip64 -o src/runtime/c_graph_dispatch.so src/runtime/c_graph_dispatch.c
+```
+See `.factory/services.yaml` for the individual build commands (build_c, build_c_dispatch, build_c_dispatch_v2, build_c_graph_dispatch).

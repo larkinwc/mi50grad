@@ -1,0 +1,38 @@
+{
+  "featureId": "sprint4-combined-benchmark",
+  "milestone": "final-benchmark",
+  "status": "pass",
+  "issues": [
+    {
+      "severity": "non_blocking",
+      "description": "AWQ kernel mode (44.7 tok/s) runs via cached+stream path, not C dispatch. The C dispatch plan uses pre-cached GPTQ function pointers and does not switch to AWQ kernel pointers when set_awq_mode(True) is called. This means the AWQ speedup is not realized in the best-performing dispatch mode.",
+      "file": "tests/bench_tp4_sprint4.py",
+      "line": null
+    },
+    {
+      "severity": "non_blocking",
+      "description": "Global graph C plan throughput (36.5 tok/s) is ~5% below C dispatch (38.3 tok/s). Documented as known behavior: hipGraphLaunch overhead from 512 calls/step negates per-segment launch savings. The allreduce bottleneck (~10ms/token from 128x kernel P2P at ~79us) dominates, making graph replay savings (<1ms) marginal.",
+      "file": "bench/tp4_sprint4_report.md",
+      "line": null
+    },
+    {
+      "severity": "suggestion",
+      "description": "The benchmark hardcodes STAR_TOPOLOGY_TPS=15.3 as the baseline for speedup calculations, but this represents the 4×MI50 pure PCIe star baseline, not the Sprint 3 baseline (38.0 tok/s on mixed HW). The report correctly clarifies this hardware difference, but in-code comments could be clearer that the comparison is hardware-specific.",
+      "file": "tests/bench_tp4_sprint4.py",
+      "line": null
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "target": "library",
+      "description": "Document in library that rsync --delete removes compiled .so files (fast_allreduce.so, c_dispatch.so, c_dispatch_v2.so, c_graph_dispatch.so) on each deploy, requiring rebuild. Consider adding --exclude='*.so' to the deploy command or documenting the rebuild step explicitly.",
+      "rationale": "Worker discovered this issue during session and it caused deployment friction. Documented in worker skillFeedback but not in the library knowledge base."
+    },
+    {
+      "target": "library",
+      "description": "Document AWQ kernel interaction with C dispatch plan: set_awq_mode(True) switches to AWQ GEMV kernel only in cached+stream path. To use AWQ in C dispatch mode, _build_c_dispatch_plan() must be updated to use AWQ function pointers when _awq_mode=True.",
+      "rationale": "This is a non-obvious architectural constraint discovered during sprint4-combined-benchmark. Future workers implementing AWQ C dispatch integration need this context."
+    }
+  ],
+  "summary": "sprint4-combined-benchmark feature is well-implemented. The benchmark script correctly tests all three VAL-CROSS assertions: (1) combined throughput with all Sprint 4 opts active, (2) progressive fallback chain with cosine_sim >= 0.99 at each level, (3) single-GPU regression check. Results: 38.3 tok/s C dispatch + kernel P2P (2.50x vs star baseline), all fallback modes pass cosine_sim >= 0.99, single-GPU 22.0 tok/s (exceeds 18.3 floor). Two non-blocking issues documented: AWQ mode uses cached+stream path rather than C dispatch, and global graph is ~5% slower than C dispatch (known overhead). The sprint4_report.md is thorough and accurately characterizes the hardware-specific performance context (4×MI50 pure PCIe vs mixed HW with MFMA). All validation assertions VAL-CROSS-001/002/003 pass."
+}
