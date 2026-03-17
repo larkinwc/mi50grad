@@ -1,0 +1,50 @@
+{
+  "milestone": "allreduce-optimization",
+  "round": 1,
+  "status": "fail",
+  "assertionsSummary": {
+    "total": 2,
+    "passed": 1,
+    "failed": 1,
+    "blocked": 0
+  },
+  "passedAssertions": ["VAL-AR-005"],
+  "failedAssertions": [
+    {
+      "id": "VAL-AR-004",
+      "reason": "Double-buffer path produces incorrect output. Min cosine similarity = -0.028881 (threshold >= 0.99). The double-buffer implementation has a correctness bug - outputs diverge significantly from standard path."
+    }
+  ],
+  "blockedAssertions": [],
+  "appliedUpdates": [
+    {
+      "target": "user-testing.md",
+      "description": "Added test script test_val_ar_004_005.py for double-buffer validation with real model weights.",
+      "source": "setup"
+    }
+  ],
+  "previousRound": null,
+  "testResults": {
+    "VAL-AR-004": {
+      "status": "fail",
+      "min_cosine_similarity": -0.028881,
+      "avg_cosine_similarity": 0.162144,
+      "threshold": 0.99,
+      "evidence": "test_val_ar_004_005.py output shows min_cos_sim=-0.028881"
+    },
+    "VAL-AR-005": {
+      "status": "pass",
+      "standard_ms_per_step": 46.32,
+      "double_buffer_ms_per_step": 42.30,
+      "speedup": 1.095,
+      "threshold": 1.05,
+      "evidence": "test_val_ar_004_005.py output shows speedup=1.095x"
+    }
+  },
+  "notes": {
+    "implementationStatus": "The overlap-double-buffer feature was marked as completed in commit 9500ca9, but validation reveals a critical correctness bug. The double-buffer mechanism shows 9.5% throughput improvement but produces completely incorrect results (negative cosine similarity indicates wrong direction in output space).",
+    "rootCauseHypothesis": "The buffer alternation logic in _decode_step_cached_stream() may have a bug in buffer pointer management or residual accumulation. The implementation removes wait_for_allreduce_on_compute_stream() which may cause race conditions between allreduce completion and RMSNorm reads.",
+    "minimalTestPassed": "The minimal buffer swap test (test_overlap_double_buffer.py --minimal) passed, validating basic pointer alternation. However, the full TP=4 integration test fails correctness.",
+    "recommendedFix": "1. Debug the double-buffer implementation to find where output divergence occurs. 2. Consider whether stream events are properly synchronizing allreduce completion before RMSNorm reads. 3. Verify residual accumulation logic writes to the correct buffer."
+  }
+}
