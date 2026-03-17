@@ -319,6 +319,8 @@ class InferenceEngine:
             raise ValueError(
                 f"quant_format must be one of {self.VALID_QUANT_FORMATS}, got {quant_format!r}")
         self.quant_format = quant_format
+        # AWQ mode: skip zero-point subtraction in GEMV (set via set_awq_mode() after loading)
+        self._awq_mode = False
 
         self.config = config
         self.device = GPUDevice(device_id)
@@ -374,6 +376,31 @@ class InferenceEngine:
         """
         self._tp_peers = peers
         self._tp_group = tp_group
+
+    def set_awq_mode(self, enabled: bool = True):
+        """Enable or disable AWQ GEMV kernel mode.
+
+        When enabled, the AWQ variant of gemv_int4_v5 is used for non-residual
+        GEMV calls. The AWQ kernel skips the zero-point subtraction (w = q * scale
+        instead of w = (q - zero) * scale), saving 8 v_sub_f32 instructions per
+        uint32 word and eliminating the zeros tensor memory traffic.
+
+        Must be called after weights are loaded (zeros tensor pointers are ignored
+        by the AWQ kernel path). Requires gemv_int4_v5_awq.hip to be compiled.
+
+        Args:
+            enabled: True to use AWQ kernel, False to fall back to GPTQ kernel.
+        """
+        if enabled and not self._gemv_int4_v5_awq:
+            print("WARNING: AWQ GEMV kernel not available (gemv_int4_v5_awq.hip not found). "
+                  "AWQ mode disabled; falling back to standard v5/v3 GEMV.")
+            self._awq_mode = False
+        else:
+            self._awq_mode = enabled
+            if enabled:
+                print("AWQ GEMV mode enabled: using gemv_int4_v5_awq_t16 (no zero-point)")
+            else:
+                print("AWQ GEMV mode disabled: using standard v5/v3 GEMV")
 
     def _init_deltanet_gpu(self):
         """Compile and load the DeltaNet v3 GPU kernel (required — no CPU fallback).
@@ -538,6 +565,20 @@ class InferenceEngine:
                 print("GEMV INT4 v5 (hybrid DPP+LDS t16) loaded as default for non-residual GEMV")
         except Exception as e:
             print(f"GEMV INT4 v5 failed (falling back to v4/v3): {e}")
+        # Try to load AWQ GEMV kernel (v5 variant without zero-point subtraction).
+        # AWQ dequantization: w = q * scale (no zeros tensor, saves 8 v_sub_f32 per uint32).
+        # Used when awq_mode=True is set via set_awq_mode() after weight loading.
+        self._gemv_int4_v5_awq = False
+        try:
+            hip_path = HIP_DIR / "gemv_int4_v5_awq.hip"
+            if hip_path.exists() and self._gemv_int4_v2:
+                self.kernels.get_hip("gemv_int4_v5_awq_t16", "gemv_int4_v5_awq")
+                self.kernels.get_hip("gemv_int4_v5_awq_t8", "gemv_int4_v5_awq")
+                self.kernels.get_hip("gemv_int4_v5_awq_t4", "gemv_int4_v5_awq")
+                self._gemv_int4_v5_awq = True
+                print("GEMV INT4 v5 AWQ (no zero-point) loaded")
+        except Exception as e:
+            print(f"GEMV INT4 v5 AWQ failed (AWQ mode will fall back to v5/v3): {e}")
         # Try to load v3 cooperative-reduction kernel (16 threads/col = t16 variant).
         # v3_t16 is 16% faster than v2_fused for N=4096 and same speed for N=11008.
         # Used for GEMV WITHOUT residual epilogue when v5 unavailable. v2_fused remains for
@@ -1695,6 +1736,23 @@ class InferenceEngine:
         self.device.launch(func, (grid_x, grid_y, 1), (256, 1, 1), params)
 
     def _launch_gemv_int4(self, dst, src, qweight, scales, zeros, K, N, residual=0):
+        # AWQ mode: use no-zeros-point kernel for non-residual GEMV (saves loads + subtractions)
+        if self._awq_mode and self._gemv_int4_v5_awq and not residual:
+            func = self.kernels.get_hip("gemv_int4_v5_awq_t16", "gemv_int4_v5_awq")
+            cols_per_wg = 16  # 256 threads / 16 threads_per_col
+            grid_x = (N + cols_per_wg - 1) // cols_per_wg
+            params = [
+                ctypes.c_uint64(src),
+                ctypes.c_uint64(qweight),
+                ctypes.c_uint64(scales),
+                ctypes.c_uint64(dst),
+                ctypes.c_uint32(K),
+                ctypes.c_uint32(N),
+                ctypes.c_uint32(self.config.group_size),
+            ]
+            self.device.launch(func, (grid_x, 1, 1), (256, 1, 1), params)
+            self._record_launch(getattr(self, '_active_layer_idx', -1))
+            return
         if self._gemv_int4_v2:
             # For GEMV without residual epilogue, use v5_t16 (default) or v3_t16 (fallback).
             # v5_t16: hybrid DPP+LDS reduction, row-major layout (preserves coalescing).
