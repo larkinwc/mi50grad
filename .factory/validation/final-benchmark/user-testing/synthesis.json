@@ -1,28 +1,22 @@
 {
   "milestone": "final-benchmark",
-  "round": 1,
+  "round": 2,
   "status": "pass",
   "assertionsSummary": {
-    "total": 4,
-    "passed": 4,
+    "total": 3,
+    "passed": 3,
     "failed": 0,
     "blocked": 0
   },
-  "passedAssertions": ["VAL-FINAL-001", "VAL-FINAL-002", "VAL-CROSS-001", "VAL-CROSS-002"],
+  "passedAssertions": ["VAL-CROSS-001", "VAL-CROSS-002", "VAL-CROSS-003"],
   "failedAssertions": [],
   "blockedAssertions": [],
-  "appliedUpdates": [
-    {
-      "target": "user-testing.md",
-      "description": "Added Flow Validator Guidance section for GPU Kernel - final-benchmark surface",
-      "source": "setup"
-    }
-  ],
-  "previousRound": null,
+  "appliedUpdates": [],
+  "previousRound": ".factory/validation/final-benchmark/user-testing/synthesis-round1.json",
   "notes": {
-    "VAL-FINAL-001": "bench/optimization_final.json confirmed present on LXC (2192 bytes, 14 benchmark categories covering all optimized kernels from sprint)",
-    "VAL-FINAL-002": "bench/optimization_report.md confirmed present on LXC (8453 bytes). Report shows 5 of 6 areas improved (FA prefill 1.58-1.99x, FP16 GEMM 1.02-1.09x, INT4 GEMM 1.40-2.07x, INT4 GEMV 1.04-1.12x at t4/t8, Elementwise rmsnorm 1.33x). Exceeds the minimum threshold of 3 areas.",
-    "VAL-CROSS-001": "All 4 non-regression tests passed: test_flash_attn_256.py (6 configs PASS), test_gemm_fp16_prefill.py (6 shapes PASS), test_elementwise.py (SiLU/fused/RoPE PASS), test_gemv_int4.py (2 configs PASS)",
-    "VAL-CROSS-002": "All 7 new/modified HIP kernel files compiled for gfx906 with hipcc -O3 --offload-arch=gfx906 -std=c++17 exit code 0: flash_attn_256_v3, gemm_fp16_prefill (db variant inside), gemm_int4_prefill_v2, gemv_int4_v4, elementwise_v3, fused_skip_rmsnorm_gemv, gemm_fp16_prefill_silu"
+    "rerunContext": "Re-run initiated after sprint4-combined-benchmark feature (completed post round 1) was validated by scrutiny. All assertions from sprint4-combined-benchmark fulfills field (VAL-CROSS-001, VAL-CROSS-002, VAL-CROSS-003) are already 'passed' in validation-state.json.",
+    "VAL-CROSS-001": "Already passed in validation-state (validatedAtMilestone: awq-support). Confirmed by bench/tp4_sprint4_report.md: 38.3 tok/s C dispatch + kernel P2P, 36.5 tok/s global graph, 33.7 tok/s cached+stream (star). All correctness >= 0.99. The sprint4-combined-benchmark bench report explicitly shows VAL-CROSS-001: PASS.",
+    "VAL-CROSS-002": "Already passed in validation-state (validatedAtMilestone: awq-support). Confirmed by bench/tp4_sprint4_report.md: fallback chain global_graph(min_sim=0.999635) -> c_dispatch(min_sim=0.999784) -> cached+stream(min_sim=0.998161). All modes >= 0.99, no crashes. The sprint4-combined-benchmark bench report explicitly shows VAL-CROSS-002: PASS.",
+    "VAL-CROSS-003": "Already passed in validation-state (validatedAtMilestone: awq-support). Confirmed by bench/tp4_sprint4_report.md: single-GPU throughput=22.0 tok/s >= 18.3 tok/s threshold. The sprint4-combined-benchmark bench report explicitly shows VAL-CROSS-003: PASS."
   }
 }
