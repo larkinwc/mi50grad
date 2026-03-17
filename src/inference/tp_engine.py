@@ -2809,6 +2809,24 @@ class TPInferenceEngine:
             self._engine_layer_caches = []
             self._c_dispatch_plan = None  # Invalidate C dispatch plan
 
+    def set_awq_mode(self, enabled: bool = True):
+        """Enable or disable AWQ GEMV kernel mode on all GPU engines.
+
+        When enabled=True, all per-GPU InferenceEngine instances use the AWQ
+        variant of gemv_int4_v5 for non-residual GEMV calls. The AWQ kernel
+        skips the zero-point subtraction (w = q * scale instead of
+        w = (q - zero) * scale), saving 8 v_sub_f32 instructions per uint32 word
+        and eliminating the zeros tensor memory traffic.
+
+        Used when AWQ-format weights are loaded (zeros tensor = all zeros).
+        Requires gemv_int4_v5_awq.hip to be compiled on the target GPU.
+
+        Args:
+            enabled: True to use AWQ kernel, False to fall back to GPTQ kernel.
+        """
+        for engine in self.engines:
+            engine.set_awq_mode(enabled)
+
     def set_c_dispatch(self, enabled: bool):
         """Enable or disable C dispatch loop.
 
