@@ -1,0 +1,79 @@
+{
+  "milestone": "awq-model-integration",
+  "round": 1,
+  "status": "fail",
+  "assertionsSummary": {
+    "total": 4,
+    "passed": 1,
+    "failed": 0,
+    "blocked": 3
+  },
+  "passedAssertions": ["VAL-AWQ-002"],
+  "failedAssertions": [],
+  "blockedAssertions": [
+    {
+      "id": "VAL-AWQ-001",
+      "blockedBy": "No native AWQ model available. Downloaded model from QuantTrio/Qwen3.5-27B-AWQ is GPTQ format (has qzeros tensors). AWQ format requires zero-point=0 (no qzeros)."
+    },
+    {
+      "id": "VAL-AWQ-003",
+      "blockedBy": "Cannot measure AWQ throughput without native AWQ model. AWQ kernel with GPTQ weights produces incorrect results (GPTQ weights have non-zero zero points)."
+    },
+    {
+      "id": "VAL-AWQ-004",
+      "blockedBy": "Cannot verify AWQ correctness without native AWQ model. Cosine sim test failed (min=0.147) when using AWQ kernel with GPTQ weights."
+    }
+  ],
+  "appliedUpdates": [
+    {
+      "target": "user-testing.md",
+      "description": "Documented that downloaded 'AWQ' model from QuantTrio/Qwen3.5-27B-AWQ is actually GPTQ format. True AWQ model not currently available on HuggingFace for Qwen 3.5 27B.",
+      "source": "setup"
+    }
+  ],
+  "previousRound": null,
+  "testExecutionDetails": {
+    "environmentSetup": {
+      "vllmStopped": true,
+      "codeDeployed": true,
+      "awqKernelCompiled": true,
+      "cDispatchCompiled": true,
+      "modelDownloaded": "QuantTrio/Qwen3.5-27B-AWQ"
+    },
+    "modelFormatAnalysis": {
+      "downloadedModel": "QuantTrio/Qwen3.5-27B-AWQ",
+      "hasQweight": true,
+      "hasQzeros": true,
+      "hasScales": true,
+      "detectedFormat": "gptq",
+      "expectedFormat": "awq",
+      "conclusion": "Downloaded model is GPTQ format, not AWQ"
+    },
+    "testResults": {
+      "test_awq_e2e.py": {
+        "exitCode": 0,
+        "awqKernelAvailable": true,
+        "awqModePropagation": true,
+        "coherenceTest": "PASS (mean_sim=0.9998)",
+        "throughputComparison": "GPTQ=44.91 tok/s, AWQ-kernel-mode=14.17 tok/s"
+      },
+      "test_tp4_sprint5_kernels.py": {
+        "exitCode": 0,
+        "gemvV6Loaded": true,
+        "gemvV5Loaded": true,
+        "tp4Correctness": "PASS (min_cosine_sim=0.999267)"
+      },
+      "bench_tp4_awq.py": {
+        "exitCode": 134,
+        "failure": "Memory access fault during TP=4 AWQ warmup",
+        "singleGpuCorrectness": "FAIL (min_cosine_sim=0.147 < 0.99)"
+      }
+    }
+  },
+  "recommendations": [
+    "Find or create a true AWQ-quantized Qwen 3.5 27B model (no qzeros tensor)",
+    "Consider using Qwen/Qwen2.5-32B-Instruct-AWQ as an alternative model for AWQ testing",
+    "Update download script to verify model format after download",
+    "Add format validation in AWQWeightLoader to fail early if GPTQ format detected"
+  ]
+}

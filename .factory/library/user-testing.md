@@ -114,3 +114,29 @@ ssh root@192.168.1.198 "docker start vllm-mobydick 2>/dev/null || true"
 - `FAIL` in output
 - `sys.exit(1)` exit code (non-zero from docker run)
 - Missing output or Python exception traceback
+
+## AWQ Model Availability (Critical Finding)
+
+**Status: No native AWQ model available**
+
+The downloaded model from `QuantTrio/Qwen3.5-27B-AWQ` on HuggingFace is **GPTQ format**, not AWQ format:
+- Has `qzeros` tensors (AWQ format has no qzeros)
+- Has `qweight` and `scales` tensors (shared with AWQ)
+- Detects as `gptq` format via `detect_awq_format()`
+
+**AWQ vs GPTQ format difference:**
+- AWQ: `w = q * scale` (zero-point=0, no qzeros tensor)
+- GPTQ: `w = (q - zero) * scale` (has qzeros tensor)
+
+**Impact on validation:**
+- VAL-AWQ-001 (AWQ model available): FAILED - no native AWQ model
+- VAL-AWQ-003 (AWQ throughput): BLOCKED - AWQ kernel with GPTQ weights produces incorrect results
+- VAL-AWQ-004 (AWQ correctness): BLOCKED - cosine sim fails (min=0.147 < 0.99)
+
+**Alternative models to consider:**
+- `Qwen/Qwen2.5-32B-Instruct-AWQ` - may have true AWQ format
+- Need to verify format after download with `detect_awq_format()`
+
+**Test scripts for AWQ validation:**
+- `tests/test_awq_e2e.py` - tests AWQ kernel path with GPTQ weights (partial validation)
+- `tests/bench_tp4_awq.py` - AWQ throughput benchmark (requires native AWQ model)
