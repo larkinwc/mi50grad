@@ -1,0 +1,44 @@
+{
+  "groupId": "awq-cross-group",
+  "milestone": "awq-support",
+  "assertions": {
+    "VAL-AWQ-001": {
+      "status": "pass",
+      "evidence": "test_awq_loader.py output: 7/7 tests passed. ALL TESTS PASSED. VAL-AWQ-001 PASS: AWQ weights loaded correctly.",
+      "details": "AWQ weight loader correctness validated with synthetic weights. gate_qweight: (640, 17408) int32, gate_scales: (40, 17408) float16, gate_zeros: all 0 (AWQ no zero-point), down_qweight: (2176, 5120) int32. 64 layers from config. No qzeros tensors in model index. Dequantization max_err=0.000000 < 1e-2. AWQ/GPTQ format compatibility verified."
+    },
+    "VAL-AWQ-002": {
+      "status": "pass",
+      "evidence": "test_awq_gemv.py output: ALL CRITICAL TESTS PASSED. VAL-AWQ-002: ALL correctness tests PASSED (max_abs_err < 1e-2).",
+      "details": "AWQ GEMV kernel (gemv_int4_v5_awq) correctness vs numpy reference: all Qwen 3.5 27B shapes (N=4096/5120/11008/13696/17408, K=5120, gs=128) passed with max_abs_err < 1e-2 (worst: 0.000739). Equivalence check PASS (AWQ == GPTQ with zeros=0, max_abs_err=0.000000e+00). Latency check PASS: AWQ 1.03-1.27x faster than GPTQ across all shapes and variants (t4/t8/t16)."
+    },
+    "VAL-AWQ-003": {
+      "status": "pass",
+      "evidence": "test_awq_e2e.py output: [PASS] awq_tp4_coherence — mean_sim=0.9702 (steps 9+), threshold=0.95. [PASS] no_nan_inf — All 15 steps clean (no NaN/Inf). VAL-AWQ-003: No NaN/Inf + coherence >= 0.95 (steps 9+): PASS",
+      "details": "TP=4 decode with AWQ kernel mode (gemv_int4_v5_awq_t16) enabled on all 4 GPUs. 15 total steps (9 warmup + 6 check). Post-warmup step-to-step cosine_sim: 0.9752, 0.9654, 0.9787, 0.9602, 0.9658, 0.9761. min=0.9602, mean=0.9702 >= 0.95 threshold. No NaN/Inf detected in any step."
+    },
+    "VAL-AWQ-004": {
+      "status": "pass",
+      "evidence": "test_awq_e2e.py output: [PASS] awq_throughput_reported — GPTQ=20.04 tok/s, AWQ=21.07 tok/s, speedup=1.051x. VAL-AWQ-004: AWQ tok/s vs GPTQ tok/s reported: PASS",
+      "details": "TP=4 throughput comparison (30 benchmark steps, 5 warmup). GPTQ standard kernel: 20.04 tok/s. AWQ no-zeros kernel: 21.07 tok/s. AWQ speedup: 1.051x over GPTQ. AWQ is 5.1% faster than GPTQ due to eliminated zero-point subtraction."
+    },
+    "VAL-CROSS-001": {
+      "status": "pass",
+      "evidence": "test_global_graph_bench.py output: Global graph dispatch: 20.4 tok/s. C dispatch + kernel P2P: 20.7 tok/s. Cached+stream: 15.1 tok/s. Speedup vs cached+stream: 1.35x. *** ALL TESTS PASSED ***",
+      "details": "All Sprint 4 optimizations combined (kernel P2P allreduce + global graph C dispatch + GEMV v5): Global graph=20.4 tok/s, C dispatch+kernel P2P=20.7 tok/s. Star topology baseline=15.1 tok/s. Speedup vs star baseline: 1.35x. All correctness checks pass (cosine_sim >= 0.99 for all modes)."
+    },
+    "VAL-CROSS-002": {
+      "status": "pass",
+      "evidence": "test_global_graph_bench.py output: [PASS] fallback_chain_all_modes — All 3 modes produce cosine_sim >= 0.99. C dispatch: min=0.999656. Cached+stream: min=0.999615. Global graph: min=0.999747.",
+      "details": "Progressive fallback chain tested: global graph → C dispatch → cached+stream. All modes produce cosine_sim >= 0.99 vs single-GPU reference (10 steps each). No crashes at any fallback level. Toggle (enable/disable global graph) works correctly."
+    },
+    "VAL-CROSS-003": {
+      "status": "pass",
+      "evidence": "bench_tp4_sprint3.py output: Single-GPU: 21.7 tok/s. Validation: Single-GPU regression (within ±10% of 20.3): PASS (21.7 tok/s)",
+      "details": "Single-GPU decode throughput: 21.7 tok/s. Threshold: 18.3 tok/s (20.3 - 10%). 21.7 >= 18.3: PASS. All Sprint 4 code changes do not regress single-GPU throughput."
+    }
+  },
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["ssh", "docker"]
+}
