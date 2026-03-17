@@ -318,3 +318,80 @@ def load_and_generate(model_dir: str, prompt: str,
     finally:
         generator.cleanup()
         engine.cleanup()
+
+
+def load_and_generate_eagle(model_dir: str, prompt: str,
+                             device_ids: Optional[list] = None,
+                             max_tokens: int = 256,
+                             temperature: float = 0.0,
+                             k_draft: int = 4,
+                             verbose: bool = False) -> Tuple[str, dict]:
+    """Load model and generate text using EAGLE speculative decoding.
+    
+    EAGLE uses the target model's own hidden states and lm_head to generate
+    draft tokens, eliminating the need for a separate draft model.
+    
+    Args:
+        model_dir: path to GPTQ safetensors model directory
+        prompt: input text
+        device_ids: list of GPU IDs (default: [0])
+        max_tokens: maximum tokens to generate
+        temperature: sampling temperature (0.0 for greedy)
+        k_draft: number of draft tokens per iteration (default: 4)
+        verbose: if True, print debugging info
+    
+    Returns:
+        Tuple of (generated_text, stats_dict)
+    """
+    from src.model.weight_loader import QwenWeightLoader
+    from src.model.qwen import QwenConfig, load_config_from_json
+    from src.inference.speculative import EagleSpeculativeGenerator
+    
+    if device_ids is None:
+        device_ids = [0]
+    
+    # Load config from model directory
+    config = load_config_from_json(model_dir)
+    qwen_loader = QwenWeightLoader(model_dir, config=config,
+                                    bits=config.bits,
+                                    group_size=config.group_size)
+    
+    # Initialize engine (single-GPU or tensor-parallel)
+    if len(device_ids) > 1:
+        from src.inference.tp_engine import TPInferenceEngine
+        engine = TPInferenceEngine(config, device_ids=device_ids)
+    else:
+        engine = InferenceEngine(config, device_id=device_ids[0])
+    
+    # Load weights layer by layer
+    for layer_idx in range(config.num_hidden_layers):
+        weights = qwen_loader.load_layer(layer_idx)
+        engine.load_layer_weights(layer_idx, weights)
+    
+    # Load final RMSNorm
+    final_norm = qwen_loader.load_final_norm()
+    engine.load_final_norm(final_norm)
+    
+    # Load embedding and LM head
+    embed_weight = qwen_loader.load_embedding()
+    lm_head_weight = qwen_loader.load_lm_head()
+    
+    # Tokenizer
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+    except ImportError:
+        raise ImportError("transformers package required for tokenizer")
+    
+    # Generate with EAGLE speculative decoding
+    generator = EagleSpeculativeGenerator(
+        engine, embed_weight, lm_head_weight, tokenizer,
+        k_draft=k_draft, temperature=temperature
+    )
+    params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
+    
+    try:
+        return generator.generate(prompt, params, verbose=verbose)
+    finally:
+        generator.cleanup()
+        engine.cleanup()

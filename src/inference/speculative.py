@@ -409,3 +409,374 @@ class SpeculativeGenerator:
     def cleanup(self):
         """Free resources."""
         self.generator.cleanup()
+
+
+# ============================================================================
+# EAGLE-style Speculative Decoding
+# ============================================================================
+
+class EagleDraftHead:
+    """EAGLE-style draft head for speculative decoding.
+    
+    EAGLE uses the target model's own hidden states and lm_head to generate
+    draft tokens, eliminating the need for a separate draft model.
+    
+    Architecture:
+    - Takes last hidden state from target model
+    - Applies lm_head to get logits
+    - Samples/greedy selects draft token
+    - Converts token back to embedding for next iteration
+    - Repeats for K draft tokens
+    
+    For training-free inference, simply reuses the model's existing lm_head
+    and embedding weights.
+    """
+    
+    def __init__(self, embed_weight: np.ndarray, lm_head_weight: np.ndarray,
+                 hidden_size: int = 5120):
+        """Initialize EAGLE draft head.
+        
+        Args:
+            embed_weight: [vocab_size, hidden_size] embedding weights
+            lm_head_weight: [vocab_size, hidden_size] LM head weights
+            hidden_size: hidden state dimension
+        """
+        self.embed_weight = embed_weight
+        self.lm_head_weight = lm_head_weight
+        self.hidden_size = hidden_size
+        self.vocab_size = embed_weight.shape[0]
+    
+    def generate_draft_tokens(self, hidden_state: np.ndarray, 
+                               k: int = 4,
+                               temperature: float = 0.0) -> Tuple[List[int], List[np.ndarray]]:
+        """Generate K draft tokens from a hidden state.
+        
+        Args:
+            hidden_state: [hidden_size] FP16 hidden state from target model
+            k: number of draft tokens to generate
+            temperature: sampling temperature (0.0 = greedy)
+        
+        Returns:
+            Tuple of (draft_token_ids, hidden_states_list)
+            - draft_token_ids: list of K token IDs
+            - hidden_states_list: list of K hidden states (for verification)
+        """
+        draft_tokens = []
+        hidden_states = []
+        current_hidden = hidden_state.copy()
+        
+        for _ in range(k):
+            # Apply lm_head: hidden -> logits
+            logits = self._apply_lm_head(current_hidden)
+            
+            # Sample or greedy select
+            if temperature == 0.0:
+                token_id = int(np.argmax(logits))
+            else:
+                token_id = self._sample_logits(logits, temperature)
+            
+            draft_tokens.append(token_id)
+            
+            # Get embedding for next iteration
+            current_hidden = self.embed_weight[token_id].copy()
+            hidden_states.append(current_hidden)
+        
+        return draft_tokens, hidden_states
+    
+    def _apply_lm_head(self, hidden: np.ndarray) -> np.ndarray:
+        """Apply LM head to get logits.
+        
+        Args:
+            hidden: [hidden_size] FP16 hidden state
+        
+        Returns:
+            [vocab_size] FP32 logits
+        """
+        # LM head is typically just a linear projection: W^T @ hidden
+        # lm_head_weight is [vocab_size, hidden_size]
+        logits = np.dot(self.lm_head_weight, hidden)
+        return logits.astype(np.float32)
+    
+    def _sample_logits(self, logits: np.ndarray, temperature: float = 1.0) -> int:
+        """Sample from logits with temperature.
+        
+        Args:
+            logits: [vocab_size] FP32 logits
+            temperature: sampling temperature
+        
+        Returns:
+            Sampled token ID
+        """
+        # Apply temperature scaling
+        scaled_logits = logits / temperature
+        
+        # Softmax
+        exp_logits = np.exp(scaled_logits - np.max(scaled_logits))
+        probs = exp_logits / np.sum(exp_logits)
+        
+        # Sample
+        return int(np.random.choice(len(probs), p=probs))
+
+
+def eagle_speculative_decode(generator,
+                             input_ids: List[int],
+                             params,
+                             draft_head: EagleDraftHead,
+                             k_draft: int = 4,
+                             temperature: float = 0.0,
+                             verbose: bool = False) -> Tuple[List[int], dict]:
+    """Perform EAGLE-style speculative decoding.
+    
+    This function orchestrates the EAGLE draft-verify loop:
+    1. Use target model's hidden state to generate K draft tokens via lm_head
+    2. Verify drafts by running model forward pass
+    3. Accept longest matching prefix, reject rest
+    4. Repeat until stop condition
+    
+    Args:
+        generator: TextGenerator instance with prefill() and _lm_head() methods
+        input_ids: initial prompt token IDs
+        params: SamplingParams for generation
+        draft_head: EagleDraftHead instance for draft generation
+        k_draft: number of draft tokens per iteration (default: 4)
+        temperature: sampling temperature for draft generation
+        verbose: if True, print debugging info
+    
+    Returns:
+        Tuple of (generated_token_ids, stats_dict)
+    """
+    from src.inference.sampler import sample_token
+    
+    generated_ids = []
+    position = len(input_ids)
+    
+    # Stats tracking
+    total_drafts = 0
+    total_accepted = 0
+    total_iterations = 0
+    
+    # Prefill to get initial hidden state
+    hidden = generator.prefill(input_ids)
+    
+    # Generate up to max_tokens
+    while len(generated_ids) < params.max_tokens:
+        total_iterations += 1
+        
+        # Generate K draft tokens using EAGLE method
+        draft_tokens, draft_hidden_states = draft_head.generate_draft_tokens(
+            hidden, k=k_draft, temperature=temperature
+        )
+        
+        # Limit to remaining tokens
+        remaining = params.max_tokens - len(generated_ids)
+        if len(draft_tokens) > remaining:
+            draft_tokens = draft_tokens[:remaining]
+            draft_hidden_states = draft_hidden_states[:remaining]
+        
+        total_drafts += len(draft_tokens)
+        
+        if verbose and len(draft_tokens) > 0:
+            print(f"  Draft {len(draft_tokens)} tokens: {draft_tokens}")
+        
+        # Verify drafts by running model forward pass
+        accepted_tokens = []
+        verify_hidden = hidden.copy()
+        verify_pos = position
+        
+        for i, draft_token in enumerate(draft_tokens):
+            # Get model's logits at current position
+            model_logits = generator._lm_head(verify_hidden)
+            
+            # Check if draft token matches model's greedy choice
+            model_choice = int(np.argmax(model_logits))
+            
+            if model_choice == draft_token:
+                # Accept this token
+                accepted_tokens.append(draft_token)
+                
+                # Run actual model forward pass for next position
+                emb = generator._embed_token(draft_token)
+                verify_hidden = generator.engine.decode_step(emb, verify_pos)
+                verify_pos += 1
+            else:
+                # Mismatch - reject from this point
+                if verbose:
+                    print(f"  Rejected at position {i}: draft={draft_token}, model={model_choice}")
+                break
+        
+        total_accepted += len(accepted_tokens)
+        
+        if len(accepted_tokens) > 0:
+            if verbose:
+                print(f"  Accepted {len(accepted_tokens)} of {len(draft_tokens)} drafts")
+            
+            generated_ids.extend(accepted_tokens)
+            position += len(accepted_tokens)
+            
+            # Update hidden state for next iteration
+            # Run forward pass on last accepted token to get proper hidden state
+            last_token = accepted_tokens[-1]
+            emb = generator._embed_token(last_token)
+            hidden = generator.engine.decode_step(emb, position - 1)
+            
+            # If all drafts accepted, we need to generate one more token
+            if len(accepted_tokens) == len(draft_tokens) and len(draft_tokens) > 0:
+                # Continue to next iteration to generate more
+                pass
+            else:
+                # Some drafts rejected - the position after accepted prefix needs a new token
+                # Get model's choice at this position
+                logits = generator._lm_head(hidden)
+                if params.temperature == 0:
+                    token_id = int(np.argmax(logits))
+                else:
+                    token_id = sample_token(logits, params, past_tokens=input_ids + generated_ids)
+                
+                if params.stop_token_ids and token_id in params.stop_token_ids:
+                    break
+                if token_id == getattr(generator.tokenizer, 'eos_token_id', None):
+                    break
+                
+                generated_ids.append(token_id)
+                emb = generator._embed_token(token_id)
+                hidden = generator.engine.decode_step(emb, position)
+                position += 1
+        else:
+            # All drafts rejected - use standard greedy decode
+            if verbose:
+                print(f"  All drafts rejected, using standard greedy")
+            
+            logits = generator._lm_head(hidden)
+            if params.temperature == 0:
+                token_id = int(np.argmax(logits))
+            else:
+                token_id = sample_token(logits, params, past_tokens=input_ids + generated_ids)
+            
+            if params.stop_token_ids and token_id in params.stop_token_ids:
+                break
+            if token_id == getattr(generator.tokenizer, 'eos_token_id', None):
+                break
+            
+            generated_ids.append(token_id)
+            emb = generator._embed_token(token_id)
+            hidden = generator.engine.decode_step(emb, position)
+            position += 1
+        
+        # Check stop conditions
+        if len(generated_ids) > 0 and params.stop_token_ids:
+            last_token = generated_ids[-1]
+            if last_token in params.stop_token_ids:
+                break
+        
+        if len(generated_ids) >= params.max_tokens:
+            break
+    
+    stats = {
+        'total_drafts': total_drafts,
+        'total_accepted': total_accepted,
+        'total_iterations': total_iterations,
+        'acceptance_rate': total_accepted / total_drafts if total_drafts > 0 else 0.0,
+    }
+    
+    return generated_ids, stats
+
+
+class EagleSpeculativeGenerator:
+    """Wrapper for EAGLE-style speculative decoding."""
+    
+    def __init__(self, engine, embed_weight: np.ndarray, lm_head_weight: np.ndarray,
+                 tokenizer=None, k_draft: int = 4, temperature: float = 0.0):
+        """Initialize EAGLE speculative generator.
+        
+        Args:
+            engine: InferenceEngine instance
+            embed_weight: embedding weight array
+            lm_head_weight: LM head weight array
+            tokenizer: tokenizer instance
+            k_draft: number of draft tokens per iteration
+            temperature: sampling temperature for draft generation
+        """
+        from src.inference.generate import TextGenerator
+        
+        self.generator = TextGenerator(engine, embed_weight, lm_head_weight, tokenizer)
+        self.draft_head = EagleDraftHead(embed_weight, lm_head_weight,
+                                          hidden_size=engine.config.hidden_size)
+        self.k_draft = k_draft
+        self.temperature = temperature
+    
+    def generate(self, prompt: str, params=None, verbose: bool = False):
+        """Generate text using EAGLE speculative decoding.
+        
+        Args:
+            prompt: input text
+            params: sampling parameters
+            verbose: if True, print debugging info
+        
+        Returns:
+            Tuple of (generated_text, stats_dict)
+        """
+        if params is None:
+            params = self.generator.engine.params if hasattr(self.generator.engine, 'params') else None
+            if params is None:
+                from src.inference.sampler import SamplingParams
+                params = SamplingParams()
+        
+        if self.generator.tokenizer is None:
+            raise RuntimeError("Tokenizer not set.")
+        
+        input_ids = self.generator.tokenizer.encode(prompt)
+        
+        # Run EAGLE speculative decode
+        generated_ids, stats = eagle_speculative_decode(
+            self.generator,
+            input_ids,
+            params,
+            self.draft_head,
+            k_draft=self.k_draft,
+            temperature=self.temperature,
+            verbose=verbose
+        )
+        
+        return self.generator.tokenizer.decode(generated_ids), stats
+    
+    def benchmark(self, prompt: str, max_tokens: int = 100, verbose: bool = False):
+        """Benchmark EAGLE speculative decoding vs standard decode.
+        
+        Args:
+            prompt: input text
+            max_tokens: maximum tokens to generate
+            verbose: if True, print debugging info
+        
+        Returns:
+            Dict with timing and acceptance stats
+        """
+        import time
+        from src.inference.sampler import SamplingParams
+        
+        params = SamplingParams(temperature=0, max_tokens=max_tokens)
+        
+        # Standard decode
+        t0 = time.perf_counter()
+        self.generator.params = params
+        standard_text = self.generator.generate(prompt, params)
+        standard_time = time.perf_counter() - t0
+        
+        # EAGLE speculative decode
+        t0 = time.perf_counter()
+        spec_text, spec_stats = self.generate(prompt, params, verbose=verbose)
+        spec_time = time.perf_counter() - t0
+        
+        return {
+            'standard_time_ms': standard_time * 1000,
+            'eagle_time_ms': spec_time * 1000,
+            'speedup': standard_time / spec_time if spec_time > 0 else 1.0,
+            'acceptance_rate': spec_stats['acceptance_rate'],
+            'total_drafts': spec_stats['total_drafts'],
+            'total_accepted': spec_stats['total_accepted'],
+            'output_match': standard_text == spec_text,
+        }
+    
+    def cleanup(self):
+        """Free resources."""
+        self.generator.cleanup()
+
