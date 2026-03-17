@@ -2821,11 +2821,21 @@ class TPInferenceEngine:
         Used when AWQ-format weights are loaded (zeros tensor = all zeros).
         Requires gemv_int4_v5_awq.hip to be compiled on the target GPU.
 
+        NOTE: Call this BEFORE build_dispatch_cache() so that the cached
+        launch specs use the correct kernels. If called after building the
+        cache, the cache will be automatically rebuilt.
+
         Args:
             enabled: True to use AWQ kernel, False to fall back to GPTQ kernel.
         """
         for engine in self.engines:
             engine.set_awq_mode(enabled)
+        # Force rebuild of dispatch cache to use AWQ kernels
+        if self._engine_layer_caches:
+            print(f"  AWQ mode {'enabled' if enabled else 'disabled'}: rebuilding dispatch cache...")
+            self._engine_layer_caches = []
+            self._c_dispatch_plan = None  # Invalidate C dispatch plan
+            self.build_dispatch_cache()  # Rebuild with correct kernels
 
     def set_c_dispatch(self, enabled: bool):
         """Enable or disable C dispatch loop.

@@ -2767,28 +2767,35 @@ class InferenceEngine:
             # --- FFN down projection (v5_t16 default, v3_t16 fallback, no residual for TP) ---
             # v5 uses hybrid DPP+LDS reduction with identical performance to v3/v4.
             # Falls back to v3_t16 if v5 is unavailable.
-            if self._gemv_int4_v5 or self._gemv_int4_v3:
+            # AWQ mode: use gemv_int4_v5_awq_t16 (no zero-point subtraction, zeros ptr ignored).
+            if self._gemv_int4_v5 or self._gemv_int4_v3 or self._gemv_int4_v5_awq:
                 cols_per_wg = 16
                 down_grid = (h + cols_per_wg - 1) // cols_per_wg
-                if self._gemv_int4_v5:
+                # Select kernel based on AWQ mode and availability
+                if self._awq_mode and self._gemv_int4_v5_awq:
+                    down_func = self.kernels.get_hip("gemv_int4_v5_awq_t16", "gemv_int4_v5_awq")
+                    shared_mem = 0  # AWQ v5 uses static shared memory
+                elif self._gemv_int4_v5:
                     down_func = self.kernels.get_hip("gemv_int4_v5_t16", "gemv_int4_v5")
                     shared_mem = 0  # v5 uses static shared memory (NUM_WF * COLS_PER_WG floats)
                 else:
                     down_func = self.kernels.get_hip("gemv_int4_v3_t16", "gemv_int4_v3")
                     shared_mem = 1024
+                # Build params: AWQ kernel ignores zeros pointer (pass 0 or actual zeros)
+                down_params = [
+                    ctypes.c_uint64(self.d_ffn_gate),
+                    ctypes.c_uint64(lw.down_qweight),
+                    ctypes.c_uint64(lw.down_scales),
+                    ctypes.c_uint64(lw.down_zeros),  # ignored by AWQ kernel
+                    ctypes.c_uint64(self.d_ffn_out),
+                    ctypes.c_uint32(inter),
+                    ctypes.c_uint32(h),
+                    ctypes.c_uint32(cfg.group_size),
+                ]
                 lc['ffn_down'] = LaunchSpec(
                     func=down_func,
                     grid=(down_grid, 1, 1), block=(256, 1, 1),
-                    params=[
-                        ctypes.c_uint64(self.d_ffn_gate),
-                        ctypes.c_uint64(lw.down_qweight),
-                        ctypes.c_uint64(lw.down_scales),
-                        ctypes.c_uint64(lw.down_zeros),
-                        ctypes.c_uint64(self.d_ffn_out),
-                        ctypes.c_uint32(inter),
-                        ctypes.c_uint32(h),
-                        ctypes.c_uint32(cfg.group_size),
-                    ],
+                    params=down_params,
                     shared_mem=shared_mem,
                 )
 
