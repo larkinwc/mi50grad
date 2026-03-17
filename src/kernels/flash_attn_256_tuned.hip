@@ -66,7 +66,110 @@ static __device__ __forceinline__ float fast_exp_schraudolph(float x) {
 // #define FAST_EXP fast_exp_schraudolph
 
 // ============================================================================
-// DECODE KERNEL: 256 threads (4 wavefronts) per WG, KV-parallel softmax merge
+// DECODE KERNEL (64-thread variant): 1 WG per head, optimized sequential sweep
+// ============================================================================
+//
+// This is the 64-thread decode kernel. It uses a single 64-thread WG per head
+// to process all KV positions sequentially. While this is slower per-kernel
+// than the 256-thread 4-way-parallel variant, it uses fewer GPU resources:
+//
+// - 1 wavefront/WG vs 4 wavefronts/WG
+// - Fewer registers per WG (only 64 threads × ~20 regs = 1280 regs vs 256×20)
+// - More WGs can be active per CU, improving occupancy in saturated scenarios
+//
+// Grid: (num_heads, 1, 1), Block: (64, 1, 1)
+// Each WG handles 1 head, all 64 threads cooperate on the KV sweep.
+//
+// This implementation is functionally equivalent to the 256-thread variant
+// but optimized for scenarios where many kernels compete for GPU resources.
+
+extern "C" __global__
+__attribute__((amdgpu_flat_work_group_size(64, 64)))
+void flash_attn_256_decode_64t(
+    const __half* __restrict__ Q,    // [1, num_heads, 256]
+    const __half* __restrict__ K,    // [kv_seq_len, num_kv_heads, 256]
+    const __half* __restrict__ V,    // [kv_seq_len, num_kv_heads, 256]
+    __half* __restrict__ Out,        // [1, num_heads, 256]
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads
+) {
+    unsigned int head = blockIdx.x;
+    unsigned int lane  = threadIdx.x;   // 0..63 (single wavefront)
+
+    // GQA: map head to kv_head
+    unsigned int kv_head = (unsigned int)((unsigned long long)head * num_kv_heads / num_heads);
+    unsigned int dim_base = lane * DIMS_PER_THREAD;  // 0, 4, 8, ..., 252
+    float scale = rsqrtf((float)HEAD_DIM);
+
+    // Load Q vector (4 dimensions per thread)
+    size_t q_offset = (size_t)head * HEAD_DIM + dim_base;
+    float q0 = __half2float(Q[q_offset + 0]) * scale;
+    float q1 = __half2float(Q[q_offset + 1]) * scale;
+    float q2 = __half2float(Q[q_offset + 2]) * scale;
+    float q3 = __half2float(Q[q_offset + 3]) * scale;
+
+    // Online softmax state (kept in registers throughout)
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    size_t kv_head_offset = (size_t)kv_head * HEAD_DIM;
+    size_t kv_row_stride  = (size_t)num_kv_heads * HEAD_DIM;
+
+    // Sequential KV sweep: all 64 threads process each KV position together
+    for (unsigned int kv_pos = 0; kv_pos < kv_seq_len; kv_pos++) {
+        size_t k_off = (size_t)kv_pos * kv_row_stride + kv_head_offset + dim_base;
+
+        float k0 = __half2float(K[k_off + 0]);
+        float k1 = __half2float(K[k_off + 1]);
+        float k2 = __half2float(K[k_off + 2]);
+        float k3 = __half2float(K[k_off + 3]);
+
+        // Dot product: q · k (reduced across 64 lanes)
+        float dot = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3;
+
+        // Intra-wavefront reduction using shuffle operations
+        dot += __shfl_down(dot, 32);
+        dot += __shfl_down(dot, 16);
+        dot += __shfl_down(dot, 8);
+        dot += __shfl_down(dot, 4);
+        dot += __shfl_down(dot, 2);
+        dot += __shfl_down(dot, 1);
+        float score = __shfl(dot, 0);
+
+        // Online softmax update
+        float new_max    = fmaxf(running_max, score);
+        float correction = FAST_EXP(running_max - new_max);
+        float p          = FAST_EXP(score - new_max);
+        running_sum      = running_sum * correction + p;
+
+        // Load V and accumulate
+        float v0 = __half2float(V[k_off + 0]);
+        float v1 = __half2float(V[k_off + 1]);
+        float v2 = __half2float(V[k_off + 2]);
+        float v3 = __half2float(V[k_off + 3]);
+
+        acc0 = acc0 * correction + p * v0;
+        acc1 = acc1 * correction + p * v1;
+        acc2 = acc2 * correction + p * v2;
+        acc3 = acc3 * correction + p * v3;
+
+        running_max = new_max;
+    }
+
+    // Normalize and store output
+    float inv_sum = 1.0f / running_sum;
+    size_t out_offset = (size_t)head * HEAD_DIM + dim_base;
+    Out[out_offset + 0] = __float2half(acc0 * inv_sum);
+    Out[out_offset + 1] = __float2half(acc1 * inv_sum);
+    Out[out_offset + 2] = __float2half(acc2 * inv_sum);
+    Out[out_offset + 3] = __float2half(acc3 * inv_sum);
+}
+
+
+// ============================================================================
+// DECODE KERNEL (256-thread variant): 4 wavefronts per WG, KV-parallel merge
 // ============================================================================
 //
 // For decode (seq_len=1): split KV range across 4 wavefronts.
@@ -86,38 +189,8 @@ static __device__ __forceinline__ float fast_exp_schraudolph(float x) {
 // LDS layout (per WG):
 //   float partial_max[4]         = 16 bytes
 //   float partial_sum[4]         = 16 bytes
-//   float partial_acc[4][4]      = 64 bytes (4 wf * 4 dims * 4 bytes)
-//     indexed as partial_acc[wf_id * HEAD_DIM/4 + dim_idx_in_wf]
-// Total: ~40KB per WG with full acc (4*4*256 floats = 16KB for acc only)
-// That's too much — store only the softmax state (max+sum), not acc.
-// Instead: each wavefront keeps acc in registers; LDS only for max/sum merge.
-// Then in normalize step, each wf reads other wfs' (max,sum) and corrects.
-//
-// LDS needed: 4 * (max, sum) = 4*2*4 = 32 bytes → trivially fits.
-// acc remains in registers throughout (no LDS for acc).
-//
-// Implementation:
-// 1. Each wf sweeps its KV slice: kv_start = wf_id * ceil(kv_len/4)
-// 2. After sweep: store (running_max, running_sum) to LDS
-// 3. __syncthreads() to ensure all wfs have stored
-// 4. Each wf reads all 4 (max, sum) pairs, computes merged sum
-// 5. Applies correction to its own acc: acc *= exp(own_max - global_max) / merged_sum
-// 6. Each wf writes its normalized slice of the output
-//    (but all 4 wfs write to the SAME output location → need to sum contributions)
-// 7. Use LDS reduction for the final accumulation:
-//    - acc_final += acc * correction_wf (summed across all 4 wavefronts)
-//    Actually: needs another reduction pass. Use atomicAdd to shared float,
-//    or wf 0 collects and writes.
-//
-// Simpler final reduction: wf 0 accumulates, all wfs store to LDS, wf 0 reads + writes.
-
-// LDS for decode: 4 wfs × (max=1, sum=1) + acc tiles
-// acc tile: 4 dims per thread × 4 wfs = each dim position has 4 partial values
-// Each thread stores 4 partial accs (its 4 dims, for all 4 wfs → needs access to others)
-//
-// Actually simplest approach: each wf stores its full 256-dim acc to LDS,
-// then wf 0 accumulates and writes. LDS size: 4 wfs × 256 dims × 4 bytes = 4KB.
-// Plus 4 × (max, sum) = 32 bytes. Total: ~4KB → fine.
+//   float partial_acc[4][HEAD_DIM] = 4KB (4 wf * 256 dims * 4 bytes)
+// Total: ~4KB per WG → fits comfortably in LDS (64KB available on gfx906)
 
 #define DECODE_WFS 4
 #define DECODE_ACC_LDS_SIZE (DECODE_WFS * HEAD_DIM)  // floats per WG for acc
