@@ -1479,3 +1479,45 @@ have the same interface and the same t16 grid (ceil(N/16)). If v5.hip is missing
 **No regression:** v5 delivers identical throughput to v3 (both are bandwidth-limited).
 The small difference (~4%) is within measurement noise (same kernel architecture, same LDS layout).
 
+---
+
+## AWQ Weight Loader (awq-weight-loader milestone, 2026-03-16)
+
+**Implementation:** `src/model/awq_loader.py` + `tests/test_awq_loader.py`
+
+**AWQ vs GPTQ format differences:**
+- AWQ: `qweight` [K/8, N] INT32 + `scales` [K/group_size, N] FP16. NO `qzeros` tensor.
+- GPTQ: `qweight` + `scales` + `qzeros` (3 tensors per layer)
+- AWQ dequant: `w = q * scale` (zero_point = 0, no subtraction)
+- GPTQ dequant: `w = (q - zero) * scale`
+- AWQ tensor naming: `model.layers.N.mlp.gate_proj.qweight` (vs GPTQ `model.language_model.layers.N...`)
+
+**Format detection:** `detect_awq_format(model_dir)` scans safetensors index for `qzeros` keys.
+- Returns 'awq' if qweight present and NO qzeros
+- Returns 'gptq' if qzeros found
+- Returns 'fp16' if no qweight
+
+**AWQ loader output format:** Identical to GPTQ loader for engine compatibility:
+- `{gate,up,down}_qweight`: [K/8, N] INT32 (same as GPTQ)
+- `{gate,up,down}_scales`: [K/group_size, N] FP16 (same as GPTQ)
+- `{gate,up,down}_zeros`: [K/group_size, N] FP16, ALL ZEROS (AWQ-specific: no zero-point)
+
+**Zero-point signal:** The all-zeros `_zeros` array signals to GEMV kernels to skip zero-point
+subtraction. The existing GEMV kernel (v3/v5) already supports this via the `zeros` input:
+when `zeros == 0`, the term `(q - zero)` becomes `(q - 0) = q`, which is functionally equivalent
+to the AWQ formula `w = q * scale`.
+
+**No AWQ model available:** `/opt/models/` only has `Qwen3.5-27B-GPTQ-Int4`. AWQ test uses
+synthetic weights. When an AWQ model becomes available, set `model_dir` to its path and test
+with the real data. The loader handles both `model.layers.N` and `model.language_model.layers.N`
+prefix variants via `_detect_layer_prefix()`.
+
+**Test results (7/7 pass):**
+- detect_awq_format(): correctly identifies AWQ (no qzeros)
+- Shape/dtype: gate_qweight=(640,17408) int32, gate_scales=(40,17408) float16, zeros=0
+- No zero-point tensors in synthetic AWQ model index
+- Dequantization: max_abs_err=0.0 (exact because FP16 scales in same precision)
+- Layer count: num_layers=64 from config
+- Matmul correctness: cos_sim=1.0
+- GPTQ compatibility: same dict keys, same dtypes as GPTQ loader output
+
