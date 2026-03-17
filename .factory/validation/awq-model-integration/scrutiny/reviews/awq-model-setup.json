@@ -1,0 +1,49 @@
+{
+  "featureId": "awq-model-setup",
+  "reviewedAt": "2026-03-17T20:45:00.000Z",
+  "commitId": "5915e002e3874896472e5af20ae0e22efe05d639",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "The AWQ model setup feature correctly implements AWQ model discovery, download, and kernel integration. The implementation satisfies both VAL-AWQ-001 (AWQ model available and loadable) and VAL-AWQ-002 (AWQ kernel in C dispatch path). Minor optimization opportunity exists for gate+up projections which still use zero-point subtraction.",
+    "issues": [
+      {
+        "file": "src/inference/engine.py",
+        "line": 2775,
+        "severity": "non_blocking",
+        "description": "AWQ kernel only applied to down_proj, not gate+up projections. The gemv_int4_dual_fused kernel (used for gate+up) still performs zero-point subtraction even though zeros=0 in AWQ. This is functionally correct but misses ~2/3 of the potential AWQ speedup benefit."
+      },
+      {
+        "file": "tests/test_awq_model_load.py",
+        "line": 85,
+        "severity": "non_blocking",
+        "description": "Tests skip (return True) when AWQ model is not present. While this is good for CI, it means full integration testing requires manual model download. Consider adding a --skip-missing flag or environment variable to make this behavior more explicit."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "conventions",
+      "observation": "Kernel selection follows a priority order (AWQ > v5 > v3) documented in code comments. This pattern should be documented in AGENTS.md for future kernel additions.",
+      "evidence": "src/inference/engine.py:2771-2779 shows priority: if _awq_mode and _gemv_int4_v5_awq → AWQ kernel, elif _gemv_int4_v5 → v5, else fallback"
+    },
+    {
+      "area": "knowledge",
+      "observation": "AWQ vs GPTQ quantization difference well documented: AWQ uses w = q * scale (no zero-point) while GPTQ uses w = (q - zero) * scale. This eliminates 8 v_sub_f32 instructions per uint32 word.",
+      "evidence": "notes/AWQ_INTEGRATION.md provides comprehensive documentation. src/kernels/gemv_int4_v5_awq.hip:15-22 documents the compute savings."
+    },
+    {
+      "area": "gotchas",
+      "observation": "set_awq_mode() must be called BEFORE build_dispatch_cache() for optimal performance. Calling after triggers an automatic cache rebuild with performance warning. This ordering requirement should be more prominently documented.",
+      "evidence": "src/inference/tp_engine.py:2833-2837 shows automatic cache rebuild when called after cache is built. The warning mentions 'rebuilding dispatch cache' but doesn't explain the ordering implication."
+    },
+    {
+      "area": "services",
+      "observation": "Model download requires huggingface-hub package. The download script auto-installs it if missing, but this could be added to services.yaml or a requirements file for pre-installation.",
+      "evidence": "scripts/download_awq_model.sh:24-25 shows: 'pip3 show huggingface-hub > /dev/null 2>&1 || pip3 install huggingface-hub -q'"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS. The awq-model-setup feature correctly implements all three steps: (1) AWQ model discovery and download script for QuantTrio/Qwen3.5-27B-AWQ, (2) AWQ kernel integration into C dispatch path with proper cache invalidation, (3) comprehensive test coverage for format detection, loader, engine load, and C dispatch plan. Both VAL-AWQ-001 and VAL-AWQ-002 assertions are satisfied. Minor non-blocking issue: AWQ kernel only applied to down_proj projection, leaving optimization opportunity for gate+up projections which could benefit from a future gemv_int4_dual_awq.hip variant."
+}

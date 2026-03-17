@@ -107,17 +107,10 @@ def test_single_gpu_kernel_loading():
         expected = "v6_t16" if use_v6 else ("v5_t16" if v5_loaded else "v3_t16")
         print(f"  Shape N={N}, K={K} ({desc}): will use {expected}")
     
-    # Load a single layer to verify kernel works
-    loader = QwenWeightLoader(MODEL_DIR, config)
-    engine.load_layer_weights(0, loader.load_layer(0))
-    
-    # Quick correctness check
-    rng = np.random.default_rng(42)
-    emb = rng.standard_normal(config.hidden_size).astype(np.float16)
-    out = engine.decode_step(emb, 0)
-    
-    assert out.shape == (config.hidden_size,), f"Output shape mismatch: {out.shape}"
-    assert not np.any(np.isnan(out)), "Output contains NaN"
+    # Note: decode_step requires all layers loaded. Skip full decode test here.
+    # Correctness will be tested in test_tp4_correctness which loads all layers.
+    # For kernel loading verification, we just check the flags above.
+    pass
     
     passed = v6_loaded or v5_loaded  # At least v5 or v6 should be loaded
     record("VAL-KERN-005.1: GEMV v6/v5 loaded", passed,
@@ -155,6 +148,9 @@ def test_tp4_kernel_loading():
     record("VAL-KERN-005.2: TP=4 GEMV v6/v5 loaded", passed,
            f"v6={v6_loaded}, v5={v5_loaded}")
     
+    # Cleanup
+    tp_engine.cleanup()
+    
     return passed
 
 
@@ -163,7 +159,14 @@ def test_tp4_kernel_loading():
 # ============================================================================
 
 def test_tp4_correctness():
-    """Test TP=4 decode produces cosine sim >= 0.99 vs single-GPU."""
+    """Test TP=4 decode produces cosine sim >= 0.99 vs single-GPU.
+    
+    Uses the same pattern as test_tp4_correctness.py:
+    1. Load single-GPU, run all steps, save outputs
+    2. Free single-GPU engine
+    3. Load TP=4, run all steps, save outputs
+    4. Compare outputs
+    """
     print_header("Test 3: TP=4 Correctness (Cosine Sim vs Single-GPU)")
     
     from src.model.qwen import load_config_from_json
@@ -172,8 +175,10 @@ def test_tp4_correctness():
     from src.model.weight_loader import QwenWeightLoader
     
     config = load_config_from_json(MODEL_DIR)
+    rng = np.random.default_rng(42)
     
-    # Single-GPU reference
+    # --- Phase 1: Single-GPU Reference ---
+    print("  --- Phase 1: Single-GPU Reference ---")
     print("  Loading single-GPU engine...")
     single_engine = InferenceEngine(config, device_id=DEVICE_ID_SINGLE)
     loader = QwenWeightLoader(MODEL_DIR, config)
@@ -183,44 +188,70 @@ def test_tp4_correctness():
     single_engine.load_lm_head(loader.load_lm_head())
     print(f"  Single-GPU engine loaded ({config.num_hidden_layers} layers)")
     
-    # TP=4 engine
+    # Generate fixed embeddings for reproducibility
+    embeddings = [rng.standard_normal(config.hidden_size).astype(np.float16) 
+                  for _ in range(CORRECTNESS_STEPS)]
+    
+    # Warm up
+    print("  Warming up single-GPU engine (1 step)...")
+    single_engine.kv_cache.current_len = 0
+    single_engine.deltanet_state.reset()
+    _ = single_engine.decode_step(embeddings[0], 0)
+    
+    # Run decode steps
+    print(f"  Running {CORRECTNESS_STEPS} decode steps...")
+    single_outputs = []
+    single_engine.kv_cache.current_len = 0
+    single_engine.deltanet_state.reset()
+    for step in range(CORRECTNESS_STEPS):
+        out = single_engine.decode_step(embeddings[step], step)
+        single_outputs.append(out.copy())
+    print("  Single-GPU decode complete.")
+    
+    # Free single-GPU engine
+    print("  Freeing single-GPU engine...")
+    single_engine.device.cleanup()
+    del single_engine
+    
+    # --- Phase 2: TP=4 ---
+    print("  --- Phase 2: TP=4 ---")
     print("  Loading TP=4 engine...")
     tp_engine = TPInferenceEngine(config, device_ids=DEVICE_IDS)
+    loader = QwenWeightLoader(MODEL_DIR, config)
+    for i in range(config.num_hidden_layers):
+        tp_engine.load_layer_weights(i, loader.load_layer(i))
+    tp_engine.load_final_norm(loader.load_final_norm())
+    tp_engine.load_lm_head(loader.load_lm_head())
     print(f"  TP=4 engine loaded ({len(tp_engine.engines)} GPUs)")
     
-    # Generate reference outputs
-    rng = np.random.default_rng(42)
-    ref_outputs = []
-    tp_outputs = []
+    # Warm up
+    print("  Warming up TP=4 engine (1 step)...")
+    for e in tp_engine.engines:
+        e.kv_cache.current_len = 0
+        e.deltanet_state.reset()
+    _ = tp_engine.decode_step(embeddings[0], 0)
     
+    # Run decode steps
     print(f"  Running {CORRECTNESS_STEPS} decode steps...")
+    tp_outputs = []
+    for e in tp_engine.engines:
+        e.kv_cache.current_len = 0
+        e.deltanet_state.reset()
     for step in range(CORRECTNESS_STEPS):
-        emb = rng.standard_normal(config.hidden_size).astype(np.float16)
-        
-        # Single-GPU
-        single_engine.kv_cache.current_len = step
-        single_engine.deltanet_state.reset()
-        out_single = single_engine.decode_step(emb, step)
-        
-        # TP=4
-        tp_engine.kv_cache.current_len = step
-        tp_engine.deltanet_state.reset()
-        out_tp = tp_engine.decode_step(emb, step)
-        
-        ref_outputs.append(out_single)
-        tp_outputs.append(out_tp)
-        
-        cs = cosine_sim(out_single, out_tp)
-        print(f"    Step {step}: cosine_sim = {cs:.6f}")
+        out = tp_engine.decode_step(embeddings[step], step)
+        tp_outputs.append(out.copy())
+    print("  TP=4 decode complete.")
     
-    # Check all cosine similarities
+    # --- Comparison ---
+    print("  --- Comparison ---")
     all_passed = True
     min_cs = 1.0
     for step in range(CORRECTNESS_STEPS):
-        cs = cosine_sim(ref_outputs[step], tp_outputs[step])
+        cs = cosine_sim(single_outputs[step], tp_outputs[step])
         min_cs = min(min_cs, cs)
         step_passed = cs >= COSINE_SIM_THRESHOLD
         all_passed = all_passed and step_passed
+        print(f"    Step {step}: cosine_sim = {cs:.6f} {'PASS' if step_passed else 'FAIL'}")
     
     print(f"  Minimum cosine similarity: {min_cs:.6f}")
     print(f"  Threshold: {COSINE_SIM_THRESHOLD}")
@@ -229,7 +260,6 @@ def test_tp4_correctness():
            f"min_cs={min_cs:.6f}")
     
     # Cleanup
-    single_engine.device.cleanup()
     tp_engine.cleanup()
     
     metrics['min_cosine_sim'] = min_cs
