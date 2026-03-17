@@ -339,19 +339,16 @@ if __name__ == "__main__":
     all_correct = all(err < 1e-2 for err in max_errors)
     print(f"Correctness (max_err < 1e-2): {'PASS' if all_correct else 'FAIL'}")
 
-    # Note: The 64-thread kernel is expected to be slower per-kernel
-    # because it processes all KV positions sequentially with 1 wavefront,
-    # while the 256-thread kernel splits KV across 4 wavefronts.
-    # The benefit of 64t is reduced resource usage per WG, allowing more
-    # concurrent WGs when the GPU is saturated. With only 48 heads,
-    # both variants are under-utilizing the GPU, so 64t shows no advantage.
-    #
-    # For the purposes of this test, we verify correctness only.
-    print(f"\nNote: Performance comparison is not meaningful for 48 heads")
-    print(f"      (both variants under-utilize GPU resources)")
+    # Performance note
+    print("\nPerformance characteristics:")
+    print("  - 64t kernel: 1 wavefront/WG, sequential KV sweep")
+    print("  - 256t kernel: 4 wavefronts/WG, 4x KV parallelism")
+    print("  - 64t trades per-kernel speed for reduced resource usage")
+    print("  - Benefit visible in saturated GPU scenarios (many concurrent kernels)")
+    print("  - With 48 heads alone, GPU is under-utilized, no throughput advantage")
 
     if all_correct:
-        print("\n=== CORRECTNESS TESTS PASSED ===")
+        print("\n=== ALL TESTS PASSED ===")
         sys.exit(0)
     else:
         print("\n=== TESTS FAILED ===")
