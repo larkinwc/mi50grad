@@ -1608,3 +1608,35 @@ Using unnormalized random normal (norm ~71) causes highly variable outputs unsui
 With a fixed embedding repeated, cosine_sim is naturally low for early positions (0.76 at step 0→1).
 Passes threshold after step ~9. Use MEAN cosine_sim >= 0.95 (not MIN) for more stable measurement.
 Skip first 9 warmup steps.
+
+---
+
+## Sprint 4 Final Benchmark (final-benchmark milestone, 2026-03-17)
+
+**Benchmark file:** `tests/bench_tp4_sprint4.py`
+**Report file:** `bench/tp4_sprint4_report.md`
+
+### Final Results (4×MI50 gfx906, 100 steps, Qwen3.5-27B-GPTQ-Int4)
+
+| Mode | Throughput | vs vLLM |
+|---|---|---|
+| C dispatch + kernel P2P | **38.3 tok/s** | 0.82× |
+| Global graph C plan (all opts) | 36.5 tok/s | 0.78× |
+| AWQ kernel mode (GPTQ weights) | **44.7 tok/s** | 0.95× |
+| Single-GPU | 22.0 tok/s | 0.47× |
+| vLLM reference (mixed HW) | 46.9 tok/s | 1.00× |
+
+**All 7 validation assertions pass (tests/bench_tp4_sprint4.py).**
+- VAL-CROSS-001: best throughput = 38.3 tok/s (C dispatch + kernel P2P) PASS
+- VAL-CROSS-002: Progressive fallback chain (all modes cosine_sim >= 0.99) PASS  
+- VAL-CROSS-003: Single-GPU regression >= 18.3 tok/s (got 22.0) PASS
+
+**Key findings:**
+1. C dispatch + kernel P2P = 38.3 tok/s — dominant optimization.
+2. Global graph = 36.5 tok/s (0.95× C dispatch) — slightly slower due to hipGraphLaunch overhead.
+3. AWQ kernel mode = 44.7 tok/s — operates via cached+stream path with AWQ kernel (not C dispatch).
+4. Single-GPU: 22.0 tok/s, no regression.
+
+**Benchmark structure:**
+- Phase 1: Single-GPU subprocess (avoids OOM), collects reference outputs to tempfile
+- Phase 2: TP=4 subprocess (one engine load, sequential mode testing)
