@@ -1,0 +1,47 @@
+{
+  "featureId": "awq-gemv-kernel",
+  "milestone": "awq-support",
+  "reviewedBy": "scrutiny-validator",
+  "status": "pass",
+  "summary": "AWQ GEMV kernel (gemv_int4_v5_awq.hip) is correctly implemented, compiles for gfx906, and passes correctness checks (max_abs_err=0.000739 << 1e-2). The kernel removes the zeros pointer parameter entirely and saves 8 v_sub_f32 instructions per uint32 word. Engine integration with set_awq_mode() is well-structured and propagates to all TP engines. Performance improvement is real: 1.17-1.27x speedup on isolated GEMV vs GPTQ.",
+  "codeReviewIssues": [
+    {
+      "severity": "non_blocking",
+      "description": "AWQ mode only applies to non-residual GEMV calls (_launch_gemv_int4 with residual=0). The down_proj with residual epilogue falls through to the standard GPTQ kernel even in AWQ mode. This means the down_proj GEMV still uses the GPTQ kernel with zeros pointer.",
+      "file": "src/inference/engine.py",
+      "suggestion": "Add AWQ variant for residual GEMV path too, or document that AWQ optimization only covers non-residual calls (gate, up projections). Non-blocking as zeros=0 means GPTQ kernel gives correct results."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "The dual fused kernel (_launch_ffn_gate_up_silu / gemv_int4_dual) is used when self._gemv_int4_dual is True, which bypasses AWQ mode entirely (the dual kernel still passes zeros ptr). In practice, AWQ mode is set on the standard single-projection path only.",
+      "file": "src/inference/engine.py",
+      "suggestion": "Worker handoff already documents this as a known limitation. Non-blocking."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "AWQ mode bypassed by C dispatch: The C dispatch plan caches kernel function pointers at build time and ignores set_awq_mode() called afterward. This means AWQ speedup is not realized in c_dispatch path. This pre-existing gap is documented in the E2E worker handoff.",
+      "file": "src/inference/engine.py",
+      "suggestion": "Future work: rebuild c_dispatch plan after set_awq_mode(). Not a correctness issue."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "The kernel uses __builtin_amdgcn_ubfe() for nibble extraction (unsigned bit field extract) which is correct for AWQ's 0..15 unsigned range. GPTQ v5 also uses the same builtin. Consistent and correct.",
+      "file": "src/kernels/gemv_int4_v5_awq.hip",
+      "suggestion": "No change needed."
+    }
+  ],
+  "validationAssertionsChecked": [
+    {
+      "assertionId": "VAL-AWQ-002",
+      "status": "pass",
+      "evidence": "Worker handoff confirms: max_abs_err=0.000739 < 1e-2 for all 5 Qwen 3.5 27B shapes (N=4096/5120/11008/13696/17408, K=5120). Equivalence check: AWQ == GPTQ(zeros=0) exactly (error=0.0). Both pass. Scrutiny validator confirmed awq_dequantize correctness inline (max_err=0.000000 for small test case)."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "type": "library",
+      "suggestion": "Document in architecture.md that AWQ kernel (gemv_int4_v5_awq) bypasses c_dispatch path — isolated speedup (1.17-1.27x) is not realized in E2E because c_dispatch caches GPTQ function pointers.",
+      "rationale": "Future workers should know about this gap when comparing AWQ E2E vs isolated benchmarks."
+    }
+  ]
+}

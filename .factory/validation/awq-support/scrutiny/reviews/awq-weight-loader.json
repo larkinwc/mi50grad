@@ -1,0 +1,41 @@
+{
+  "featureId": "awq-weight-loader",
+  "milestone": "awq-support",
+  "reviewedBy": "scrutiny-validator",
+  "status": "pass",
+  "summary": "AWQ weight loader implementation is complete, well-structured, and tested. The loader correctly implements format detection, zero-point-free weight loading, and compatibility with the existing engine format. All tests pass with synthetic AWQ-format weights. No real AWQ model is available for testing, which is documented.",
+  "codeReviewIssues": [
+    {
+      "severity": "non_blocking",
+      "description": "The `load_layer()` method calls `_detect_layer_prefix()` which scans the index on first call, but does not cache the FULL layer prefix per-call. Multiple calls to `load_layer()` will re-call `_detect_layer_prefix()` but it IS cached via `self._layer_prefix` — this is fine.",
+      "file": "src/model/awq_loader.py",
+      "suggestion": "No action needed — caching is correct."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "The `awq_dequantize()` utility function is defined in the loader module and also used by tests. The nibble expansion uses a Python loop over 8 positions which is O(K*N*8) in Python — acceptable for CPU correctness checking but not for performance-critical paths. This is purely a CPU utility function used for testing, not in the hot decode path.",
+      "file": "src/model/awq_loader.py",
+      "suggestion": "Non-blocking; acceptable as test utility."
+    },
+    {
+      "severity": "non_blocking",
+      "description": "The loader adds 1.0 to norm weights during loading (weights['attn_norm'] = (1.0 + attn_norm.astype(np.float32)).astype(np.float16)) — this follows the same pattern as the GPTQ loader, consistent with Qwen 3.5 27B's RMSNorm parameterization.",
+      "file": "src/model/awq_loader.py",
+      "suggestion": "Consistent with existing GPTQ loader — no change needed."
+    }
+  ],
+  "validationAssertionsChecked": [
+    {
+      "assertionId": "VAL-AWQ-001",
+      "status": "pass",
+      "evidence": "Worker handoff confirms: gate_qweight=(640,17408) int32, gate_scales=(40,17408) float16, gate_zeros=all 0, down_qweight=(2176,5120). Scrutiny validator confirmed same results by running inline test remotely: detect_awq_format returns 'gptq' for GPTQ model, returns 'awq' for synthetic AWQ test data. Shape assertions all pass."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "type": "library",
+      "suggestion": "Document in .factory/library/architecture.md that AWQ weight loader uses 'model.layers.N' prefix (vs GPTQ 'model.language_model.layers.N') and tries both via _detect_layer_prefix().",
+      "rationale": "Workers integrating AWQ with future models need to know about the prefix detection fallback."
+    }
+  ]
+}
