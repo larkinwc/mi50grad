@@ -1,0 +1,23 @@
+{
+  "groupId": "dpp-all",
+  "assertions": {
+    "VAL-DPP-001": {
+      "status": "pass",
+      "evidence": "terminal output from tests/test_gemv_int4_v5.py on dev server",
+      "details": "All 4 shapes PASS. N=4096: t4=0.000000, t8=0.000004, t16=0.000244; N=5120: t4=0.000000, t8=0.000000, t16=0.000244; N=11008: t4=0.000000, t8=0.000000, t16=0.000244; N=13696: t4=0.000122, t8=0.000122, t16=0.000122. All max_abs_err < 1e-3 threshold. Script exited 0."
+    },
+    "VAL-DPP-002": {
+      "status": "pass",
+      "evidence": "terminal output from tests/test_gemv_int4_v5.py on dev server",
+      "details": "Primary shapes (N=4096,K=5120 and N=11008,K=5120) for t4/t8/t16 all within 5% margin. N=4096 t4: v5=120.9us vs v4=122.9us (1.017x); t8: v5=89.2us vs v4=89.1us (0.999x, within margin); t16: v5=86.5us vs v4=86.5us (1.000x). N=11008 t4: v5=135.4us vs v4=135.8us (1.003x); t8: v5=125.3us vs v4=121.1us (0.966x, within 5% margin); t16: v5=124.8us vs v4=124.2us (0.995x). All PASS."
+    },
+    "VAL-DPP-003": {
+      "status": "pass",
+      "evidence": "terminal output from tests/test_gemv_v5_e2e.py on dev server with HIP_VISIBLE_DEVICES=0,1,2,3",
+      "details": "Single-GPU: 21.5 tok/s >= 18.3 threshold [PASS]. TP=4 cosine_sim min=0.999970 >= 0.99 [PASS]. TP=4 throughput: 21.1 tok/s >= 20.0 threshold (matches ~21.1 tok/s reference baseline) [PASS]. GEMV v5 (hybrid DPP+LDS t16) loaded as default. All engines v5=True."
+    }
+  },
+  "frictions": [],
+  "blockers": [],
+  "toolsUsed": ["SSH", "Docker"]
+}
