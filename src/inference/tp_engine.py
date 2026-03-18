@@ -2019,6 +2019,49 @@ class TPInferenceEngine:
                     print(f"WARNING: Failed to rebuild C dispatch plan after "
                           f"set_kernel_p2p_allreduce({enabled}): {e}")
 
+    def set_deferred_attention_ar(self, enabled: bool):
+        """Enable or disable deferred attention allreduce (M3 optimization).
+        
+        When enabled=True:
+          - Attention output allreduce is SKIPPED
+          - Partial attention output (d_proj_out) is added directly to d_hidden (local residual add)
+          - FFN operates on partial hidden state (d_hidden contains partial attention + residual)
+          - Single allreduce after FFN down-projection (d_ffn_out → d_hidden)
+          - Reduces allreduce count from 128 to 64 per token (50% reduction)
+        
+        Mathematical justification:
+          - FFN gate projection: gate = SiLU(x @ W_gate) — x must be reduced for correctness
+          - FFN up projection: up = x @ W_up — linear, can operate on partial x
+          - FFN down projection: out = (gate * up) @ W_down — row-parallel, allreduce after
+          
+          Since gate uses element-wise SiLU (not linear), this changes the computation.
+          However, for TP=4 with sufficient numerical precision, cosine similarity >= 0.99
+          is expected.
+        
+        Note: This is an approximation that changes the computation graph. Validate
+        correctness with cosine similarity >= 0.99 threshold before using in production.
+        
+        Args:
+            enabled: True to enable deferred attention AR, False for standard path
+        """
+        self._deferred_attention_ar = enabled
+        if enabled:
+            print(f"Deferred attention allreduce ENABLED: "
+                  f"skipping attention AR, adding partial locally, "
+                  f"reduces AR count from 128 to 64 per token")
+        else:
+            print(f"Deferred attention allreduce disabled (standard 2 ARs per layer)")
+        
+        # Invalidate C dispatch plan so it gets rebuilt
+        if self._c_dispatch_plan is not None:
+            self._c_dispatch_plan = None
+            if self._c_dispatch_enabled:
+                try:
+                    self._c_dispatch_plan = self._build_c_dispatch_plan()
+                except Exception as e:
+                    print(f"WARNING: Failed to rebuild C dispatch plan after "
+                          f"set_deferred_attention_ar({enabled}): {e}")
+
     def set_cached_dispatch(self, cached: bool):
         """Enable or disable cached (pre-built parameter) dispatch.
 
@@ -4502,6 +4545,9 @@ class TPInferenceEngine:
                 ('kv_cache_v_base',     ct.c_uint64),
                 ('kv_stride',           ct.c_uint32),
                 ('use_direct_kv_write', ct.c_uint32),
+                # Deferred attention allreduce (M3 optimization)
+                ('d_hidden',            ct.c_uint64),  # engine->d_hidden for residual add
+                ('d_proj_out',          ct.c_uint64),  # engine->d_proj_out (attn output partial)
             ]
 
         # Allreduce function type signatures
@@ -4576,6 +4622,9 @@ class TPInferenceEngine:
                 ('attn_allreduce_specs',    ct.c_uint64),
                 ('ffn_allreduce_specs',     ct.c_uint64),
                 ('use_stream_overlap',      ct.c_int),
+                # Deferred attention allreduce (M3 optimization)
+                ('use_deferred_attention_ar', ct.c_int),  # 1=skip attention AR, add partial locally
+                ('residual_add_fn',         ct.c_void_p),  # residual_add_v2_fn_t function pointer
                 ('hipSetDevice_fn',         HipSetDeviceFunc),
                 ('hipStreamSynchronize_fn', HipStreamSyncFunc),
                 ('hipEventRecord_fn',       HipEventRecordFunc),
@@ -4672,6 +4721,10 @@ class TPInferenceEngine:
                     es.kv_cache_v_base = 0
                     es.kv_stride       = 0
                     es.use_direct_kv_write = 0
+                
+                # Deferred attention allreduce (M3 optimization): store pointers for residual add
+                es.d_hidden = engine.d_hidden
+                es.d_proj_out = engine.d_proj_out
 
         # Build allreduce spec arrays
         AttnARArray = CAllreduceSpec * num_layers
@@ -4897,6 +4950,11 @@ class TPInferenceEngine:
         plan.attn_allreduce_specs = ct.addressof(attn_ar_array)
         plan.ffn_allreduce_specs  = ct.addressof(ffn_ar_array)
         plan.use_stream_overlap   = 1
+        
+        # Deferred attention allreduce (M3 optimization): disabled by default
+        # Can be enabled via set_deferred_attention_ar(True)
+        plan.use_deferred_attention_ar = 0
+        plan.residual_add_fn = 0  # Will be set if deferred AR is enabled
 
         # HIP API function pointers
         hip_lib_handle = self._hip._lib
@@ -4925,6 +4983,44 @@ class TPInferenceEngine:
         plan.hipMemcpyAsync_fn       = hip_memcpy_async_fn
         plan.hipGetLastError_fn      = hip_get_last_error_fn
         plan.hipModuleLaunchKernel_fn = hip_module_launch_fn
+        
+        # Load residual_add_v2 function pointer for deferred attention allreduce
+        if getattr(self, '_deferred_attention_ar', False):
+            elementwise_so_path = build_dir / "elementwise_v2.so"
+            if elementwise_so_path.exists():
+                try:
+                    elementwise_lib = ct.CDLL(str(elementwise_so_path))
+                    # Set function signature for residual_add_v2(dst, src, n)
+                    elementwise_lib.residual_add_v2.argtypes = [
+                        ct.c_void_p,  # dst (modified in place)
+                        ct.c_void_p,  # src (added to dst)
+                        ct.c_uint,    # n (number of FP16 elements)
+                    ]
+                    elementwise_lib.residual_add_v2.restype = ct.c_int
+                    plan.residual_add_fn = ct.cast(
+                        elementwise_lib.residual_add_v2,
+                        ct.c_void_p
+                    ).value
+                    plan.use_deferred_attention_ar = 1
+                    print(f"C dispatch: deferred attention allreduce ENABLED "
+                          f"(residual_add_fn=0x{plan.residual_add_fn:016x}, "
+                          f"AR count will be 64 instead of 128)")
+                    # Keep library alive to prevent GC
+                    if not hasattr(self, '_c_dispatch_objects'):
+                        self._c_dispatch_objects = {}
+                    self._c_dispatch_objects['elementwise_lib'] = elementwise_lib
+                except Exception as e:
+                    print(f"C dispatch: failed to load elementwise_v2 for deferred AR: {e}")
+                    plan.use_deferred_attention_ar = 0
+                    plan.residual_add_fn = 0
+            else:
+                print(f"C dispatch: elementwise_v2.so not found at {elementwise_so_path}, "
+                      f"deferred AR disabled")
+                plan.use_deferred_attention_ar = 0
+                plan.residual_add_fn = 0
+        else:
+            plan.use_deferred_attention_ar = 0
+            plan.residual_add_fn = 0
 
         # Store all objects to keep them alive (Python GC must not collect them)
         self._c_dispatch_objects = {

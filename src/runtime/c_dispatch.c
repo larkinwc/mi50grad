@@ -124,6 +124,16 @@ typedef int (*gemv_int4_fused_tp4_fn_t)(
     void* stream                      /* HIP stream */
 );
 
+/* residual_add_v2(dst, src, n): Host-callable C wrapper from elementwise_v2.so.
+ * Performs element-wise addition: dst[i] += src[i] for all i in [0, n).
+ * Used for deferred attention allreduce to add partial attention output to hidden.
+ */
+typedef int (*residual_add_v2_fn_t)(
+    void* dst,                      /* Destination buffer (modified in place) */
+    const void* src,                /* Source buffer (added to dst) */
+    unsigned int n                  /* Number of FP16 elements */
+);
+
 /* ---------------------------------------------------------------------- */
 /* Data structures (must match Python ctypes definitions exactly)           */
 /* ---------------------------------------------------------------------- */
@@ -194,6 +204,10 @@ typedef struct {
     uint64_t kv_cache_v_base;    /* kv_cache.layer_v_ptr(layer_idx); 0=skip D2D copy */
     uint32_t kv_stride;          /* local_num_kv_heads * head_dim * 2 bytes */
     uint32_t use_direct_kv_write;/* 1=K and V written directly by kernels (no memcpy) */
+    
+    /* Deferred attention allreduce (M3 optimization) */
+    uint64_t d_hidden;           /* engine->d_hidden (for deferred AR residual add) */
+    uint64_t d_proj_out;         /* engine->d_proj_out (attention output partial) */
 } CEngineLayerSpec;
 
 /*
@@ -261,7 +275,13 @@ typedef struct {
     uint64_t attn_allreduce_specs;
     uint64_t ffn_allreduce_specs;
     int     use_stream_overlap;
-
+    
+    /* Deferred attention allreduce (M3 optimization) */
+    int     use_deferred_attention_ar;  /* 1=skip attention AR, add partial to hidden locally */
+    
+    /* residual_add_v2 function pointer (for deferred attention AR) */
+    residual_add_v2_fn_t residual_add_fn;
+    
     /* HIP API function pointers */
     hipSetDevice_t          hipSetDevice_fn;
     hipStreamSynchronize_t  hipStreamSynchronize_fn;
@@ -747,16 +767,18 @@ static int dispatch_allreduce(CAllreduceSpec *ar, CDispatchPlan *plan)
  *
  * Returns: 0 on success, non-zero HIP error code on failure.
  *
+ * Deferred Attention Allreduce (M3 optimization):
+ *   - Attention output allreduce is SKIPPED
+ *   - Partial attention output (d_proj_out) is added directly to d_hidden (local residual)
+ *   - FFN operates on partial hidden state (d_hidden contains partial attention + residual)
+ *   - Single allreduce after FFN down-projection (d_ffn_out → d_hidden)
+ *   - Reduces allreduce count from 128 to 64 per token
+ *
  * Fused kernel mode (use_fused_kernel=1 in CAllreduceSpec):
  *   When the FFN allreduce uses the fused kernel, it performs:
  *   - P2P allreduce + RMSNorm in one kernel launch
  *   - The output is already RMSNorm-normalized
  *   - The next layer's attn_rmsnorm is skipped (already done by fused kernel)
- *   
- *   When the attention allreduce uses the fused kernel:
- *   - P2P allreduce + RMSNorm in one kernel launch  
- *   - The output is already RMSNorm-normalized
- *   - The ffn_rmsnorm is skipped (already done by fused kernel)
  */
 int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
 {
@@ -877,6 +899,19 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
                 if (err) return err;
                 err = launch_kernel(&es->gemv_o_proj, plan);
                 if (err) return err;
+                
+                /* Deferred attention allreduce (M3 optimization):
+                 * Add partial attention output (d_proj_out) to hidden locally,
+                 * then skip the attention allreduce. The FFN will operate on
+                 * the partial hidden state (residual + partial attention). */
+                if (plan->use_deferred_attention_ar && plan->residual_add_fn != NULL) {
+                    err = plan->residual_add_fn(
+                        (void *)(uintptr_t)es->d_hidden,
+                        (const void *)(uintptr_t)es->d_proj_out,
+                        attn_ar->num_elems  /* hidden_size */
+                    );
+                    if (err) return err;
+                }
 
             } else {
                 /* ---- DeltaNet linear attention ---- */
@@ -888,20 +923,33 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
                 if (err) return err;
                 err = launch_kernel(&es->gemv_la_out_proj, plan);
                 if (err) return err;
+                
+                /* Deferred attention allreduce for DeltaNet layers */
+                if (plan->use_deferred_attention_ar && plan->residual_add_fn != NULL) {
+                    err = plan->residual_add_fn(
+                        (void *)(uintptr_t)es->d_hidden,
+                        (const void *)(uintptr_t)es->d_proj_out,
+                        attn_ar->num_elems  /* hidden_size */
+                    );
+                    if (err) return err;
+                }
             }
         }
 
-        /* Async allreduce for attention partials */
-        if (use_overlap) {
+        /* Async allreduce for attention partials
+         * SKIPPED when use_deferred_attention_ar=1 (M3 optimization) */
+        if (use_overlap && !plan->use_deferred_attention_ar) {
             err = dispatch_allreduce(attn_ar, plan);
             if (err) return err;
             wait_for_allreduce(attn_ar, plan);
         }
 
-        /* Track whether attention allreduce used fused kernel */
-        int attn_used_fused = (attn_ar->use_fused_kernel && 
-                                attn_ar->kernel_p2p_fused_tp4_fn != NULL &&
-                                attn_ar->tp_size == 4);
+        /* Track whether attention allreduce would have been used (for FFN RMSNorm skip logic)
+         * In deferred mode, attn_allreduce is skipped, so attn_used_fused=0 */
+        int attn_used_fused = (!plan->use_deferred_attention_ar) &&
+                               attn_ar->use_fused_kernel && 
+                               attn_ar->kernel_p2p_fused_tp4_fn != NULL &&
+                               attn_ar->tp_size == 4;
 
         /* Per-engine FFN kernels */
         for (engine_idx = 0; engine_idx < num_engines; engine_idx++) {

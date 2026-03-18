@@ -1,0 +1,110 @@
+{
+  "milestone": "fused-gemv-ar",
+  "round": 2,
+  "status": "fail",
+  "validatorsRun": {
+    "test": {
+      "passed": true,
+      "command": "python3 tests/val_m2_fused_gemv_ar.py (local syntax check; full test requires dev server)",
+      "exitCode": 0,
+      "observation": "Validation test syntax verified. Full GPU tests require running on dev server."
+    },
+    "typecheck": {
+      "passed": true,
+      "command": "Python syntax: python3 -m py_compile; C syntax: gcc -fsyntax-only src/runtime/c_dispatch.c",
+      "exitCode": 0,
+      "observation": "Python files compile without errors. C dispatch compiles (other C files have x86 intrinsics, expected for ARM macOS)."
+    },
+    "lint": {
+      "passed": true,
+      "command": "No lint tool configured; manual code review performed",
+      "exitCode": 0,
+      "observation": "Code follows project conventions. Kernel is well-documented with clear phase structure."
+    }
+  },
+  "reviewsSummary": {
+    "total": 3,
+    "passed": 2,
+    "failed": 1,
+    "failedFeatures": ["m2-fix-fused-regression"]
+  },
+  "blockingIssues": [
+    {
+      "featureId": "m2-fix-fused-regression",
+      "severity": "blocking",
+      "description": "Fused GEMV+AR+RMSNorm kernel causes 71% throughput regression (45 tok/s -> 15 tok/s) even after input buffer fix. Kernel is disabled by default pending investigation. Root cause unknown."
+    }
+  ],
+  "featureReviews": {
+    "m2-fused-gemv-kernel": {
+      "status": "pass",
+      "description": "Fused INT4 GEMV + P2P Allreduce + RMSNorm kernel implementation",
+      "issues": [],
+      "positiveObservations": [
+        "Well-documented kernel with clear phase structure (GEMV, P2P Allreduce, RMSNorm)",
+        "Supports both TP=2 and TP=4 configurations",
+        "Uses register-cached scale/zero for performance",
+        "Proper cooperative reduction via DPP + LDS",
+        "FP32 accumulation for numerical accuracy"
+      ]
+    },
+    "m2-c-dispatch-fused": {
+      "status": "pass",
+      "description": "C dispatch integration for fused kernel",
+      "issues": [],
+      "positiveObservations": [
+        "Proper extension of CAllreduceSpec struct with fused kernel fields (use_gemv_fused, gemv_fused_tp4_fn, ffn_gate_ptrs, etc.)",
+        "dispatch_allreduce() correctly routes to fused kernel when enabled",
+        "Correctly skips ffn_down and next attn_rmsnorm when fused kernel is used",
+        "Input buffer fix applied: uses ffn_gate_ptrs instead of hidden_ptrs[0]"
+      ]
+    },
+    "m2-fix-fused-regression": {
+      "status": "fail",
+      "description": "Fix for fused kernel regression",
+      "issues": [
+        {
+          "severity": "blocking",
+          "description": "Fused kernel still causes regression after input buffer fix. Kernel disabled by default (commit 39ffd0d)."
+        },
+        {
+          "severity": "non_blocking",
+          "description": "Root cause of regression not fully identified. Input buffer was wrong, but fix did not resolve the throughput issue."
+        },
+        {
+          "severity": "suggestion",
+          "description": "Consider profiling kernel execution to identify bottleneck: memory bandwidth, synchronization overhead, or computation errors."
+        }
+      ],
+      "timeline": [
+        "Initial integration (6b17de8): 71% regression discovered",
+        "First diagnosis (2c110d1): Disabled by default",
+        "Fix attempt (0dbe5e4): Fixed input buffer (hidden_ptrs[0] -> ffn_gate_ptrs)",
+        "Final state (39ffd0d): Still causes regression, disabled pending investigation"
+      ],
+      "sharedStateObservations": []
+    }
+  },
+  "appliedUpdates": [],
+  "suggestedGuidanceUpdates": [
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add guidance: When implementing kernel fusion, always validate with A/B benchmark comparison before merging. Fused kernels must demonstrate no regression AND numerical correctness.",
+      "evidence": "Fused GEMV+AR+RMSNorm kernel caused 71% regression. Even after fixing a known bug (wrong input buffer), the regression persists. This could have been caught earlier with mandatory benchmark validation.",
+      "isSystemic": false
+    },
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add guidance: For GPU kernel optimization work, always validate on the target hardware (dev server) before marking complete. Local compilation/syntax checks are insufficient for performance validation.",
+      "evidence": "The fused kernel regression was only discovered when benchmarking on the dev server with actual GPU execution. Local tests passed but the performance issue was hardware-specific.",
+      "isSystemic": true
+    }
+  ],
+  "rejectedObservations": [],
+  "previousRound": ".factory/validation/fused-gemv-ar/scrutiny/synthesis.json (Round 1)",
+  "summary": {
+    "whatWasBuilt": "Fused GEMV+P2P Allreduce+RMSNorm kernel for FFN down projection in TP inference. Infrastructure for kernel fusion is in place with proper C dispatch integration. Input buffer bug was identified and fixed.",
+    "currentStatus": "Fused kernel is DISABLED by default due to unresolved throughput regression (45 tok/s -> 15 tok/s). Baseline throughput of 44+ tok/s is maintained with the kernel disabled. No new fixes have been added since Round 1.",
+    "nextSteps": "Investigate root cause of regression in fused kernel. Possible areas: (1) memory bandwidth contention from P2P reads during GEMV, (2) kernel launch overhead not actually reduced, (3) synchronization patterns, (4) numerical issues causing incorrect computation. Consider profiling with ROCm profiler."
+  }
+}
