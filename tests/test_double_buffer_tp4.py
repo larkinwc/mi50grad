@@ -522,26 +522,27 @@ def test_c_dispatch_interaction():
     print(f"  Loaded {len(layers_weights)} layers")
     
     # Create C dispatch engine (no double-buffer)
+    # IMPORTANT: Load weights FIRST, then build dispatch cache, THEN enable C dispatch
     print("\nCreating C dispatch engine (no double-buffer)...")
     tp_c = TPInferenceEngine(config, device_ids=DEVICE_IDS, max_seq_len=MAX_SEQ_LEN)
-    tp_c.set_c_dispatch(True)
     for layer_idx, lw in enumerate(layers_weights):
         tp_c.load_layer_weights(layer_idx, lw)
     tp_c.load_final_norm(final_norm)
     tp_c.load_lm_head(lm_head)
     tp_c.build_dispatch_cache()
+    tp_c.set_c_dispatch(True)  # Must be AFTER build_dispatch_cache
     
     # Create C dispatch + double-buffer engine
     # Double-buffer should be ignored when C dispatch is enabled
     print("Creating C dispatch + double-buffer engine...")
     tp_c_db = TPInferenceEngine(config, device_ids=DEVICE_IDS, max_seq_len=MAX_SEQ_LEN)
-    tp_c_db.set_c_dispatch(True)
-    tp_c_db.set_double_buffer_enabled(True)  # Should be ignored
+    tp_c_db.set_double_buffer_enabled(True)  # Should be ignored when C dispatch is active
     for layer_idx, lw in enumerate(layers_weights):
         tp_c_db.load_layer_weights(layer_idx, lw)
     tp_c_db.load_final_norm(final_norm)
     tp_c_db.load_lm_head(lm_head)
     tp_c_db.build_dispatch_cache()
+    tp_c_db.set_c_dispatch(True)  # Must be AFTER build_dispatch_cache
     
     print(f"\nRunning 10 decode steps...")
     
