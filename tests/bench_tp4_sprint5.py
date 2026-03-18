@@ -67,6 +67,13 @@ def record(name: str, passed: bool, msg: str = ""):
     print(f"  [{status}] {name}{suffix}")
 
 
+def reset_tp(engine):
+    """Reset all KV caches and DeltaNet states for TP engine."""
+    for e in engine.engines:
+        e.kv_cache.current_len = 0
+        e.deltanet_state.reset()
+
+
 # ============================================================================
 # Benchmark: TP=4 Throughput
 # ============================================================================
@@ -83,7 +90,21 @@ def bench_tp4_throughput() -> dict:
     
     print("  Loading TP=4 engine...")
     t_load = time.perf_counter()
-    tp_engine = TPInferenceEngine(config, device_ids=DEVICE_IDS)
+    tp_engine = TPInferenceEngine(config, device_ids=DEVICE_IDS, max_seq_len=MAX_SEQ_LEN)
+    
+    # Load weights
+    loader = QwenWeightLoader(MODEL_DIR, config)
+    for layer_idx in range(config.num_hidden_layers):
+        if layer_idx % 16 == 0:
+            print(f"    Layer {layer_idx}...")
+        tp_engine.load_layer_weights(layer_idx, loader.load_layer(layer_idx))
+    tp_engine.load_final_norm(loader.load_final_norm())
+    tp_engine.load_lm_head(loader.load_lm_head())
+    tp_engine.build_dispatch_cache()
+    tp_engine.set_direct_kv_write(True)
+    tp_engine.set_c_dispatch(True)
+    tp_engine.set_kernel_p2p_allreduce(True)
+    
     t_load = time.perf_counter() - t_load
     print(f"  TP=4 engine loaded in {t_load:.2f}s ({len(tp_engine.engines)} GPUs)")
     
@@ -100,21 +121,18 @@ def bench_tp4_throughput() -> dict:
     rng = np.random.default_rng(42)
     for i in range(WARMUP_STEPS):
         emb = rng.standard_normal(config.hidden_size).astype(np.float16)
-        tp_engine.kv_cache.current_len = i
-        tp_engine.deltanet_state.reset()
+        reset_tp(tp_engine)
         tp_engine.decode_step(emb, i)
-    tp_engine._hip.synchronize()
+        tp_engine._hip.synchronize()
     
     # Benchmark
     print(f"\n  Benchmarking ({BENCH_STEPS} steps)...")
-    tp_engine.kv_cache.current_len = 0
-    tp_engine.deltanet_state.reset()
+    reset_tp(tp_engine)
     
     t0 = time.perf_counter()
     for i in range(BENCH_STEPS):
         emb = rng.standard_normal(config.hidden_size).astype(np.float16)
-        tp_engine.decode_step(emb, tp_engine.kv_cache.current_len)
-        tp_engine.kv_cache.advance()
+        tp_engine.decode_step(emb, i)
     tp_engine._hip.synchronize()
     t1 = time.perf_counter()
     
