@@ -4556,6 +4556,15 @@ class TPInferenceEngine:
                 ('kernel_p2p_fused_tp4_fn', ct.c_void_p),  # kernel_p2p_fused_tp4_fn_t
                 ('rmsnorm_weight_ptrs', ct.c_uint64 * 4),  # RMSNorm weight pointers per GPU
                 ('eps',             ct.c_float),  # RMSNorm epsilon
+                # Fused GEMV+AR+RMSNorm kernel fields (for FFN down projection)
+                ('use_gemv_fused',  ct.c_uint32),  # 1=use fused GEMV+allreduce+RMSNorm
+                ('gemv_fused_tp4_fn', ct.c_void_p),  # gemv_int4_fused_tp4_fn_t function pointer
+                ('ffn_down_qweight_ptrs', ct.c_uint64 * 4),  # FFN down proj INT4 weights per GPU
+                ('ffn_down_scales_ptrs', ct.c_uint64 * 4),  # FFN down proj scales per GPU
+                ('ffn_down_zeros_ptrs', ct.c_uint64 * 4),   # FFN down proj zeros per GPU
+                ('ffn_K',           ct.c_uint32),  # FFN intermediate size (input to down proj)
+                ('ffn_group_size',  ct.c_uint32),  # Quantization group size
+                # Padding for alignment (total struct size should be 448 bytes)
             ]
 
         class CDispatchPlan(ct.Structure):
@@ -4776,14 +4785,17 @@ class TPInferenceEngine:
                     gemv_fused_lib.gemv_int4_p2p_allreduce_rmsnorm_tp4,
                     ct.c_void_p
                 ).value
-                # Enable fused GEMV kernel only for TP=4
-                if self.tp_size == 4:
-                    use_gemv_fused_in_c = True
-                    print(f"C dispatch: fused GEMV+AR+RMSNorm kernel enabled for FFN down-proj "
-                          f"(fn_ptr=0x{gemv_fused_fn_ptr:016x})")
-                else:
-                    print(f"C dispatch: fused GEMV kernel available but TP={self.tp_size} "
-                          f"(requires TP=4)")
+                # DISABLED: Fused GEMV+AR+RMSNorm kernel has a critical bug (reads from wrong input buffer).
+                # The kernel reads from hidden_ptrs[0] but should read from d_ffn_gate (SiLU output).
+                # Keep disabled until the input pointer is fixed in c_dispatch.c do_allreduce_gemv_fused().
+                # Previously caused 71% throughput regression (45 tok/s -> 13 tok/s).
+                # if self.tp_size == 4:
+                #     use_gemv_fused_in_c = True
+                #     print(f"C dispatch: fused GEMV+AR+RMSNorm kernel enabled for FFN down-proj "
+                #           f"(fn_ptr=0x{gemv_fused_fn_ptr:016x})")
+                # else:
+                print(f"C dispatch: fused GEMV kernel loaded but DISABLED by default (bug: wrong input buffer). "
+                      f"TP={self.tp_size}")
             except Exception as e:
                 print(f"C dispatch: failed to load fused GEMV kernel library: {e}")
                 gemv_fused_lib = None
