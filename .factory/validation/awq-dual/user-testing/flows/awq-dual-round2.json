@@ -1,0 +1,107 @@
+{
+  "assertionResults": [
+    {
+      "id": "VAL-AWQ-001",
+      "status": "pass",
+      "evidence": "test_awq_dual_gemv.py: All numerical equivalence tests PASSED. max_abs_err=0.000209-0.000246 < 1e-2 threshold. Tested shapes: N=11008/13696/17408, K=5120, group_size=128. AWQ dual kernel produces output equivalent to two separate AWQ GEMVs + SiLU fusion.",
+      "metrics": {
+        "max_abs_err_N11008": 2.094209e-04,
+        "max_abs_err_N13696": 2.033412e-04,
+        "max_abs_err_N17408": 2.456307e-04,
+        "threshold": 1e-2
+      },
+      "consoleOutput": "VAL-AWQ-DUAL-001: ALL equivalence tests PASSED\n  ✓ N=11008, K= 5120: max_abs_err=2.094209e-04\n  ✓ N=13696, K= 5120: max_abs_err=2.033412e-04\n  ✓ N=17408, K= 5120: max_abs_err=2.456307e-04"
+    },
+    {
+      "id": "VAL-AWQ-002",
+      "status": "blocked",
+      "evidence": "AWQ dual kernel selection confirmed via code inspection and kernel loading logs. Kernel loads: 'GEMV INT4 dual AWQ (fused gate+up+silu, no zero-point) loaded'. set_awq_mode(True) propagates to all 4 GPUs. However, cannot validate kernel selection in cached LaunchSpec without true AWQ model weights. With GPTQ weights, AWQ kernel mode causes NaN/Inf (expected: AWQ kernel skips zero-point subtraction, GPTQ weights have non-zero zeros). test_awq_dual_dispatch.py fails because it creates engine without loading weights.",
+      "metrics": {
+        "awq_dual_kernel_loaded": true,
+        "awq_mode_propagates_to_all_gpus": true,
+        "blocked_by": "No true AWQ model available (model at /opt/models/Qwen3.5-27B-AWQ is GPTQ format with qzeros)"
+      },
+      "consoleOutput": "Kernel loading: 'GEMV INT4 dual AWQ (fused gate+up+silu, no zero-point) loaded'\nAWQ mode propagation: 'TPInferenceEngine.set_awq_mode(True) propagates to all 4 engines: True'\nE2E with GPTQ weights: 'Step 0: NaN/Inf detected in output!' (expected - wrong weight format)"
+    },
+    {
+      "id": "VAL-AWQ-003",
+      "status": "pass",
+      "evidence": "test_awq_dual_gemv.py: All throughput benchmarks PASSED. AWQ dual kernel shows 1.021-1.050x speedup over GPTQ dual kernel, exceeding 1.02x target. Zero-point arithmetic savings (8 v_sub_f32 per uint32 per projection) translate to measurable throughput improvement.",
+      "metrics": {
+        "speedup_N11008": "1.043x (GPTQ=145.4us, AWQ=139.4us)",
+        "speedup_N13696": "1.021x (GPTQ=167.0us, AWQ=163.6us)",
+        "speedup_N17408": "1.050x (GPTQ=204.8us, AWQ=195.1us)",
+        "target_speedup": ">= 1.02x"
+      },
+      "consoleOutput": "Throughput Report:\n  ✓ N=11008, K= 5120: GPTQ=145.4us, AWQ=139.4us, speedup=1.043x\n  ✓ N=13696, K= 5120: GPTQ=167.0us, AWQ=163.6us, speedup=1.021x\n  ✓ N=17408, K= 5120: GPTQ=204.8us, AWQ=195.1us, speedup=1.050x"
+    },
+    {
+      "id": "VAL-AWQ-004",
+      "status": "blocked",
+      "evidence": "C dispatch integration code confirmed working: AWQ kernel mode enabled, dispatch cache rebuilds on mode change. However, E2E validation blocked by lack of true AWQ model. Running AWQ kernel mode with GPTQ weights causes NaN/Inf because AWQ kernel skips zero-point subtraction (assumes zeros=0), but GPTQ weights have non-zero zero points. Model at /opt/models/Qwen3.5-27B-AWQ is detected as 'gptq' format (has qzeros tensors).",
+      "metrics": {
+        "awq_kernel_mode_enabled": true,
+        "dispatch_cache_rebuilds": true,
+        "blocked_by": "No true AWQ model available",
+        "e2e_with_gptq_weights": "NaN/Inf (expected - wrong format)"
+      },
+      "consoleOutput": "AWQ mode: 'AWQ GEMV mode enabled: using gemv_int4_v5_awq_t16 + gemv_int4_dual_awq_fused (no zero-point)'\nDispatch: 'Dispatch cache built for 4 engines × 64 layers'\nE2E GPTQ: 'Step 0: NaN/Inf detected in output!' (expected - AWQ kernel incompatible with GPTQ weights)"
+    }
+  ],
+  "frictions": [
+    {
+      "description": "test_awq_dual_dispatch.py creates engine without loading weights, so layer cache is empty",
+      "suggestedFix": "Test should either use mock weights or skip layer cache validation when weights not loaded"
+    },
+    {
+      "description": "Model at /opt/models/Qwen3.5-27B-AWQ has qzeros tensors, detected as GPTQ format, not true AWQ",
+      "suggestedFix": "Download true AWQ model (with qweight/scales but no qzeros) or create synthetic AWQ weights for testing"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "NO-AWQ-MODEL",
+      "description": "No true AWQ model available at /opt/models/. Model labeled 'AWQ' is actually GPTQ format (has qzeros). AWQ kernel mode with GPTQ weights produces NaN/Inf because AWQ kernel skips zero-point subtraction.",
+      "severity": "blocking",
+      "affectedAssertions": ["VAL-AWQ-002", "VAL-AWQ-004"],
+      "suggestedResolution": "Download true AWQ Qwen 3.5 27B model from HuggingFace (e.g., from Qwen or casper-hansen) that has no qzeros tensors, or create synthetic AWQ weights for validation."
+    }
+  ],
+  "toolsUsed": ["ssh", "docker", "python3", "hipcc"],
+  "testFiles": [
+    "tests/test_awq_dual_gemv.py",
+    "tests/test_awq_dual_dispatch.py", 
+    "tests/test_awq_e2e.py"
+  ],
+  "testEnvironment": {
+    "devServer": "root@192.168.1.198",
+    "dockerImage": "mixa3607/rocm-gfx906:7.1.0-complete",
+    "gpus": "4x AMD MI50 (gfx906)",
+    "modelPaths": {
+      "gptq": "/opt/models/Qwen3.5-27B-GPTQ-Int4",
+      "awq_labeled": "/opt/models/Qwen3.5-27B-AWQ (actually GPTQ format - has qzeros)"
+    }
+  },
+  "keyFindings": {
+    "VAL-AWQ-001": {
+      "result": "PASS",
+      "summary": "AWQ dual kernel produces numerically correct output (max_abs_err < 1e-2)",
+      "confidence": "high"
+    },
+    "VAL-AWQ-002": {
+      "result": "BLOCKED",
+      "summary": "Kernel selection code correct, cannot validate E2E without AWQ model",
+      "confidence": "medium - code inspection confirms implementation"
+    },
+    "VAL-AWQ-003": {
+      "result": "PASS",
+      "summary": "AWQ dual kernel shows 2-5% speedup over GPTQ dual kernel",
+      "confidence": "high"
+    },
+    "VAL-AWQ-004": {
+      "result": "BLOCKED", 
+      "summary": "C dispatch integration code correct, cannot validate E2E without AWQ model",
+      "confidence": "medium - code inspection confirms implementation"
+    }
+  }
+}
