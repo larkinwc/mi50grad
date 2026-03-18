@@ -1,0 +1,31 @@
+{
+  "milestone": "double-buffer",
+  "round": 1,
+  "status": "partial",
+  "assertionsSummary": {
+    "total": 1,
+    "passed": 1,
+    "failed": 0,
+    "blocked": 0
+  },
+  "passedAssertions": ["VAL-DB-005"],
+  "failedAssertions": [],
+  "blockedAssertions": [],
+  "appliedUpdates": [
+    {
+      "target": "user-testing.md",
+      "description": "Documented correct test execution order: load weights -> build_dispatch_cache() -> set_c_dispatch(True)",
+      "source": "setup"
+    }
+  ],
+  "previousRound": null,
+  "testOutput": {
+    "VAL-DB-005": {
+      "test": "test_double_buffer_tp4.py --c-dispatch",
+      "min_cosine_similarity": 1.000000,
+      "avg_cosine_similarity": 1.000000,
+      "steps_tested": 10,
+      "passed": true
+    }
+  }
+}

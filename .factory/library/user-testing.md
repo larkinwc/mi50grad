@@ -128,3 +128,6 @@ For each assertion tested:
 1. **SSH to dev server:** Use `ssh root@192.168.1.198` with default SSH key auth
 2. **Docker device access:** Must include `--device=/dev/kfd --device=/dev/dri --group-add video`
 3. **Build dependency:** HIP kernel shared libraries must be built before Python tests can load them
+4. **Model mount:** Docker container must mount `/opt/models:/opt/models` for model weight access
+5. **numpy in Docker:** Install with `pip3 install numpy --break-system-packages --quiet` in same command as test execution
+6. **C dispatch setup order:** Must follow strict order: load weights -> build_dispatch_cache() -> set_c_dispatch(True). Setting C dispatch before loading weights causes dispatch cache to build with 0 layers.
