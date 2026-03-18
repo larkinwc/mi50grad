@@ -480,12 +480,14 @@ class InferenceEngine:
         """Enable or disable AWQ GEMV kernel mode.
 
         When enabled, the AWQ variant of gemv_int4_v5 is used for non-residual
-        GEMV calls. The AWQ kernel skips the zero-point subtraction (w = q * scale
+        GEMV calls, and gemv_int4_dual_awq is used for FFN gate+up projections.
+        The AWQ kernel skips the zero-point subtraction (w = q * scale
         instead of w = (q - zero) * scale), saving 8 v_sub_f32 instructions per
         uint32 word and eliminating the zeros tensor memory traffic.
 
         Must be called after weights are loaded (zeros tensor pointers are ignored
-        by the AWQ kernel path). Requires gemv_int4_v5_awq.hip to be compiled.
+        by the AWQ kernel path). Requires gemv_int4_v5_awq.hip and 
+        gemv_int4_dual_awq.hip to be compiled.
 
         Args:
             enabled: True to use AWQ kernel, False to fall back to GPTQ kernel.
@@ -494,10 +496,17 @@ class InferenceEngine:
             print("WARNING: AWQ GEMV kernel not available (gemv_int4_v5_awq.hip not found). "
                   "AWQ mode disabled; falling back to standard v5/v3 GEMV.")
             self._awq_mode = False
+        elif enabled and not self._gemv_int4_dual_awq:
+            print("NOTE: AWQ dual GEMV kernel not available (gemv_int4_dual_awq.hip not found). "
+                  "AWQ mode enabled for FFN down only; gate+up will use GPTQ dual kernel.")
+            self._awq_mode = True
         else:
             self._awq_mode = enabled
             if enabled:
-                print("AWQ GEMV mode enabled: using gemv_int4_v5_awq_t16 (no zero-point)")
+                if self._gemv_int4_dual_awq:
+                    print("AWQ GEMV mode enabled: using gemv_int4_v5_awq_t16 + gemv_int4_dual_awq_fused (no zero-point)")
+                else:
+                    print("AWQ GEMV mode enabled: using gemv_int4_v5_awq_t16 (no zero-point)")
             else:
                 print("AWQ GEMV mode disabled: using standard v5/v3 GEMV")
 
@@ -707,6 +716,8 @@ class InferenceEngine:
             print(f"GEMV INT4 v3 failed (falling back to v2): {e}")
         self._gemv_int4_dual = False
         self._gemv_int4_dual_fused = False
+        self._gemv_int4_dual_awq = False
+        self._gemv_int4_dual_awq_fused = False
         try:
             hip_path = HIP_DIR / "gemv_int4_dual.hip"
             if hip_path.exists() and self._gemv_int4_v2:
@@ -718,6 +729,18 @@ class InferenceEngine:
                 print("GEMV INT4 dual (fused gate+up+silu, no-memset) loaded")
         except Exception as e:
             print(f"GEMV INT4 dual failed: {e}")
+        # AWQ variant of dual GEMV (no zero-point subtraction)
+        try:
+            hip_path = HIP_DIR / "gemv_int4_dual_awq.hip"
+            if hip_path.exists() and self._gemv_int4_v2:
+                self.kernels.get_hip("gemv_int4_dual_awq_splitk", "gemv_int4_dual_awq")
+                self.kernels.get_hip("dual_awq_fp32_to_silu_fp16", "gemv_int4_dual_awq")
+                self.kernels.get_hip("gemv_int4_dual_awq_fused", "gemv_int4_dual_awq")
+                self._gemv_int4_dual_awq = True
+                self._gemv_int4_dual_awq_fused = True
+                print("GEMV INT4 dual AWQ (fused gate+up+silu, no zero-point) loaded")
+        except Exception as e:
+            print(f"GEMV INT4 dual AWQ failed: {e}")
         try:
             hip_path = HIP_DIR / "gemv_fp16_v2.hip"
             if hip_path.exists():
@@ -2437,20 +2460,40 @@ class InferenceEngine:
     def _launch_ffn_gate_up_silu(self, dst, src, lw, K, N):
         """Fused gate+up INT4 GEMV + SiLU: dst = silu(gate(x)) * up(x).
 
-        Uses the fully fused kernel (gemv_int4_dual_fused) when available:
-        no separate memset or fp32_to_fp16 calls needed. The kernel initializes
-        both FP32 accumulator buffers internally on the first-completing split tile,
-        and writes FP16 output with SiLU in the last-completing split tile.
+        Uses the fully fused kernel (gemv_int4_dual_fused or gemv_int4_dual_awq_fused)
+        when available: no separate memset or fp32_to_fp16 calls needed. The kernel
+        initializes both FP32 accumulator buffers internally on the first-completing
+        split tile, and writes FP16 output with SiLU in the last-completing split tile.
+
+        AWQ mode: uses gemv_int4_dual_awq_fused which skips zero-point subtraction,
+        saving 8 v_sub_f32 instructions per uint32 word and eliminating zeros loads.
 
         Saves 2 memset launches + 1 convert+silu launch vs the 3-kernel path.
         """
         grid_x = (N + 255) // 256
         k_splits = self._gemv_int4_k_splits
 
-        if self._gemv_int4_dual_fused:
-            # Fully fused path: single launch, no memset needed.
-            # Persistent buffers d_gemv_fp32, d_gemv_fp32_2, d_gemv_done are
-            # zeroed once at init and reset by the kernel after each call.
+        if self._awq_mode and self._gemv_int4_dual_awq_fused:
+            # AWQ fused path: single launch, no memset, no zero-point subtraction
+            func = self.kernels.get_hip("gemv_int4_dual_awq_fused", "gemv_int4_dual_awq")
+            params = [
+                ctypes.c_uint64(src),
+                ctypes.c_uint64(lw.gate_qweight),
+                ctypes.c_uint64(lw.gate_scales),
+                ctypes.c_uint64(lw.up_qweight),
+                ctypes.c_uint64(lw.up_scales),
+                ctypes.c_uint64(self.d_gemv_fp32),
+                ctypes.c_uint64(self.d_gemv_fp32_2),
+                ctypes.c_uint64(self.d_gemv_done),
+                ctypes.c_uint64(dst),
+                ctypes.c_uint32(K),
+                ctypes.c_uint32(N),
+                ctypes.c_uint32(self.config.group_size),
+                ctypes.c_uint32(k_splits),
+            ]
+            self.device.launch(func, (grid_x, k_splits, 1), (256, 1, 1), params)
+        elif self._gemv_int4_dual_fused:
+            # GPTQ fused path: single launch, no memset needed
             func = self.kernels.get_hip("gemv_int4_dual_fused", "gemv_int4_dual")
             params = [
                 ctypes.c_uint64(src),
@@ -2477,26 +2520,46 @@ class InferenceEngine:
             self.device.memset(self.d_gemv_fp32_2, 0, N * 4)
 
             # Fused gate+up split-K
-            func = self.kernels.get_hip("gemv_int4_dual_splitk", "gemv_int4_dual")
-            params = [
-                ctypes.c_uint64(src),
-                ctypes.c_uint64(lw.gate_qweight),
-                ctypes.c_uint64(lw.gate_scales),
-                ctypes.c_uint64(lw.gate_zeros),
-                ctypes.c_uint64(lw.up_qweight),
-                ctypes.c_uint64(lw.up_scales),
-                ctypes.c_uint64(lw.up_zeros),
-                ctypes.c_uint64(self.d_gemv_fp32),
-                ctypes.c_uint64(self.d_gemv_fp32_2),
-                ctypes.c_uint32(K),
-                ctypes.c_uint32(N),
-                ctypes.c_uint32(self.config.group_size),
-            ]
+            if self._awq_mode and self._gemv_int4_dual_awq:
+                # AWQ split-K (no zeros)
+                func = self.kernels.get_hip("gemv_int4_dual_awq_splitk", "gemv_int4_dual_awq")
+                params = [
+                    ctypes.c_uint64(src),
+                    ctypes.c_uint64(lw.gate_qweight),
+                    ctypes.c_uint64(lw.gate_scales),
+                    ctypes.c_uint64(lw.up_qweight),
+                    ctypes.c_uint64(lw.up_scales),
+                    ctypes.c_uint64(self.d_gemv_fp32),
+                    ctypes.c_uint64(self.d_gemv_fp32_2),
+                    ctypes.c_uint32(K),
+                    ctypes.c_uint32(N),
+                    ctypes.c_uint32(self.config.group_size),
+                ]
+            else:
+                # GPTQ split-K (with zeros)
+                func = self.kernels.get_hip("gemv_int4_dual_splitk", "gemv_int4_dual")
+                params = [
+                    ctypes.c_uint64(src),
+                    ctypes.c_uint64(lw.gate_qweight),
+                    ctypes.c_uint64(lw.gate_scales),
+                    ctypes.c_uint64(lw.gate_zeros),
+                    ctypes.c_uint64(lw.up_qweight),
+                    ctypes.c_uint64(lw.up_scales),
+                    ctypes.c_uint64(lw.up_zeros),
+                    ctypes.c_uint64(self.d_gemv_fp32),
+                    ctypes.c_uint64(self.d_gemv_fp32_2),
+                    ctypes.c_uint32(K),
+                    ctypes.c_uint32(N),
+                    ctypes.c_uint32(self.config.group_size),
+                ]
             self.device.launch(func, (grid_x, k_splits, 1), (256, 1, 1), params)
             self._record_launch(getattr(self, '_active_layer_idx', -1))  # splitk launch
 
             # Convert FP32 → FP16 with fused SiLU
-            func2 = self.kernels.get_hip("dual_fp32_to_silu_fp16", "gemv_int4_dual")
+            if self._awq_mode and self._gemv_int4_dual_awq:
+                func2 = self.kernels.get_hip("dual_awq_fp32_to_silu_fp16", "gemv_int4_dual_awq")
+            else:
+                func2 = self.kernels.get_hip("dual_fp32_to_silu_fp16", "gemv_int4_dual")
             params2 = [
                 ctypes.c_uint64(self.d_gemv_fp32),
                 ctypes.c_uint64(self.d_gemv_fp32_2),
@@ -3384,7 +3447,32 @@ class InferenceEngine:
             )
 
             # --- FFN gate+up+silu ---
-            if self._gemv_int4_dual_fused:
+            # AWQ mode: use AWQ dual fused kernel (12 params, no zeros)
+            # GPTQ mode: use GPTQ dual fused kernel (14 params, with zeros)
+            if self._awq_mode and self._gemv_int4_dual_awq_fused:
+                # AWQ variant: no zero-point subtraction, 12 params
+                ffn_grid = (inter + 255) // 256
+                lc['ffn_gate_up_silu'] = LaunchSpec(
+                    func=self.kernels.get_hip("gemv_int4_dual_awq_fused", "gemv_int4_dual_awq"),
+                    grid=(ffn_grid, k_splits, 1), block=(256, 1, 1),
+                    params=[
+                        ctypes.c_uint64(self.d_normed),
+                        ctypes.c_uint64(lw.gate_qweight),
+                        ctypes.c_uint64(lw.gate_scales),
+                        ctypes.c_uint64(lw.up_qweight),
+                        ctypes.c_uint64(lw.up_scales),
+                        ctypes.c_uint64(self.d_gemv_fp32),
+                        ctypes.c_uint64(self.d_gemv_fp32_2),
+                        ctypes.c_uint64(self.d_gemv_done),
+                        ctypes.c_uint64(self.d_ffn_gate),
+                        ctypes.c_uint32(h),
+                        ctypes.c_uint32(inter),
+                        ctypes.c_uint32(cfg.group_size),
+                        ctypes.c_uint32(k_splits),
+                    ],
+                )
+            elif self._gemv_int4_dual_fused:
+                # GPTQ dual kernel: includes zero-point subtraction, 14 params
                 ffn_grid = (inter + 255) // 256
                 lc['ffn_gate_up_silu'] = LaunchSpec(
                     func=self.kernels.get_hip("gemv_int4_dual_fused", "gemv_int4_dual"),
