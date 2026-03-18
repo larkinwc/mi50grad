@@ -1,6 +1,6 @@
 {
   "milestone": "tp-prefill",
-  "round": 2,
+  "round": 3,
   "status": "fail",
   "assertionsSummary": {
     "total": 3,
@@ -18,19 +18,19 @@
   "detailedFindings": {
     "VAL-TP-PREFILL-001": {
       "status": "passed",
-      "evidence": "Infrastructure re-verified in round 2. Weight sharding verified across 4 GPUs. TP methods (_prefill_ffn_tp, _prefill_full_attention_tp) found. P2P allreduce initialized. Output sanity check passed (no NaN/Inf). Test output: 'Overall (infrastructure): PASS'",
+      "evidence": "Infrastructure re-verified in round 3. Weight sharding verified across 4 GPUs. TP methods (_prefill_ffn_tp, _prefill_full_attention_tp, _prefill_linear_attention_tp) found. P2P allreduce initialized (P2PAllreduce). Output sanity check passed (no NaN/Inf). Test output: 'Overall (infrastructure): PASS'",
       "testCommand": "python3 tests/val_m4_tp_prefill.py",
       "notes": "Full cosine similarity comparison vs single-GPU prefill deferred but infrastructure is solid."
     },
     "VAL-TP-PREFILL-002": {
       "status": "blocked",
-      "evidence": "Re-tested in round 2. Throughput: 0.0 tok/s reported by validation test. The test focuses on infrastructure validation rather than actual timed prefill execution. Test output: 'Performance (>= 1000 tok/s): NEEDS OPTIMIZATION'",
+      "evidence": "Re-tested in round 3. Throughput: 0.0 tok/s reported by validation test. The test focuses on infrastructure validation rather than actual timed prefill execution. Test output: 'Performance (>= 1000 tok/s): NEEDS OPTIMIZATION'",
       "testCommand": "python3 tests/val_m4_tp_prefill.py",
       "notes": "Performance optimization deferred. Requires GEMM kernel tuning to meet 1000 tok/s target."
     },
     "VAL-TP-PREFILL-003": {
       "status": "passed",
-      "evidence": "Re-verified in round 2. KV cache sharding verified: 1 KV head per GPU, 8 Q heads per GPU. TP FlashAttention methods implemented. Column-parallel QKV and row-parallel O with allreduce working. Test output: 'Overall: PASS'",
+      "evidence": "Re-verified in round 3. KV cache sharding verified: 1 KV head per GPU, 8 Q heads per GPU. TP FlashAttention methods implemented. Column-parallel QKV and row-parallel O with allreduce working. Test output: 'Overall: PASS'",
       "testCommand": "python3 tests/val_m4_tp_flash_attention.py",
       "notes": "GQA+TP design allows each GPU to process its KV head independently - elegant design."
     }
@@ -41,5 +41,5 @@
     "gpus": "4x AMD MI50 (HIP_VISIBLE_DEVICES=0,1,2,3)",
     "model": "/opt/models/Qwen3.5-27B-GPTQ-Int4"
   },
-  "flowReports": [".factory/validation/tp-prefill/user-testing/flows/tp-prefill-tests.json"]
+  "flowReports": [".factory/validation/tp-prefill/user-testing/flows/tp-prefill-tests-round3.json"]
 }
