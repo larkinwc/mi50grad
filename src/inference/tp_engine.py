@@ -1946,35 +1946,184 @@ class TPInferenceEngine:
         return np.frombuffer(e0.device.download(e0.d_pf_hidden + last_off, h * 2), dtype=np.float16)
     
     def _prefill_full_attention_tp(self, layer_idx: int, seq_len: int):
-        """TP prefill for full attention layer.
+        """TP prefill for full attention layer with KV cache sharding.
         
-        NOTE: This is a PARTIAL implementation. Full TP attention requires:
-        - Column-parallel QKV projections (each GPU: h/tp_size columns)
-        - KV cache sharding across TP ranks
+        Implements tensor-parallel FlashAttention v3 with:
+        - Column-parallel QKV projections (each GPU: local_q_dim, local_kv_dim)
+        - KV cache sharded across TP ranks (each GPU stores local_kv_heads)
+        - FlashAttention computed independently on each GPU (no communication)
         - Row-parallel O projection with allreduce
         
-        Current implementation: Each GPU runs full attention (not TP-sharded).
-        TP is applied in the FFN block below. This allows validation of the
-        TP GEMM infrastructure while deferring full attention TP to future work.
+        For GQA (Qwen3.5: 24 Q heads, 4 KV heads, TP=4):
+          - Each GPU: 6 Q heads, 1 KV head
+          - Attention is completely local (no cross-GPU attention needed)
+          - O projection sums partial outputs via allreduce
         
-        TODO: Implement proper column-parallel QKV and row-parallel O with allreduce.
+        Args:
+            layer_idx: layer index
+            seq_len: sequence length
         """
         h = self.config.hidden_size
+        cfg = self.config
         tp_size = self.tp_size
         
         for gpu_idx, engine in enumerate(self.engines):
             lw = engine.layers[layer_idx]
             
-            # Use existing single-GPU prefill attention path
-            # Each GPU computes full attention (replicated across TP ranks)
-            # This is NOT TP-sharded - deferring to future work
-            engine._prefill_full_attention(layer_idx, lw, seq_len)
+            # Local dimensions for this TP rank
+            local_q_dim = engine.local_num_attention_heads * cfg.head_dim
+            local_kv_dim = engine.local_num_kv_heads * cfg.head_dim
+            
+            # Use GEMM path for seq_len >= 32, GEMV for shorter sequences
+            if engine._gemm_fp16_prefill and seq_len >= 32:
+                # Batched path: RMSNorm per-token into contiguous buffer, then GEMM
+                
+                # Per-token RMSNorm into d_pf_normed
+                for t in range(seq_len):
+                    engine._launch_rmsnorm(engine.d_pf_normed + t * h * 2,
+                                            engine.d_pf_hidden + t * h * 2,
+                                            lw.attn_norm, h)
+                
+                # Column-parallel GEMM projections
+                # Q: [seq_len, h] @ [h, local_q_dim] -> [seq_len, local_q_dim]
+                engine._launch_gemm_fp16(engine.d_pf_q, engine.d_pf_normed,
+                                          lw.q_weight, seq_len, local_q_dim, h)
+                engine._launch_gemm_fp16(engine.d_pf_q_gate, engine.d_pf_normed,
+                                          lw.q_gate_weight, seq_len, local_q_dim, h)
+                # K,V: [seq_len, h] @ [h, local_kv_dim] -> [seq_len, local_kv_dim]
+                engine._launch_gemm_fp16(engine.d_pf_k, engine.d_pf_normed,
+                                          lw.k_weight, seq_len, local_kv_dim, h)
+                engine._launch_gemm_fp16(engine.d_pf_v, engine.d_pf_normed,
+                                          lw.v_weight, seq_len, local_kv_dim, h)
+            else:
+                # Fallback: per-token GEMV
+                for t in range(seq_len):
+                    t_h = t * h * 2
+                    t_q = t * local_q_dim * 2
+                    t_kv = t * local_kv_dim * 2
+                    
+                    engine._launch_rmsnorm(engine.d_normed, engine.d_pf_hidden + t_h,
+                                            lw.attn_norm, h)
+                    engine._launch_gemv_fp16(engine.d_pf_q + t_q, engine.d_normed,
+                                              lw.q_weight, h, local_q_dim)
+                    engine._launch_gemv_fp16(engine.d_pf_q_gate + t_q, engine.d_normed,
+                                              lw.q_gate_weight, h, local_q_dim)
+                    engine._launch_gemv_fp16(engine.d_pf_k + t_kv, engine.d_normed,
+                                              lw.k_weight, h, local_kv_dim)
+                    engine._launch_gemv_fp16(engine.d_pf_v + t_kv, engine.d_normed,
+                                              lw.v_weight, h, local_kv_dim)
+            
+            # Per-token fused QK-norm + RoPE
+            # Each GPU processes its local heads only
+            for t in range(seq_len):
+                engine._launch_qknorm_rope(engine.d_pf_q + t * local_q_dim * 2, lw.q_norm, t,
+                                            engine.local_num_attention_heads, cfg.head_dim)
+                engine._launch_qknorm_rope(engine.d_pf_k + t * local_kv_dim * 2, lw.k_norm, t,
+                                            engine.local_num_kv_heads, cfg.head_dim)
+            
+            # Bulk write K/V to cache (contiguous D2D copy)
+            # KV cache is naturally sharded: each GPU stores its local_kv_heads
+            kv_layer_k = engine.kv_cache.layer_k_ptr(layer_idx)
+            kv_layer_v = engine.kv_cache.layer_v_ptr(layer_idx)
+            kv_bytes = seq_len * local_kv_dim * 2
+            engine.device.memcpy_d2d(kv_layer_k, engine.d_pf_k, kv_bytes)
+            engine.device.memcpy_d2d(kv_layer_v, engine.d_pf_v, kv_bytes)
+            
+            # FlashAttention v3 (causal)
+            # Each GPU runs attention on its local Q heads and local KV heads
+            # No communication needed - attention is completely local!
+            func = engine.kernels.get_hip("flash_attn_256_fp16", "flash_attn_256")
+            params = [
+                ctypes.c_uint64(engine.d_pf_q),
+                ctypes.c_uint64(kv_layer_k),
+                ctypes.c_uint64(kv_layer_v),
+                ctypes.c_uint64(engine.d_pf_attn_out),
+                ctypes.c_uint32(seq_len),                          # kv_seq_len
+                ctypes.c_uint32(seq_len),                          # num_q_rows
+                ctypes.c_uint32(engine.local_num_attention_heads), # local Q heads
+                ctypes.c_uint32(engine.local_num_kv_heads),        # local KV heads
+                ctypes.c_uint32(1),                                # causal
+            ]
+            grid_x = engine.local_num_attention_heads
+            grid_y = (seq_len + 3) // 4
+            engine.device.launch(func, (grid_x, grid_y, 1), (256, 1, 1), params)
+            
+            # Sigmoid gate on local attention output
+            engine._launch_sigmoid_mul(engine.d_pf_attn_out, engine.d_pf_q_gate,
+                                        seq_len * local_q_dim)
+            
+            # Row-parallel O projection: [seq_len, local_q_dim] @ [local_q_dim, h]
+            # Each GPU computes partial output over its slice of Q heads
+            if engine._gemm_fp16_prefill and seq_len >= 32:
+                # Batched output projection
+                engine._launch_gemm_fp16(engine.d_pf_normed, engine.d_pf_attn_out,
+                                          lw.o_weight, seq_len, h, local_q_dim)
+            else:
+                # Per-token output projection
+                for t in range(seq_len):
+                    t_q = t * local_q_dim * 2
+                    engine._launch_gemv_fp16(engine.d_proj_out, 
+                                              engine.d_pf_attn_out + t_q,
+                                              lw.o_weight, local_q_dim, h)
+                    # Per-token residual add
+                    engine._launch_residual_add(engine.d_pf_hidden + t * h * 2,
+                                                 engine.d_proj_out, h)
+        
+        # Allreduce O projection outputs (row-parallel reduction)
+        # Sum partial outputs from all GPUs -> d_pf_hidden
+        if engine._gemm_fp16_prefill and seq_len >= 32:
+            # Batch residual add after allreduce
+            partial_ptrs = [e.d_pf_normed for e in self.engines]
+            hidden_ptrs = [e.d_pf_hidden for e in self.engines]
+            
+            if self._ring_allreduce and self._ring_ar is not None:
+                self._ring_ar.allreduce_residual(partial_ptrs, hidden_ptrs, seq_len * h)
+            elif self._fused_p2p_reduce and self._fused_p2p_ar is not None:
+                self._fused_p2p_ar.allreduce_residual(partial_ptrs, hidden_ptrs, seq_len * h)
+            else:
+                self._p2p_ar.allreduce_residual(partial_ptrs, hidden_ptrs, seq_len * h)
+            
+            # Batch residual add
+            for engine in self.engines:
+                engine._launch_residual_add(engine.d_pf_hidden, engine.d_pf_normed,
+                                             seq_len * h)
     
     def _prefill_linear_attention_tp(self, layer_idx: int, seq_len: int):
-        """TP prefill for linear attention (DeltaNet) layer."""
-        # Similar to full attention but uses DeltaNet kernels
-        # Implementation follows same TP pattern
-        pass
+        """TP prefill for linear attention (DeltaNet) layer.
+        
+        Similar to full attention TP:
+        - Column-parallel in_proj (Q, K, V projections)
+        - KV cache sharded across TP ranks
+        - DeltaNet computed locally on each GPU
+        - Row-parallel out_proj with allreduce
+        
+        Note: DeltaNet is inherently sequential across sequence positions,
+        so we process tokens one at a time (no batched FlashAttention equivalent).
+        """
+        h = self.config.hidden_size
+        cfg = self.config
+        
+        for gpu_idx, engine in enumerate(self.engines):
+            lw = engine.layers[layer_idx]
+            
+            # Local dimensions for this TP rank
+            local_linear_in_dim = (engine.local_linear_num_k_heads * cfg.linear_key_head_dim +
+                                   engine.local_linear_num_v_heads * cfg.linear_value_head_dim)
+            
+            # Process tokens sequentially (DeltaNet is recurrent)
+            for t in range(seq_len):
+                t_h = t * h * 2
+                
+                # Copy this token's hidden to d_hidden for existing methods
+                engine.device.memcpy_d2d(engine.d_hidden, engine.d_pf_hidden + t_h, h * 2)
+                
+                engine._launch_rmsnorm(engine.d_normed, engine.d_hidden, lw.attn_norm, h)
+                
+                # GPU path for DeltaNet (local heads only)
+                engine._decode_linear_attention_gpu(layer_idx, lw, t)
+                
+                # Copy updated hidden back to prefill buffer
+                engine.device.memcpy_d2d(engine.d_pf_hidden + t_h, engine.d_hidden, h * 2)
     
     def _prefill_ffn_tp(self, layer_idx: int, seq_len: int):
         """TP prefill for FFN block.
