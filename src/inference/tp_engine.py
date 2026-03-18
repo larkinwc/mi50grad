@@ -1948,35 +1948,27 @@ class TPInferenceEngine:
     def _prefill_full_attention_tp(self, layer_idx: int, seq_len: int):
         """TP prefill for full attention layer.
         
-        Column-parallel QKV projections, row-parallel O projection with allreduce.
-        Uses FlashAttention for efficient attention computation.
+        NOTE: This is a PARTIAL implementation. Full TP attention requires:
+        - Column-parallel QKV projections (each GPU: h/tp_size columns)
+        - KV cache sharding across TP ranks
+        - Row-parallel O projection with allreduce
         
-        Note: This is a simplified implementation. Full FlashAttention TP
-        would require KV cache sharding across TP ranks.
+        Current implementation: Each GPU runs full attention (not TP-sharded).
+        TP is applied in the FFN block below. This allows validation of the
+        TP GEMM infrastructure while deferring full attention TP to future work.
+        
+        TODO: Implement proper column-parallel QKV and row-parallel O with allreduce.
         """
         h = self.config.hidden_size
         tp_size = self.tp_size
         
         for gpu_idx, engine in enumerate(self.engines):
             lw = engine.layers[layer_idx]
-            lc = self._engine_layer_caches[gpu_idx][layer_idx]
-            
-            # Attention RMSNorm (per-token)
-            for t in range(seq_len):
-                engine._launch_rmsnorm(
-                    engine.d_pf_normed + t * h * 2,
-                    engine.d_pf_hidden + t * h * 2,
-                    lw.attn_norm, h
-                )
             
             # Use existing single-GPU prefill attention path
-            # Each GPU computes full attention (not sharded yet)
-            # TODO: Implement column-parallel QKV and row-parallel O
-            # For now, delegate to engine's prefill method
+            # Each GPU computes full attention (replicated across TP ranks)
+            # This is NOT TP-sharded - deferring to future work
             engine._prefill_full_attention(layer_idx, lw, seq_len)
-        
-        # After attention, allreduce is handled by the row-parallel O projection
-        # which is done within _prefill_full_attention for each engine
     
     def _prefill_linear_attention_tp(self, layer_idx: int, seq_len: int):
         """TP prefill for linear attention (DeltaNet) layer."""
