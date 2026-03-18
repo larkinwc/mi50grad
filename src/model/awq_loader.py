@@ -39,10 +39,12 @@ def detect_awq_format(model_dir: str) -> str:
     """Detect quantization format from safetensors index.
 
     Returns:
+        'compressed-tensors' - if weight_packed tensors found (CT format)
         'awq'  - if no qzeros tensors found (AWQ format)
         'gptq' - if qzeros tensors found (GPTQ format)
         'fp16' - if no quantized weights found
 
+    Compressed-tensors: weight_packed, weight_scale, weight_shape (no qzeros)
     AWQ models have qweight and scales but NO qzeros.
     GPTQ models have qweight, scales, AND qzeros.
     """
@@ -64,6 +66,14 @@ def detect_awq_format(model_dir: str) -> str:
 
     if not all_keys:
         return 'fp16'
+
+    # Check for compressed-tensors format first
+    has_weight_packed = any('weight_packed' in k for k in all_keys)
+    has_weight_scale = any('weight_scale' in k for k in all_keys)
+    has_weight_shape = any('weight_shape' in k for k in all_keys)
+    
+    if has_weight_packed and has_weight_scale and has_weight_shape:
+        return 'compressed-tensors'
 
     has_qweight = any('qweight' in k for k in all_keys)
     has_qzeros = any('qzeros' in k for k in all_keys)
