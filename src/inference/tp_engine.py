@@ -4786,15 +4786,15 @@ class TPInferenceEngine:
                     gemv_fused_lib.gemv_int4_p2p_allreduce_rmsnorm_tp4,
                     ct.c_void_p
                 ).value
-                # FIXED: Fused GEMV+AR+RMSNorm kernel now reads from correct input buffer (d_ffn_gate).
-                # Previously buggy: read from hidden_ptrs[0] (residual) instead of d_ffn_gate (SiLU output).
-                # Fix: added ffn_gate_ptrs to CAllreduceSpec, updated do_allreduce_gemv_fused() in c_dispatch.c.
-                if self.tp_size == 4:
+                # DISABLED: Fused GEMV+AR+RMSNorm kernel has issues that need investigation.
+                # Currently causes regression (15 tok/s vs 44 tok/s baseline).
+                # TODO: Fix and re-enable after proper validation.
+                if False:  # Disabled until fixed
                     use_gemv_fused_in_c = True
                     print(f"C dispatch: fused GEMV+AR+RMSNorm kernel ENABLED for FFN down-proj "
                           f"(fn_ptr=0x{gemv_fused_fn_ptr:016x})")
                 else:
-                    print(f"C dispatch: fused GEMV kernel loaded (requires TP=4, current TP={self.tp_size})")
+                    print(f"C dispatch: fused GEMV+AR+RMSNorm kernel available but DISABLED (needs investigation)")
             except Exception as e:
                 print(f"C dispatch: failed to load fused GEMV kernel library: {e}")
                 gemv_fused_lib = None
