@@ -2588,6 +2588,11 @@ class TPInferenceEngine:
                 lw = engine.layers[layer_idx]
 
                 # --- Attention RMSNorm (cached, all static) ---
+                # CRITICAL FIX: In double-buffer mode, update the cached LaunchSpec
+                # to use the current d_hidden pointer, since buffers swap each layer
+                if use_double_buffer:
+                    attn_rmsnorm_spec = layer_cache['attn_rmsnorm']
+                    attn_rmsnorm_spec.params[1].value = engine.d_hidden
                 engine.device.launch_cached(layer_cache['attn_rmsnorm'])
 
                 if lw.layer_type == 'full_attention':
@@ -2686,6 +2691,11 @@ class TPInferenceEngine:
                 # --- FFN RMSNorm ---
                 # Standard mode: reads d_hidden (gated by attention AR done event)
                 # Double-buffer mode: reads d_hidden_write (gated by AR stream event)
+                # CRITICAL FIX: In double-buffer mode, update the cached LaunchSpec
+                # to use d_hidden_write as input, since the cached pointer is stale
+                if use_double_buffer:
+                    ffn_rmsnorm_spec = layer_cache['ffn_rmsnorm']
+                    ffn_rmsnorm_spec.params[1].value = engine.d_hidden_write
                 engine.device.launch_cached(layer_cache['ffn_rmsnorm'])
 
                 # --- FFN gate+up+silu (cached) ---

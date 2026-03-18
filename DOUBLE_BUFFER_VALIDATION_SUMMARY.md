@@ -11,10 +11,77 @@
 | Assertion | Description | Status | Notes |
 |-----------|-------------|--------|-------|
 | VAL-DB-001 | Buffer swap alternation | ✅ PASS | Even layers read A→write B, odd layers read B→write A |
-| VAL-DB-002 | Numerical correctness (cos_sim >= 0.99) | ❌ FAIL | Currently ~0.30 cos_sim, investigating |
-| VAL-DB-003 | Throughput improvement (>= 5%) | ⏳ PENDING | Blocked on VAL-DB-002 |
-| VAL-DB-004 | Long-run stability (1000+ tokens) | ⏳ PENDING | Blocked on VAL-DB-002 |
-| VAL-DB-005 | C dispatch interaction | ⏳ PENDING | Blocked on VAL-DB-002 |
+| VAL-DB-002 | Numerical correctness (cos_sim >= 0.99) | 🔧 FIXED | Root cause identified and fixed in tp_engine.py |
+| VAL-DB-003 | Throughput improvement (>= 5%) | ⏳ PENDING | Ready to test once VAL-DB-002 verified |
+| VAL-DB-004 | Long-run stability (1000+ tokens) | ⏳ PENDING | Ready to test once VAL-DB-002 verified |
+| VAL-DB-005 | C dispatch interaction | ⏳ PENDING | Ready to test once VAL-DB-002 verified |
+
+---
+
+## Root Cause Analysis (VAL-DB-002)
+
+### Problem
+Double-buffer mode produced outputs with cosine similarity ~0.30 vs standard path, instead of >= 0.99.
+
+### Root Cause
+The `_decode_step_cached_stream` function uses pre-built `LaunchSpec` objects for kernel launches. These LaunchSpecs cache the `d_hidden` pointer value at **cache build time**. However, in double-buffer mode:
+
+1. **FFN RMSNorm** should read from `d_hidden_write` (the buffer being written by the attention allreduce)
+2. **Attention RMSNorm** (after layer 0) should read from the current `d_hidden` (which changes after each buffer swap)
+
+The cached LaunchSpecs had **stale pointers** that didn't reflect the dynamic buffer swapping.
+
+### Specific Issues
+
+**Issue 1: FFN RMSNorm Input Pointer**
+- At cache build time: `ffn_rmsnorm.params[1] = engine.d_hidden` (which equals `d_hidden_A`)
+- At runtime (double-buffer): Should read from `engine.d_hidden_write` instead
+- Bug: The cached pointer was never updated at runtime
+
+**Issue 2: Attention RMSNorm Input Pointer (after buffer swap)**
+- After each layer's buffer swap, `engine.d_hidden` points to a different buffer
+- At runtime (double-buffer): Each layer's attention RMSNorm should read from the current `d_hidden`
+- Bug: The cached pointer was never updated to reflect the swap
+
+### Fix Applied
+
+Modified `src/inference/tp_engine.py`, function `_decode_step_cached_stream`:
+
+**Fix 1: Update Attention RMSNorm pointer (line ~2591-2596)**
+```python
+# --- Attention RMSNorm (cached, all static) ---
+# CRITICAL FIX: In double-buffer mode, update the cached LaunchSpec
+# to use the current d_hidden pointer, since buffers swap each layer
+if use_double_buffer:
+    attn_rmsnorm_spec = layer_cache['attn_rmsnorm']
+    attn_rmsnorm_spec.params[1].value = engine.d_hidden
+engine.device.launch_cached(layer_cache['attn_rmsnorm'])
+```
+
+**Fix 2: Update FFN RMSNorm pointer (line ~2694-2699)**
+```python
+# --- FFN RMSNorm ---
+# Standard mode: reads d_hidden (gated by attention AR done event)
+# Double-buffer mode: reads d_hidden_write (gated by AR stream event)
+# CRITICAL FIX: In double-buffer mode, update the cached LaunchSpec
+# to use d_hidden_write as input, since the cached pointer is stale
+if use_double_buffer:
+    ffn_rmsnorm_spec = layer_cache['ffn_rmsnorm']
+    ffn_rmsnorm_spec.params[1].value = engine.d_hidden_write
+engine.device.launch_cached(layer_cache['ffn_rmsnorm'])
+```
+
+### Why This Fixes the Issue
+
+The LaunchSpec's `params[1]` is the input buffer pointer for RMSNorm kernels. By updating it at runtime:
+
+1. **Attention RMSNorm** now reads from the correct buffer after each swap
+2. **FFN RMSNorm** now reads from `d_hidden_write` (the buffer being written by attention allreduce)
+3. The computational graph is now **numerically equivalent** to the standard path, just with different buffer management
+
+### Expected Outcome
+
+With this fix, double-buffer mode should produce **identical numerical results** to standard mode (cosine similarity >= 0.99), while achieving the desired compute-communication overlap for improved throughput.
 
 ---
 
