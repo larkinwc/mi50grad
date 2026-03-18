@@ -1,0 +1,83 @@
+{
+  "assertionResults": [
+    {
+      "id": "VAL-AWQ-001",
+      "status": "pass",
+      "evidence": "test_awq_dual_gemv.py: All numerical equivalence tests PASSED. max_abs_err=0.000209-0.000246 < 1e-2 threshold. Tested shapes: N=11008/13696/17408, K=5120, group_size=128.",
+      "metrics": {
+        "max_abs_err_11008": 2.094209e-04,
+        "max_abs_err_13696": 2.033412e-04,
+        "max_abs_err_17408": 2.456307e-04,
+        "threshold": 1e-2
+      },
+      "consoleOutput": "VAL-AWQ-DUAL-001: ALL equivalence tests PASSED\n  ✓ N=11008, K= 5120: max_abs_err=2.094209e-04\n  ✓ N=13696, K= 5120: max_abs_err=2.033412e-04\n  ✓ N=17408, K= 5120: max_abs_err=2.456307e-04"
+    },
+    {
+      "id": "VAL-AWQ-002",
+      "status": "blocked",
+      "evidence": "test_awq_dual_dispatch.py failed due to test design issue: creates minimal engine without loading weights, so build_dispatch_cache() returns empty layer cache. The kernel selection logic exists in engine.py (lines 3455-3477) and correctly selects AWQ dual kernel (12 params) vs GPTQ dual kernel (14 params) when _awq_mode=True and _gemv_int4_dual_awq_fused is available. Manual code inspection confirms correct implementation.",
+      "metrics": {
+        "awq_dual_kernel_loaded": true,
+        "awq_mode_propagates_to_all_gpus": true,
+        "test_design_issue": "No weights loaded, no layer cache built"
+      },
+      "consoleOutput": "Test logs show: 'GEMV INT4 dual AWQ (fused gate+up+silu, no zero-point) loaded' and 'AWQ GEMV mode enabled: using gemv_int4_v5_awq_t16 + gemv_int4_dual_awq_fused (no zero-point)' indicating kernel is loaded and AWQ mode is active."
+    },
+    {
+      "id": "VAL-AWQ-003",
+      "status": "pass",
+      "evidence": "test_awq_dual_gemv.py: All throughput benchmarks PASSED. AWQ dual kernel shows 1.034-1.058x speedup over GPTQ dual kernel, exceeding 1.02x target. Zero-point arithmetic savings (8 v_sub_f32 per uint32) translate to measurable throughput improvement.",
+      "metrics": {
+        "speedup_N11008": "1.034x (GPTQ=144.2us, AWQ=139.5us)",
+        "speedup_N13696": "1.037x (GPTQ=169.2us, AWQ=163.1us)",
+        "speedup_N17408": "1.058x (GPTQ=205.9us, AWQ=194.7us)",
+        "target_speedup": ">= 1.02x"
+      },
+      "consoleOutput": "Throughput Report:\n  ✓ N=11008, K= 5120: GPTQ=144.2us, AWQ=139.5us, speedup=1.034x\n  ✓ N=13696, K= 5120: GPTQ=169.2us, AWQ=163.1us, speedup=1.037x\n  ✓ N=17408, K= 5120: GPTQ=205.9us, AWQ=194.7us, speedup=1.058x"
+    },
+    {
+      "id": "VAL-AWQ-004",
+      "status": "blocked",
+      "evidence": "E2E test blocked: AWQ model at /opt/models/Qwen3.5-27B-AWQ is detected as 'gptq' format (missing AWQ-specific file markers). Running AWQ kernel mode with GPTQ weights causes NaN/Inf because AWQ kernel skips zero-point subtraction (assumes zeros=0), but GPTQ weights have non-zero zero points. C dispatch integration code exists (engine.py lines 3455-3477) but cannot be validated E2E without true AWQ model weights.",
+      "metrics": {
+        "awq_model_detected_as": "gptq",
+        "awq_kernel_mode_causes_nan_with_gptq_weights": true,
+        "dispatch_cache_rebuilds_on_awq_mode_change": true
+      },
+      "consoleOutput": "Detecting formats:\n  AWQ model format: gptq\n  GPTQ model format: gptq\n\nWith AWQ mode enabled on GPTQ weights:\n  'Step 0: NaN/Inf detected in output!' for all steps.\n\nKernel loading confirms AWQ dual available:\n  'GEMV INT4 dual AWQ (fused gate+up+silu, no zero-point) loaded'"
+    }
+  ],
+  "frictions": [
+    {
+      "description": "test_awq_dual_dispatch.py creates engine without weights, so layer cache is empty and ffn_gate_up_silu not found",
+      "suggestedFix": "Test should either use mock weights or skip layer cache validation when weights not loaded"
+    },
+    {
+      "description": "AWQ model at /opt/models/Qwen3.5-27B-AWQ lacks AWQ format markers - detected as GPTQ",
+      "suggestedFix": "Need true AWQ model (with qweight, qzeros=0, scales) to validate E2E"
+    }
+  ],
+  "blockers": [
+    {
+      "id": "AWQ-MODEL-FORMAT",
+      "description": "AWQ model directory exists but detect_awq_format() returns 'gptq' - model may not be in AWQ format or missing format markers",
+      "severity": "blocking",
+      "affectedAssertions": ["VAL-AWQ-002", "VAL-AWQ-004"]
+    }
+  ],
+  "toolsUsed": ["ssh", "docker", "python3", "hipcc"],
+  "testFiles": [
+    "tests/test_awq_dual_gemv.py",
+    "tests/test_awq_dual_dispatch.py",
+    "tests/test_awq_e2e.py"
+  ],
+  "testEnvironment": {
+    "devServer": "root@192.168.1.198",
+    "dockerImage": "mixa3607/rocm-gfx906:7.1.0-complete",
+    "gpus": "4x AMD MI50 (gfx906)",
+    "modelPaths": {
+      "gptq": "/opt/models/Qwen3.5-27B-GPTQ-Int4",
+      "awq": "/opt/models/Qwen3.5-27B-AWQ (detected as gptq)"
+    }
+  }
+}

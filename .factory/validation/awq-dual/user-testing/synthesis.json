@@ -1,0 +1,79 @@
+{
+  "milestone": "awq-dual",
+  "round": 1,
+  "status": "partial",
+  "assertionsSummary": {
+    "total": 4,
+    "passed": 2,
+    "failed": 0,
+    "blocked": 2
+  },
+  "passedAssertions": [
+    "VAL-AWQ-001",
+    "VAL-AWQ-003"
+  ],
+  "failedAssertions": [],
+  "blockedAssertions": [
+    {
+      "id": "VAL-AWQ-002",
+      "blockedBy": "Test design issue: test_awq_dual_dispatch.py creates engine without loading weights, so build_dispatch_cache() returns empty layer cache. Code inspection confirms correct implementation in engine.py lines 3455-3477."
+    },
+    {
+      "id": "VAL-AWQ-004",
+      "blockedBy": "AWQ model format detection: /opt/models/Qwen3.5-27B-AWQ is detected as 'gptq' format. Need true AWQ model (zeros=0) to validate E2E. Running AWQ kernel with GPTQ weights causes NaN/Inf."
+    }
+  ],
+  "appliedUpdates": [
+    {
+      "target": "user-testing.md",
+      "description": "Added note about AWQ model format detection - need true AWQ model to test AWQ kernel E2E",
+      "source": "flow-report"
+    }
+  ],
+  "previousRound": null,
+  "testExecutionDetails": {
+    "devServer": "root@192.168.1.198",
+    "dockerImage": "mixa3607/rocm-gfx906:7.1.0-complete",
+    "gpus": "4x AMD MI50 (gfx906)",
+    "buildCommand": "make all",
+    "testFiles": [
+      "tests/test_awq_dual_gemv.py",
+      "tests/test_awq_dual_dispatch.py",
+      "tests/test_awq_e2e.py"
+    ]
+  },
+  "keyFindings": {
+    "VAL-AWQ-001": {
+      "result": "PASS",
+      "summary": "AWQ dual kernel produces numerically correct output",
+      "metrics": {
+        "max_abs_err_N11008": "2.094e-04",
+        "max_abs_err_N13696": "2.033e-04",
+        "max_abs_err_N17408": "2.456e-04",
+        "threshold": "1e-2"
+      }
+    },
+    "VAL-AWQ-003": {
+      "result": "PASS",
+      "summary": "AWQ dual kernel shows 3.4-5.8% speedup over GPTQ dual kernel",
+      "metrics": {
+        "speedup_N11008": "1.034x",
+        "speedup_N13696": "1.037x",
+        "speedup_N17408": "1.058x",
+        "target": ">= 1.02x"
+      }
+    }
+  },
+  "recommendations": [
+    {
+      "priority": "high",
+      "description": "Obtain true AWQ model (with zeros=0 in quantization) to validate VAL-AWQ-002 and VAL-AWQ-004 E2E",
+      "rationale": "Current AWQ model directory is detected as GPTQ format; AWQ kernel mode with GPTQ weights causes NaN/Inf"
+    },
+    {
+      "priority": "medium",
+      "description": "Fix test_awq_dual_dispatch.py to load mock weights or use real model",
+      "rationale": "Test creates engine without weights, leading to empty layer cache and false failures"
+    }
+  ]
+}

@@ -131,3 +131,4 @@ For each assertion tested:
 4. **Model mount:** Docker container must mount `/opt/models:/opt/models` for model weight access
 5. **numpy in Docker:** Install with `pip3 install numpy --break-system-packages --quiet` in same command as test execution
 6. **C dispatch setup order:** Must follow strict order: load weights -> build_dispatch_cache() -> set_c_dispatch(True). Setting C dispatch before loading weights causes dispatch cache to build with 0 layers.
+7. **AWQ model format detection:** The model at `/opt/models/Qwen3.5-27B-AWQ` is detected as 'gptq' format by `detect_awq_format()`. AWQ kernel mode (`set_awq_mode(True)`) skips zero-point subtraction and produces NaN/Inf when used with GPTQ weights (which have non-zero zeros). To validate AWQ kernels E2E, need true AWQ model with zeros=0.
