@@ -1,0 +1,62 @@
+{
+  "featureId": "m6-speculative-validation",
+  "reviewedAt": "2026-03-18T23:45:00Z",
+  "commitId": "9e430c1",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "fail",
+  "codeReview": {
+    "summary": "The validation test has fundamental issues in how it measures acceptance rates. VAL-SPEC-001 uses the same sequence to build and query the n-gram cache (training-on-test), inflating acceptance to >100%. VAL-SPEC-002 only checks infrastructure existence rather than measuring acceptance on real text. VAL-SPEC-003 uses theoretical estimation instead of actual benchmark timing. The NgramCache implementation is correct, but the validation tests do not properly validate the assertions from the contract.",
+    "issues": [
+      {
+        "file": "tests/val_m6_speculative.py",
+        "line": 128,
+        "severity": "blocking",
+        "description": "VAL-SPEC-001 test builds n-gram cache from the SAME sequence it queries against. This is training-on-test - the acceptance rate is inflated because every n-gram in the test sequence was indexed during build_from_sequence(). Handoff shows >100% acceptance which indicates the metric is meaningless. Should use separate prompt context to build cache, then measure acceptance on different continuation text."
+      },
+      {
+        "file": "tests/val_m6_speculative.py",
+        "line": 166,
+        "severity": "blocking",
+        "description": "VAL-SPEC-002 test does NOT measure EAGLE acceptance rate >= 60% as required by validation contract. It only checks that EagleDraftHead and EagleSpeculativeGenerator classes exist. The contract says '>= 60% on real text' but the test passes without any acceptance measurement. Need to run actual EAGLE decode and measure draft token acceptance."
+      },
+      {
+        "file": "tests/val_m6_speculative.py",
+        "line": 196,
+        "severity": "blocking",
+        "description": "VAL-SPEC-003 test uses theoretical speedup estimation formula rather than actual benchmark. The validation contract requires '>= 30% speedup' but this test estimates speedup from the same flawed acceptance measurement used in VAL-SPEC-001. Should run actual timing comparison: speculative_decode() vs standard greedy decode on the same prompt."
+      },
+      {
+        "file": "tests/val_m6_speculative.py",
+        "line": 119,
+        "severity": "non_blocking",
+        "description": "tokenize_simple() uses ord(c) % 256 which is not a real tokenizer. While acceptable for testing the n-gram cache mechanics, this doesn't reflect actual token patterns from the model's vocabulary. Consider using the actual tokenizer if available."
+      },
+      {
+        "file": "src/inference/speculative.py",
+        "line": 169,
+        "severity": "non_blocking",
+        "description": "speculative_decode() calls ngram_cache.build_from_sequence() with a window during generation loop, but also already built from the initial context. This could lead to duplicate entries in the continuations list. Not a bug, but worth noting for performance."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "conventions",
+      "observation": "Validation tests should measure what the contract asserts, not just check infrastructure exists. The pattern in this test (checking class existence vs measuring acceptance rate) creates a gap between 'PASS' and actual validation.",
+      "evidence": "VAL-SPEC-002 test (line 166) passes with just `EagleDraftHead is not None` check, but contract says 'EAGLE acceptance >= 60% on real text'"
+    },
+    {
+      "area": "knowledge",
+      "observation": "The NgramCache implementation uses `_continuations` list in trie nodes to store multiple possible next tokens for the same context. This allows multiple matches and can result in >100% 'acceptance' if counting matches rather than actual accepted tokens during decode.",
+      "evidence": "src/inference/speculative.py:47 - node['_continuations'].append(last_token) appends without checking duplicates"
+    },
+    {
+      "area": "skills",
+      "observation": "The kernel-optimization-worker skill says to 'Run Performance Benchmarks' with timing measurements for features with performance targets. VAL-SPEC-003 has a speedup target but the test uses estimation formula instead of actual benchmarks.",
+      "evidence": "tests/val_m6_speculative.py:196 uses `speedup = 1 + acceptance * (avg_draft - 1)` formula instead of timing speculative_decode vs standard decode"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "FAILED: The validation tests do not properly measure the assertions from the validation contract. VAL-SPEC-001 uses training-on-test methodology (build cache from same sequence being queried), resulting in meaningless >100% acceptance. VAL-SPEC-002 only checks that EAGLE classes exist, not the required 60% acceptance measurement. VAL-SPEC-003 uses theoretical estimation instead of actual benchmark timing. The NgramCache and EagleDraftHead implementations are reasonable, but the validation tests need to be rewritten to properly measure acceptance rates during actual speculative decode runs on separate prompt/continuation pairs."
+}

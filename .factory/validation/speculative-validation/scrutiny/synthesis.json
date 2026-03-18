@@ -1,0 +1,78 @@
+{
+  "milestone": "speculative-validation",
+  "round": 1,
+  "status": "fail",
+  "validatorsRun": {
+    "test": {
+      "passed": true,
+      "command": "python3 -m py_compile (all source files)",
+      "exitCode": 0,
+      "notes": "No pytest tests in tests/ - validation tests are standalone scripts requiring GPU. All Python syntax checks passed."
+    },
+    "typecheck": {
+      "passed": true,
+      "command": "N/A - no typechecker (mypy/pyright) available in environment",
+      "exitCode": 0,
+      "notes": "Manual syntax verification with py_compile passed for all .py files in src/"
+    },
+    "lint": {
+      "passed": true,
+      "command": "N/A - no linter (flake8/ruff/pylint) available in environment",
+      "exitCode": 0,
+      "notes": "No linting tools available; syntax verification passed"
+    }
+  },
+  "reviewsSummary": {
+    "total": 1,
+    "passed": 0,
+    "failed": 1,
+    "failedFeatures": ["m6-speculative-validation"]
+  },
+  "blockingIssues": [
+    {
+      "featureId": "m6-speculative-validation",
+      "file": "tests/val_m6_speculative.py",
+      "line": 128,
+      "severity": "blocking",
+      "description": "VAL-SPEC-001: Test builds n-gram cache from the SAME sequence it queries against (training-on-test). Acceptance rates are inflated because every n-gram was indexed during build_from_sequence(). Should use separate prompt context to build cache, then measure acceptance on different continuation text."
+    },
+    {
+      "featureId": "m6-speculative-validation",
+      "file": "tests/val_m6_speculative.py",
+      "line": 166,
+      "severity": "blocking",
+      "description": "VAL-SPEC-002: Test only checks that EAGLE classes exist, but contract requires >= 60% acceptance rate measurement on real text. No actual acceptance measurement performed."
+    },
+    {
+      "featureId": "m6-speculative-validation",
+      "file": "tests/val_m6_speculative.py",
+      "line": 196,
+      "severity": "blocking",
+      "description": "VAL-SPEC-003: Test uses theoretical speedup estimation formula instead of actual benchmark timing. Contract requires >= 30% speedup but test estimates from flawed acceptance measurement."
+    }
+  ],
+  "appliedUpdates": [
+    {
+      "target": "library",
+      "description": "Added note about NgramCache _continuations list behavior - multiple matches possible per context, can result in >100% match rate if counting matches vs actual accepted tokens",
+      "sourceFeature": "m6-speculative-validation",
+      "file": ".factory/library/speculative-decode.md"
+    }
+  ],
+  "suggestedGuidanceUpdates": [
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add boundary: Validation tests must measure what the validation contract asserts, not just check infrastructure exists. If an assertion specifies a performance threshold (e.g., '>= 50% acceptance'), the test must perform an actual measurement.",
+      "evidence": "VAL-SPEC-002 test passes with just class existence check but contract requires '>= 60% acceptance rate on real text'. Same pattern in VAL-SPEC-001/003 where estimation replaces measurement.",
+      "isSystemic": false
+    },
+    {
+      "target": "skills",
+      "suggestion": "kernel-optimization-worker skill should enforce: For features with performance targets in validation contract, validation tests MUST include actual benchmark timing measurements, not theoretical estimations.",
+      "evidence": "VAL-SPEC-003 has '>= 30% speedup' target but test uses formula `speedup = 1 + acceptance * (avg_draft - 1)` instead of timing speculative_decode vs standard decode.",
+      "isSystemic": false
+    }
+  ],
+  "rejectedObservations": [],
+  "previousRound": null
+}
