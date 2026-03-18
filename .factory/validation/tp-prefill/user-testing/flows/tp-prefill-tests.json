@@ -1,0 +1,46 @@
+{
+  "flowId": "tp-prefill-tests",
+  "milestone": "tp-prefill",
+  "assertions": ["VAL-TP-PREFILL-001", "VAL-TP-PREFILL-002", "VAL-TP-PREFILL-003"],
+  "results": {
+    "VAL-TP-PREFILL-001": {
+      "status": "blocked",
+      "evidence": "Infrastructure verified but full cosine similarity comparison vs single-GPU prefill not tested. The validation test focuses on infrastructure validation (weight sharding, methods, allreduce). Test output: 'Weight Sharding: PASS', 'TP FFN GEMM Execution: PASS', 'Output Sanity: PASS'",
+      "notes": "Full correctness validation (cosine similarity vs single-GPU) requires comparison test with actual prefill execution. Current test validates infrastructure only."
+    },
+    "VAL-TP-PREFILL-002": {
+      "status": "blocked",
+      "evidence": "Throughput: 0.0 tok/s. Performance target (1000 tok/s) not met.",
+      "notes": "The validation test reports 'Performance: FAIL (initial baseline)'. The infrastructure is functional but throughput optimization is deferred. Test does not run actual timed prefill."
+    },
+    "VAL-TP-PREFILL-003": {
+      "status": "passed",
+      "evidence": "KV cache sharding verified: 1 KV head per GPU, 8 Q heads per GPU. P2P allreduce initialized. TP size verified: 4.",
+      "notes": "FlashAttention validation shows 'KV cache sharding verified: 1 KV heads/GPU ✓' and 'Q heads sharding verified: 8 Q heads/GPU ✓'. Infrastructure ready for TP-sharded attention."
+    }
+  },
+  "commandsRun": [
+    {
+      "command": "ssh root@192.168.1.198 docker run ... python3 tests/val_m4_tp_prefill.py",
+      "exitCode": 0,
+      "observation": "Weight Sharding: PASS, TP FFN GEMM Execution: PASS, Output Sanity: PASS, Performance: NEEDS OPTIMIZATION"
+    },
+    {
+      "command": "ssh root@192.168.1.198 docker run ... python3 tests/val_m4_tp_flash_attention.py",
+      "exitCode": 0,
+      "observation": "Infrastructure: PASS, KV Cache Sharding: PASS, TP FlashAttention Methods: PASS"
+    }
+  ],
+  "toolsUsed": ["SSH", "Docker"],
+  "frictions": [],
+  "blockers": [
+    {
+      "assertion": "VAL-TP-PREFILL-001",
+      "description": "Full cosine similarity comparison vs single-GPU prefill requires comparison test implementation"
+    },
+    {
+      "assertion": "VAL-TP-PREFILL-002",
+      "description": "Throughput target (1000 tok/s) requires GEMM kernel optimization"
+    }
+  ]
+}
