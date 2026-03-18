@@ -4740,6 +4740,56 @@ class TPInferenceEngine:
         else:
             print(f"C dispatch: fused kernel library not found at {fused_so_path}")
 
+        # Load fused GEMV+AR+RMSNorm kernel library (gemv_int4_p2p_allreduce_rmsnorm)
+        # This kernel fuses FFN down projection (INT4 GEMV) + P2P allreduce + RMSNorm
+        gemv_fused_fn_ptr = None
+        use_gemv_fused_in_c = False
+        gemv_fused_lib = None
+        gemv_fused_so_path = build_dir / "gemv_int4_p2p_allreduce_rmsnorm.so"
+        
+        if gemv_fused_so_path.exists():
+            try:
+                gemv_fused_lib = ct.CDLL(str(gemv_fused_so_path))
+                # Set function signature
+                gemv_fused_lib.gemv_int4_p2p_allreduce_rmsnorm_tp4.argtypes = [
+                    ct.c_void_p,        # output
+                    ct.c_void_p,        # A (input activation)
+                    ct.POINTER(ct.c_uint),  # B_q4 (INT4 weights)
+                    ct.c_void_p,        # scales
+                    ct.c_void_p,        # zeros
+                    ct.c_void_p,        # partial_local
+                    ct.c_void_p,        # partial_peer0
+                    ct.c_void_p,        # partial_peer1
+                    ct.c_void_p,        # partial_peer2
+                    ct.c_void_p,        # weight (RMSNorm)
+                    ct.c_uint,          # K (input dim)
+                    ct.c_uint,          # N (output dim)
+                    ct.c_uint,          # dim (for RMSNorm)
+                    ct.c_uint,          # group_size
+                    ct.c_float,         # eps
+                    ct.c_uint,          # tp_rank
+                    ct.c_uint,          # tp_size
+                    ct.c_void_p,        # stream
+                ]
+                gemv_fused_lib.gemv_int4_p2p_allreduce_rmsnorm_tp4.restype = ct.c_int
+                gemv_fused_fn_ptr = ct.cast(
+                    gemv_fused_lib.gemv_int4_p2p_allreduce_rmsnorm_tp4,
+                    ct.c_void_p
+                ).value
+                # Enable fused GEMV kernel only for TP=4
+                if self.tp_size == 4:
+                    use_gemv_fused_in_c = True
+                    print(f"C dispatch: fused GEMV+AR+RMSNorm kernel enabled for FFN down-proj "
+                          f"(fn_ptr=0x{gemv_fused_fn_ptr:016x})")
+                else:
+                    print(f"C dispatch: fused GEMV kernel available but TP={self.tp_size} "
+                          f"(requires TP=4)")
+            except Exception as e:
+                print(f"C dispatch: failed to load fused GEMV kernel library: {e}")
+                gemv_fused_lib = None
+        else:
+            print(f"C dispatch: fused GEMV kernel library not found at {gemv_fused_so_path}")
+
         # We need to access layer-specific RMSNorm weights for the fused kernel.
         # The fused kernel is called after allreduce and does the RMSNorm that would
         # normally be done by the next kernel:
@@ -4762,13 +4812,15 @@ class TPInferenceEngine:
             layer_attn_norm_ptrs.append(attn_ptrs)
             layer_ffn_norm_ptrs.append(ffn_ptrs)
 
-        def fill_ar_spec(c_ar, partial_attr, rmsnorm_weight_ptrs):
+        def fill_ar_spec(c_ar, partial_attr, rmsnorm_weight_ptrs, layer_idx, is_ffn=False):
             """Fill a CAllreduceSpec for one layer.
             
             Args:
                 c_ar: CAllreduceSpec to fill
                 partial_attr: Attribute name for partial pointers ('d_proj_out' or 'd_ffn_out')
-                rmsnorm_weight_ptrs: List of RMSNorm weight pointers [engine_idx] -> ptr
+                rmsnorm_weight_ptrs: List of RMSNorm weight pointers [layer_idx][engine_idx] -> ptr
+                layer_idx: Layer index for accessing layer-specific weights
+                is_ffn: If True, populate gemv_fused fields for FFN down projection
             """
             c_ar.reduce_tp2 = reduce_tp2
             c_ar.reduce_tp3 = reduce_tp3
@@ -4791,21 +4843,37 @@ class TPInferenceEngine:
             # Kernel P2P allreduce fields
             c_ar.use_kernel_p2p = 1 if use_kernel_p2p_in_c else 0
             c_ar.kernel_p2p_tp4_fn = kernel_p2p_fn_ptr
-            # Fused kernel fields
+            # Fused kernel fields (allreduce+RMSNorm only)
             c_ar.use_fused_kernel = 1 if use_fused_kernel_in_c else 0
             c_ar.kernel_p2p_fused_tp4_fn = fused_kernel_fn_ptr
             # RMSNorm weight pointers for fused kernel (per-GPU)
             for i in range(self.tp_size):
                 c_ar.rmsnorm_weight_ptrs[i] = rmsnorm_weight_ptrs[i]
             c_ar.eps = 1e-6  # Default RMSNorm epsilon
+            
+            # Fused GEMV+AR+RMSNorm kernel fields (for FFN down projection only)
+            if is_ffn and use_gemv_fused_in_c and gemv_fused_fn_ptr:
+                c_ar.use_gemv_fused = 1
+                c_ar.gemv_fused_tp4_fn = gemv_fused_fn_ptr
+                # Populate FFN down projection weight pointers (per-GPU partitioned)
+                for i, engine in enumerate(self.engines):
+                    lw = engine.layers[layer_idx]
+                    c_ar.ffn_down_qweight_ptrs[i] = lw.down_qweight
+                    c_ar.ffn_down_scales_ptrs[i] = lw.down_scales
+                    c_ar.ffn_down_zeros_ptrs[i] = lw.down_zeros
+                c_ar.ffn_K = self.local_intermediate_size
+                c_ar.ffn_group_size = self.config.group_size
+            else:
+                c_ar.use_gemv_fused = 0
+                c_ar.gemv_fused_tp4_fn = 0
 
         for layer_idx in range(num_layers):
             # Attention allreduce: fused kernel does ffn_rmsnorm (same layer)
-            fill_ar_spec(attn_ar_array[layer_idx], 'd_proj_out', layer_ffn_norm_ptrs[layer_idx])
+            fill_ar_spec(attn_ar_array[layer_idx], 'd_proj_out', layer_ffn_norm_ptrs[layer_idx], layer_idx, is_ffn=False)
             # FFN allreduce: fused kernel does attn_rmsnorm (next layer)
             # For the last layer, use the last layer's attn_norm (won't be used anyway)
             next_layer_idx = min(layer_idx + 1, num_layers - 1)
-            fill_ar_spec(ffn_ar_array[layer_idx], 'd_ffn_out', layer_attn_norm_ptrs[next_layer_idx])
+            fill_ar_spec(ffn_ar_array[layer_idx], 'd_ffn_out', layer_attn_norm_ptrs[next_layer_idx], layer_idx, is_ffn=True)
 
         # Build the CDispatchPlan
         plan = CDispatchPlan()

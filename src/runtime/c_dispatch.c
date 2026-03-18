@@ -95,6 +95,35 @@ typedef int (*kernel_p2p_fused_tp4_fn_t)(
     void* stream  /* hipStream_t */
 );
 
+/* gemv_int4_p2p_allreduce_rmsnorm_tp4(output, A, B_q4, scales, zeros,
+ *                                        partial_local, peer0, peer1, peer2,
+ *                                        weight, K, N, dim, group_size, eps,
+ *                                        tp_rank, tp_size, stream)
+ * Host-callable C wrapper from gemv_int4_p2p_allreduce_rmsnorm.so.
+ * Fused INT4 GEMV + P2P allreduce + RMSNorm kernel for FFN down projection.
+ * Eliminates separate ffn_down kernel + allreduce + RMSNorm launches.
+ */
+typedef int (*gemv_int4_fused_tp4_fn_t)(
+    void* output,
+    const void* A,                    /* Input activation (FFN gate output) */
+    const unsigned int* B_q4,         /* INT4 weights (FFN down proj) */
+    const void* scales,               /* Per-group scales */
+    const void* zeros,                /* Per-group zeros */
+    const void* partial_local,        /* This GPU's partial buffer */
+    const void* partial_peer0,        /* Peer GPU partial buffers (P2P) */
+    const void* partial_peer1,
+    const void* partial_peer2,
+    const void* weight,               /* RMSNorm weight (next layer's attn_norm) */
+    unsigned int K,                   /* Input dim (intermediate size) */
+    unsigned int N,                   /* Output dim (hidden size) */
+    unsigned int dim,                 /* Hidden dim for RMSNorm */
+    unsigned int group_size,          /* Quantization group size */
+    float eps,                        /* RMSNorm epsilon */
+    unsigned int tp_rank,             /* This GPU's rank */
+    unsigned int tp_size,             /* Tensor parallel size */
+    void* stream                      /* HIP stream */
+);
+
 /* ---------------------------------------------------------------------- */
 /* Data structures (must match Python ctypes definitions exactly)           */
 /* ---------------------------------------------------------------------- */
@@ -200,14 +229,24 @@ typedef struct {
     uint32_t use_kernel_p2p;          /* 1=use kernel P2P, 0=use star topology */
     kernel_p2p_tp4_fn_t kernel_p2p_tp4_fn; /* ptr to kernel_p2p_allreduce_residual_tp4 */
     
-    /* Fused kernel P2P allreduce + RMSNorm fields */
+    /* Fused kernel P2P allreduce + RMSNorm fields (kernel_p2p_allreduce_rmsnorm) */
     uint32_t use_fused_kernel;        /* 1=use fused allreduce+RMSNorm, 0=separate */
     kernel_p2p_fused_tp4_fn_t kernel_p2p_fused_tp4_fn; /* ptr to fused kernel */
     uint64_t rmsnorm_weight_ptrs[4];  /* RMSNorm weight pointers for each GPU */
     float eps;                        /* RMSNorm epsilon (default: 1e-6) */
-    /* Padding for 8-byte alignment: kernel_p2p_fused_tp4_fn is 8 bytes,
-     * rmsnorm_weight_ptrs[4] is 32 bytes, eps is 4 bytes
-     * Total after use_fused_kernel(4): 4+8+32+4 = 48 bytes (aligned) */
+    
+    /* Fused GEMV+AR+RMSNorm kernel fields (gemv_int4_p2p_allreduce_rmsnorm) */
+    /* For FFN down-proj fusion: replaces ffn_down + allreduce + next_layer attn_rmsnorm */
+    uint32_t use_gemv_fused;          /* 1=use fused GEMV+allreduce+RMSNorm for FFN down */
+    gemv_int4_fused_tp4_fn_t gemv_fused_tp4_fn; /* ptr to gemv_int4_p2p_allreduce_rmsnorm_tp4 */
+    /* INT4 weight parameters for fused GEMV (FFN down projection) */
+    uint64_t ffn_down_qweight_ptrs[4]; /* FFN down proj INT4 weights per GPU */
+    uint64_t ffn_down_scales_ptrs[4];  /* FFN down proj scales per GPU */
+    uint64_t ffn_down_zeros_ptrs[4];   /* FFN down proj zeros per GPU */
+    uint32_t ffn_K;                    /* FFN intermediate size (input to down proj) */
+    uint32_t ffn_group_size;           /* Quantization group size */
+    /* Padding for 8-byte alignment: total adds 4+8+32+32+32+4+4 = 116 bytes */
+    /* Total struct size with previous 48: 48 + 116 = 164 bytes (aligned to 8: 168) */
 } CAllreduceSpec;
 
 /*
@@ -550,17 +589,141 @@ static int do_allreduce_kernel_p2p(CAllreduceSpec *ar, CDispatchPlan *plan)
     return 0;
 }
 
+/* ---------------------------------------------------------------------- */
+/* Fused GEMV+AR+RMSNorm kernel dispatch (for FFN down projection)          */
+/* ---------------------------------------------------------------------- */
+
+/*
+ * do_allreduce_gemv_fused: launch fused GEMV + P2P allreduce + RMSNorm kernel.
+ *
+ * This replaces the separate:
+ *   1. ffn_down kernel (INT4 GEMV)
+ *   2. ffn_allreduce (P2P allreduce)
+ *   3. next layer's attn_rmsnorm (RMSNorm)
+ *
+ * With a single fused kernel launch per GPU.
+ *
+ * The fused kernel:
+ *   - Computes INT4 GEMV for FFN down projection
+ *   - Performs P2P allreduce across all GPUs
+ *   - Applies RMSNorm with next layer's attention norm weights
+ *   - Writes final normalized result to hidden buffer
+ *
+ * Sync protocol (same as do_allreduce_kernel_p2p):
+ *   1. Record compute events on each GPU
+ *   2. Each GPU's AR stream waits for ALL compute events
+ *   3. Launch fused kernel on each GPU's AR stream
+ *   4. Record AR done events
+ *
+ * wait_for_allreduce() is called separately to make compute streams wait for
+ * the AR done events.
+ */
+static int do_allreduce_gemv_fused(CAllreduceSpec *ar, CDispatchPlan *plan)
+{
+    int tp = ar->tp_size;
+    if (tp != 4 || ar->gemv_fused_tp4_fn == NULL) {
+        /* Fall back to standard path if not TP=4 or kernel not available */
+        return do_allreduce_async(ar, plan);
+    }
+
+    int i, j, err;
+    uint32_t n = ar->num_elems;
+    uint32_t K = ar->ffn_K;
+    uint32_t group_size = ar->ffn_group_size;
+
+    /* Step 1: Record compute events on each GPU */
+    for (i = tp - 1; i >= 0; i--) {
+        plan->hipSetDevice_fn(ar->device_ids[i]);
+        plan->hipEventRecord_fn(
+            (void *)(uintptr_t)ar->compute_events[i],
+            (void *)(uintptr_t)ar->compute_streams[i]);
+    }
+
+    /* Step 2: Each GPU's AR stream waits for ALL compute events */
+    /* GPU0 first */
+    for (j = 0; j < tp; j++) {
+        plan->hipStreamWaitEvent_fn(
+            (void *)(uintptr_t)ar->allreduce_streams[0],
+            (void *)(uintptr_t)ar->compute_events[j], 0);
+    }
+    /* Then GPUs 1-3 */
+    for (i = 1; i < tp; i++) {
+        plan->hipSetDevice_fn(ar->device_ids[i]);
+        for (j = 0; j < tp; j++) {
+            plan->hipStreamWaitEvent_fn(
+                (void *)(uintptr_t)ar->allreduce_streams[i],
+                (void *)(uintptr_t)ar->compute_events[j], 0);
+        }
+    }
+
+    /* Step 3: Launch fused GEMV+AR+RMSNorm kernel on each GPU's AR stream.
+     * Each GPU processes its partition of the output columns.
+     * The kernel reads:
+     *   - A (input activation): same for all GPUs (FFN gate output after SiLU)
+     *   - B_q4, scales, zeros: partitioned INT4 weights (FFN down proj)
+     *   - partial_peer*: peer GPU partials via P2P BAR1 (for allreduce)
+     *   - weight: next layer's attn_norm weights (for RMSNorm)
+     */
+    for (i = 0; i < tp; i++) {
+        plan->hipSetDevice_fn(ar->device_ids[i]);
+        int p0 = (i + 1) % 4;
+        int p1 = (i + 2) % 4;
+        int p2 = (i + 3) % 4;
+        
+        /* Note: A (input activation) is the same for all GPUs - it's the
+         * FFN gate output after SiLU, which is replicated across all GPUs.
+         * We use hidden_ptrs[0] as the source since it holds the replicated input. */
+        err = ar->gemv_fused_tp4_fn(
+            (void *)(uintptr_t)ar->hidden_ptrs[i],        /* output (normalized) */
+            (const void *)(uintptr_t)ar->hidden_ptrs[0],  /* A: input activation (replicated) */
+            (const unsigned int*)(uintptr_t)ar->ffn_down_qweight_ptrs[i],
+            (const void *)(uintptr_t)ar->ffn_down_scales_ptrs[i],
+            (const void *)(uintptr_t)ar->ffn_down_zeros_ptrs[i],
+            (const void *)(uintptr_t)ar->partial_ptrs[i],
+            (const void *)(uintptr_t)ar->partial_ptrs[p0],
+            (const void *)(uintptr_t)ar->partial_ptrs[p1],
+            (const void *)(uintptr_t)ar->partial_ptrs[p2],
+            (const void *)(uintptr_t)ar->rmsnorm_weight_ptrs[i],
+            K,                                            /* Input dim (intermediate) */
+            n,                                            /* Output dim (hidden) */
+            n,                                            /* Hidden dim for RMSNorm */
+            group_size,
+            ar->eps,
+            i,                                            /* tp_rank */
+            tp,                                           /* tp_size */
+            (void *)(uintptr_t)ar->allreduce_streams[i]
+        );
+        if (err) return err;
+    }
+
+    /* Step 4: Record AR done events on each GPU's AR stream */
+    for (i = tp - 1; i >= 0; i--) {
+        plan->hipSetDevice_fn(ar->device_ids[i]);
+        plan->hipEventRecord_fn(
+            (void *)(uintptr_t)ar->ar_done_events[i],
+            (void *)(uintptr_t)ar->allreduce_streams[i]);
+    }
+
+    return 0;
+}
+
 /*
  * dispatch_allreduce: dispatch allreduce using the appropriate method.
  *
- * Checks use_fused_kernel, use_kernel_p2p flags in the CAllreduceSpec and routes to:
+ * Checks use_gemv_fused, use_fused_kernel, use_kernel_p2p flags in CAllreduceSpec
+ * and routes to:
+ *   - do_allreduce_gemv_fused:           fused GEMV+allreduce+RMSNorm (FFN down-proj)
  *   - do_allreduce_kernel_p2p with fused kernel: fused allreduce+RMSNorm
  *   - do_allreduce_kernel_p2p:                   kernel P2P (each GPU reads peers via BAR1)
  *   - do_allreduce_async:                        star topology (gather + reduce + broadcast)
  */
 static int dispatch_allreduce(CAllreduceSpec *ar, CDispatchPlan *plan)
 {
-    /* Fused kernel mode takes priority */
+    /* Fused GEMV+AR+RMSNorm mode takes priority (for FFN down projection) */
+    if (ar->use_gemv_fused && ar->gemv_fused_tp4_fn != NULL && ar->tp_size == 4) {
+        return do_allreduce_gemv_fused(ar, plan);
+    }
+    /* Fused kernel mode (allreduce+RMSNorm only) */
     if (ar->use_fused_kernel && ar->kernel_p2p_fused_tp4_fn != NULL && ar->tp_size == 4) {
         return do_allreduce_kernel_p2p(ar, plan);
     }
@@ -611,9 +774,11 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
     int err = 0;
     
     /* Track whether previous allreduce used fused kernel.
-     * If attn_ar used fused, skip ffn_rmsnorm.
-     * If ffn_ar used fused, skip next layer's attn_rmsnorm. */
-    int prev_ffn_used_fused = 0;
+     * If attn_ar used fused (allreduce+RMSNorm), skip ffn_rmsnorm.
+     * If ffn_ar used gemv_fused (GEMV+allreduce+RMSNorm), skip next layer's attn_rmsnorm.
+     * If ffn_ar used fused (allreduce+RMSNorm), skip next layer's attn_rmsnorm. */
+    int prev_ffn_used_gemv_fused = 0;  /* Tracks gemv_fused (GEMV+AR+RMSNorm) */
+    int prev_ffn_used_fused = 0;       /* Tracks fused (AR+RMSNorm only) */
 
     /* Clear any stale HIP errors */
     if (plan->hipGetLastError_fn) {
@@ -636,8 +801,9 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
 
             plan->hipSetDevice_fn(attn_ar->device_ids[engine_idx]);
 
-            /* RMSNorm: skip if previous FFN allreduce used fused kernel */
-            if (!prev_ffn_used_fused) {
+            /* RMSNorm: skip if previous FFN allreduce used fused kernel
+             * (either gemv_fused or regular fused both do RMSNorm) */
+            if (!prev_ffn_used_gemv_fused && !prev_ffn_used_fused) {
                 err = launch_kernel(&es->attn_rmsnorm, plan);
                 if (err) return err;
             }
@@ -749,17 +915,27 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
             
             err = launch_kernel(&es->ffn_gate_up_silu, plan);
             if (err) return err;
-            err = launch_kernel(&es->ffn_down, plan);
-            if (err) return err;
+            
+            /* FFN down projection: skip if using gemv_fused (fused GEMV+AR+RMSNorm)
+             * The fused kernel will be launched via dispatch_allreduce() below */
+            if (!ffn_ar->use_gemv_fused || ffn_ar->gemv_fused_tp4_fn == NULL) {
+                err = launch_kernel(&es->ffn_down, plan);
+                if (err) return err;
+            }
         }
 
-        /* Async allreduce for FFN partials (non-blocking) */
+        /* Async allreduce for FFN partials (non-blocking)
+         * When gemv_fused is used, this launches the fused GEMV+AR+RMSNorm kernel
+         * which replaces ffn_down + separate allreduce. */
         if (use_overlap) {
             err = dispatch_allreduce(ffn_ar, plan);
             if (err) return err;
         }
         
-        /* Track whether FFN allreduce used fused kernel (affects next layer) */
+        /* Track whether FFN allreduce used fused kernels (affects next layer) */
+        prev_ffn_used_gemv_fused = (ffn_ar->use_gemv_fused && 
+                                     ffn_ar->gemv_fused_tp4_fn != NULL &&
+                                     ffn_ar->tp_size == 4);
         prev_ffn_used_fused = (ffn_ar->use_fused_kernel && 
                                 ffn_ar->kernel_p2p_fused_tp4_fn != NULL &&
                                 ffn_ar->tp_size == 4);
