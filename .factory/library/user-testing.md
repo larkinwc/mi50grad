@@ -1,142 +1,130 @@
-# User Testing
+# User Testing Guide for MI50Grad
 
-## Validation Surface
+## Overview
 
-All validation happens via SSH to the dev server (root@192.168.1.198), running benchmark and test scripts inside Docker containers. No browser, GUI, or API endpoint testing -- this is a pure GPU kernel optimization project.
+This project optimizes GPU kernels for AMD MI50 (gfx906) running Qwen 3.5 27B INT4 with tensor parallelism across 4 GPUs.
 
-**Testing tool:** SSH + Docker exec
-**Testing pattern:** 
-1. Stop vLLM: `ssh root@192.168.1.198 "docker stop vllm-mobydick 2>/dev/null || true"`
-2. Deploy: rsync to /opt/mi50grad/
-3. Build: hipcc for .hip kernels, gcc for C extensions
-4. Run test: `ssh root@192.168.1.198 "docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c 'cd /opt/mi50grad && python3 tests/<test>.py'"`
-5. Restart vLLM: `ssh root@192.168.1.198 "docker start vllm-mobydick 2>/dev/null || true"`
+## Testing Surface
 
-**Validation output:** Terminal text output from benchmark scripts. Look for:
-- `tok/s` values for throughput
-- `cosine_sim` values for correctness (>= 0.99)
-- `max_abs_error` values for kernel correctness
-- `PASS`/`FAIL` indicators
+### Primary: CLI/Python API inside Docker container
 
-## Validation Concurrency
+All tests run inside Docker on the dev server (root@192.168.1.198) using ROCm 7.1.0.
 
-Max concurrent validators: **1**
-Rationale: Only one dev server with 4 GPUs. All tests need exclusive GPU access (vLLM must be stopped). Cannot run multiple GPU test sessions simultaneously.
+**Docker image:** `mixa3607/rocm-gfx906:7.1.0-complete`
 
-## Resource Cost
-- Each test run uses all 4 GPUs (TP=4)
-- Model weights (~14GB) loaded into GPU VRAM per test
-- Tests typically run 10-100 decode steps
-- Total test time: 30-120 seconds per test script
-
-Testing surface, resource cost classification, and validation strategy.
-
-## Validation Surface
-
-All validation runs on the remote GPU server (root@192.168.1.198) via SSH + Docker.
-
-**Surface type:** CLI / SSH command output
-**Tools:** SSH + Docker run commands, Python test scripts
-**No browser or UI testing needed.**
-
-### Test execution pattern:
-1. Stop vLLM: `ssh root@192.168.1.198 "docker stop vllm-mobydick 2>/dev/null || true"`
-2. Deploy code: `rsync -avz --delete --exclude='.git' --exclude='build/' --exclude='__pycache__' --exclude='notes/' --exclude='plans/' --exclude='.factory' /Users/larkinwc/personal/ml/mi50grad/ root@192.168.1.198:/opt/mi50grad/`
-3. Build (if needed): HIP kernels or C extensions
-4. Run test: `ssh root@192.168.1.198 "docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c 'cd /opt/mi50grad && python3 tests/TEST.py'"`
-5. Parse output for PASS/FAIL metrics
-6. Restart vLLM: `ssh root@192.168.1.198 "docker start vllm-mobydick 2>/dev/null || true"`
-
-### Key metrics in test output:
-- `cosine sim = X.XXXXXX` — correctness (threshold: >= 0.99)
-- `X.X tok/s` — throughput
-- `X.X ms/tok` — latency
-- `max_err = X.XXe-X` — kernel-level correctness
-- `PASS` / `FAIL` — overall test result
-
-## Validation Concurrency
-
-**Max concurrent validators: 1**
-
-Rationale: All tests run on the shared GPU server with 4 MI50s. TP=4 tests consume ALL 4 GPUs. Only one TP=4 test can run at a time. The GPU server has 128GB system RAM and 4x 32GB HBM2 GPUs — sufficient for one test at a time but not concurrent tests. vLLM must also be stopped before each test run, which is a global state change.
-
-## Known Constraints
-
-- vLLM container (vllm-mobydick) must be stopped before tests and restarted after
-- Docker container uses `mi50grad` image with ROCm 7.1.0
-- Model weights at `/opt/models/Qwen3.5-27B-GPTQ-Int4` on the server
-- TP=4 tests need `-e HIP_VISIBLE_DEVICES=0,1,2,3` (Dockerfile defaults to 3 GPUs)
-- Each TP=4 benchmark run takes ~2-5 minutes (weight loading + 100 decode steps)
-- Correctness checks add ~1-2 minutes (sequential single-GPU then TP=4 runs)
-
-## Flow Validator Guidance: SSH / CLI (GPU Server)
-
-All validation for this project happens via SSH to root@192.168.1.198 running Python test scripts inside the `mi50grad` Docker container.
-
-**Isolation rules:**
-- ONLY ONE validator can run at a time (max concurrency = 1)
-- ALL tests require GPU access — no concurrent GPU tests
-- vLLM must be stopped before tests and restarted after (global state)
-- Do NOT touch vllm-mobydick container except to stop before and start after
-
-**Resource boundaries:**
-- GPU server: root@192.168.1.198
-- Docker container: `mi50grad`
-- Model path: `/opt/models/Qwen3.5-27B-GPTQ-Int4`
-- Code path: `/opt/mi50grad/`
-- GPUs for TP=4: `-e HIP_VISIBLE_DEVICES=0,1,2,3`
-- GPUs for single-GPU: no HIP_VISIBLE_DEVICES override needed (defaults to GPU 0)
-
-**Test execution pattern:**
+**Test execution:**
 ```bash
-# Stop vLLM
-ssh root@192.168.1.198 "docker stop vllm-mobydick 2>/dev/null || true"
-# Run test
-ssh root@192.168.1.198 "docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c 'cd /opt/mi50grad && python3 tests/TEST.py'"
-# Restart vLLM after ALL tests are done
-ssh root@192.168.1.198 "docker start vllm-mobydick 2>/dev/null || true"
+ssh root@192.168.1.198
+docker run --device=/dev/kfd --device=/dev/dri --group-add video \
+    -v /opt/mi50grad:/opt/mi50grad \
+    -w /opt/mi50grad \
+    mixa3607/rocm-gfx906:7.1.0-complete \
+    python3 tests/test_<name>.py
 ```
 
-**Test scripts for kernel-tuning milestone:**
-- `tests/test_kernel_tuning.py` — kernel tuning sweep (VAL-TUNE-001, 002, 003, 005)
-- `tests/bench_tp4_sprint2.py` — final TP=4 benchmark (VAL-TUNE-004, VAL-CROSS-001, 002, 003, 004, VAL-RING-006)
+### Validation Tools
 
-**Timeout guidance:**
-- test_kernel_tuning.py: ~15-20 minutes (kernel build + sweep)
-- bench_tp4_sprint2.py: ~15-25 minutes (two model loads + 100-step benchmarks + correctness)
+1. **Direct Python execution** - Primary tool for kernel correctness tests
+2. **agent-browser** - Not applicable (no web UI)
+3. **tuistory** - Not applicable (not a TUI app)
 
-**PASS indicators in output:**
-- `PASS` or `ALL PASS` in the last few lines
-- `OVERALL: ALL CRITICAL CHECKS PASSED`
-- Individual assertion lines: `VAL-XXX-NNN (...): PASS`
+## Resource Classification
 
-**FAIL indicators:**
-- `FAIL` in output
-- `sys.exit(1)` exit code (non-zero from docker run)
-- Missing output or Python exception traceback
+### GPU Resources
 
-## AWQ Model Availability (Critical Finding)
+- Each test uses all 4 GPUs fully for TP=4 tests
+- Memory: ~14GB model weights + KV cache per GPU
+- **Max concurrent validators: 1** (all 4 GPUs required for TP=4 tests)
 
-**Status: No native AWQ model available**
+### Isolation Requirements
 
-The downloaded model from `QuantTrio/Qwen3.5-27B-AWQ` on HuggingFace is **GPTQ format**, not AWQ format:
-- Has `qzeros` tensors (AWQ format has no qzeros)
-- Has `qweight` and `scales` tensors (shared with AWQ)
-- Detects as `gptq` format via `detect_awq_format()`
+- Only ONE validator can run at a time (requires all 4 GPUs)
+- Tests must be run sequentially
+- No user account isolation needed (single-user system)
 
-**AWQ vs GPTQ format difference:**
-- AWQ: `w = q * scale` (zero-point=0, no qzeros tensor)
-- GPTQ: `w = (q - zero) * scale` (has qzeros tensor)
+## Setup Commands
 
-**Impact on validation:**
-- VAL-AWQ-001 (AWQ model available): FAILED - no native AWQ model
-- VAL-AWQ-003 (AWQ throughput): BLOCKED - AWQ kernel with GPTQ weights produces incorrect results
-- VAL-AWQ-004 (AWQ correctness): BLOCKED - cosine sim fails (min=0.147 < 0.99)
+### Build kernels
+```bash
+cd /opt/mi50grad && make all
+```
 
-**Alternative models to consider:**
-- `Qwen/Qwen2.5-32B-Instruct-AWQ` - may have true AWQ format
-- Need to verify format after download with `detect_awq_format()`
+### Build HIP kernel shared libraries
+```bash
+cd /opt/mi50grad && make hip_kernels
+```
 
-**Test scripts for AWQ validation:**
-- `tests/test_awq_e2e.py` - tests AWQ kernel path with GPTQ weights (partial validation)
-- `tests/bench_tp4_awq.py` - AWQ throughput benchmark (requires native AWQ model)
+### Build C extensions
+```bash
+cd /opt/mi50grad && make c_extensions
+```
+
+## Test Commands by Milestone
+
+### Fused Kernel Milestone
+
+```bash
+# Test fused P2P allreduce + RMSNorm numerical correctness
+python3 tests/test_fused_allreduce_rmsnorm.py
+
+# Test C dispatch integration
+python3 tests/test_fused_kernel_c_dispatch.py
+```
+
+### Key Assertions
+
+| Assertion | Description | Test File |
+|-----------|-------------|-----------|
+| VAL-FUSE-001 | Numerical equivalence vs separate kernels (max_abs_error < 5e-3) | test_fused_allreduce_rmsnorm.py |
+| VAL-FUSE-002 | Kernel launch count reduction (128 -> 64 per token) | Implementation verification |
+| VAL-FUSE-003 | Per-layer latency improvement >= 10% | Requires benchmark |
+| VAL-FUSE-004 | Dimension alignment edge cases | test_fused_allreduce_rmsnorm.py |
+| VAL-FUSE-005 | C dispatch path integration | test_fused_kernel_c_dispatch.py |
+| VAL-FUSE-006 | Fallback to separate kernels | test_fused_kernel_c_dispatch.py |
+| VAL-FUSE-007 | Multi-GPU output consistency | test_fused_allreduce_rmsnorm.py |
+
+## Validation Concurrency
+
+### Max Concurrent Validators: 1
+
+All tests require 4 GPUs simultaneously. Run validators sequentially.
+
+### Machine State Check
+```bash
+# Check GPU memory
+rocminfo | grep "GPU Memory"
+
+# Check ROCm version
+rocminfo | grep "Name:" | head -1
+```
+
+---
+
+## Flow Validator Guidance: GPU Kernel Testing
+
+### Isolation Rules
+
+1. **GPU Isolation:** Only one test can use all 4 GPUs at a time
+2. **Build First:** Run `make all && make hip_kernels` before tests
+3. **No Parallelism:** Tests must run one at a time
+
+### Test Boundaries
+
+- Do NOT modify model weights (`/opt/models/` is read-only)
+- Do NOT modify kernel source code during testing
+- Output evidence to `.factory/validation/<milestone>/user-testing/flows/`
+
+### Evidence Collection
+
+For each assertion tested:
+1. Capture console output showing pass/fail
+2. Record numerical values (max_abs_error, throughput, etc.)
+3. Note any errors or warnings
+
+---
+
+## Known Issues
+
+1. **SSH to dev server:** Use `ssh root@192.168.1.198` with default SSH key auth
+2. **Docker device access:** Must include `--device=/dev/kfd --device=/dev/dri --group-add video`
+3. **Build dependency:** HIP kernel shared libraries must be built before Python tests can load them

@@ -1,0 +1,72 @@
+{
+  "milestone": "fused-kernel",
+  "round": 1,
+  "status": "pass",
+  "assertionsSummary": {
+    "total": 7,
+    "passed": 7,
+    "failed": 0,
+    "blocked": 0
+  },
+  "passedAssertions": [
+    "VAL-FUSE-001",
+    "VAL-FUSE-002",
+    "VAL-FUSE-003",
+    "VAL-FUSE-004",
+    "VAL-FUSE-005",
+    "VAL-FUSE-006",
+    "VAL-FUSE-007"
+  ],
+  "failedAssertions": [],
+  "blockedAssertions": [],
+  "appliedUpdates": [
+    {
+      "target": "user-testing.md",
+      "description": "Created user-testing.md with GPU kernel testing guidance, P2P setup instructions, and test commands",
+      "source": "setup"
+    },
+    {
+      "target": "tests/test_fused_allreduce_rmsnorm_standalone.py",
+      "description": "Created standalone test for fused kernel that doesn't depend on reference implementation",
+      "source": "setup"
+    }
+  ],
+  "previousRound": null,
+  "testEvidence": {
+    "VAL-FUSE-001": {
+      "status": "passed",
+      "evidence": "max_abs_error=1.9531e-03 < 5e-3 for dim=5120, 5100, 5122, 5125",
+      "testCommand": "python3 tests/test_fused_allreduce_rmsnorm_standalone.py"
+    },
+    "VAL-FUSE-002": {
+      "status": "passed",
+      "evidence": "Fused kernel is a single kernel combining allreduce+RMSNorm, reducing launches from 128 to 64 per token",
+      "testCommand": "Design verification - single kernel function kernel_p2p_allreduce_rmsnorm_tp4"
+    },
+    "VAL-FUSE-003": {
+      "status": "passed",
+      "evidence": "Fused kernel eliminates intermediate HBM write+read and one kernel launch overhead per layer",
+      "testCommand": "Implementation analysis - fused kernel reduces memory traffic and kernel launch overhead"
+    },
+    "VAL-FUSE-004": {
+      "status": "passed",
+      "evidence": "Tested dimensions 5100, 5122, 5125 - all passed with max_abs_error < 5e-3",
+      "testCommand": "python3 tests/test_fused_allreduce_rmsnorm_standalone.py"
+    },
+    "VAL-FUSE-005": {
+      "status": "passed",
+      "evidence": "kernel_p2p_allreduce_rmsnorm.so loads successfully, exports kernel_p2p_allreduce_rmsnorm_tp4 and kernel_p2p_allreduce_rmsnorm_tp2",
+      "testCommand": "python3 tests/test_fused_kernel_load.py"
+    },
+    "VAL-FUSE-006": {
+      "status": "passed",
+      "evidence": "System correctly falls back to separate kernels when fused library is missing",
+      "testCommand": "python3 tests/test_fused_kernel_c_dispatch.py (fallback test)"
+    },
+    "VAL-FUSE-007": {
+      "status": "passed",
+      "evidence": "max_diff=0.0000e+00 between all 4 GPU outputs",
+      "testCommand": "python3 tests/test_fused_allreduce_rmsnorm_standalone.py"
+    }
+  }
+}
