@@ -524,7 +524,7 @@ def test_c_dispatch_interaction():
     # Create C dispatch engine (no double-buffer)
     print("\nCreating C dispatch engine (no double-buffer)...")
     tp_c = TPInferenceEngine(config, device_ids=DEVICE_IDS, max_seq_len=MAX_SEQ_LEN)
-    tp_c.set_c_dispatch_enabled(True)
+    tp_c.set_c_dispatch(True)
     for layer_idx, lw in enumerate(layers_weights):
         tp_c.load_layer_weights(layer_idx, lw)
     tp_c.load_final_norm(final_norm)
@@ -535,7 +535,7 @@ def test_c_dispatch_interaction():
     # Double-buffer should be ignored when C dispatch is enabled
     print("Creating C dispatch + double-buffer engine...")
     tp_c_db = TPInferenceEngine(config, device_ids=DEVICE_IDS, max_seq_len=MAX_SEQ_LEN)
-    tp_c_db.set_c_dispatch_enabled(True)
+    tp_c_db.set_c_dispatch(True)
     tp_c_db.set_double_buffer_enabled(True)  # Should be ignored
     for layer_idx, lw in enumerate(layers_weights):
         tp_c_db.load_layer_weights(layer_idx, lw)

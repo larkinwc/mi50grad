@@ -2671,18 +2671,26 @@ class TPInferenceEngine:
             partial_ptrs = [e.d_proj_out for e in self.engines]
             if use_double_buffer:
                 # Double-buffer: write to the alternate buffer (d_hidden_write)
+                # CRITICAL: For residual add to work correctly, d_hidden_write must
+                # contain the same value as d_hidden (the layer input). Copy it now.
+                ar_stream = p2p_ar._allreduce_streams[0]
+                for engine in self.engines:
+                    engine.device.memcpy_d2d_async(
+                        engine.d_hidden_write, engine.d_hidden, h * 2, ar_stream)
                 hidden_ptrs = [e.d_hidden_write for e in self.engines]
             else:
                 hidden_ptrs = [e.d_hidden for e in self.engines]
             p2p_ar.allreduce_residual_async(
                 partial_ptrs, hidden_ptrs, h, compute_streams)
 
-            # Standard mode: wait for attention allreduce before FFN RMSNorm
-            # Double-buffer mode: NO wait here - FFN RMSNorm reads from d_hidden_write
-            # which will be updated by the allreduce. The stream event mechanism
-            # ensures the data is ready when the RMSNorm kernel executes.
-            if not use_double_buffer:
-                p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
+            # CRITICAL: Wait for attention allreduce before FFN RMSNorm.
+            # FFN RMSNorm reads the attention output, so it cannot execute until
+            # the allreduce completes. This wait is required for BOTH standard and
+            # double-buffer modes.
+            # Double-buffer overlap benefit: The next layer's attention RMSNorm will
+            # naturally read from this layer's FFN output via buffer swap, without
+            # needing an inter-layer wait.
+            p2p_ar.wait_for_allreduce_on_compute_stream(compute_streams)
 
             for engine_idx, (engine, lc) in enumerate(
                     zip(self.engines, self._engine_layer_caches)):

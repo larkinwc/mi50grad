@@ -11,10 +11,10 @@
 | Assertion | Description | Status | Notes |
 |-----------|-------------|--------|-------|
 | VAL-DB-001 | Buffer swap alternation | ✅ PASS | Even layers read A→write B, odd layers read B→write A |
-| VAL-DB-002 | Numerical correctness (cos_sim >= 0.99) | 🔧 FIXED | Root cause identified and fixed in tp_engine.py |
-| VAL-DB-003 | Throughput improvement (>= 5%) | ⏳ PENDING | Ready to test once VAL-DB-002 verified |
-| VAL-DB-004 | Long-run stability (1000+ tokens) | ⏳ PENDING | Ready to test once VAL-DB-002 verified |
-| VAL-DB-005 | C dispatch interaction | ⏳ PENDING | Ready to test once VAL-DB-002 verified |
+| VAL-DB-002 | Numerical correctness (cos_sim >= 0.99) | ✅ PASS | **FIXED & VERIFIED** - Min cos_sim=0.999949 on dev server |
+| VAL-DB-003 | Throughput improvement (>= 5%) | ❌ FAIL | Shows 0.934x (6.6% degradation) - needs investigation |
+| VAL-DB-004 | Long-run stability (1000+ tokens) | ⏳ PENDING | Requires extended test run |
+| VAL-DB-005 | C dispatch interaction | ❌ FAIL | C dispatch plan build failing - pre-existing issue |
 
 ---
 
@@ -137,6 +137,29 @@ Results:
 VAL-DB-002: PASS
 ======================================================================
 ```
+
+### Actual Test Output (2026-03-18) ✅ PASS
+
+```
+Running 20 decode steps (per-step comparison)...
+  Step 1/20: cos_sim=0.999994, max_diff=4.687500e-02
+  Step 6/20: cos_sim=0.999987, max_diff=1.093750e-01
+  Step 11/20: cos_sim=0.999968, max_diff=9.008789e-02
+  Step 16/20: cos_sim=0.999981, max_diff=3.955078e-02
+  Step 20/20: cos_sim=0.999992, max_diff=3.906250e-02
+
+======================================================================
+Results:
+  Min cosine similarity:  0.999949
+  Avg cosine similarity:  0.999985
+  Max absolute difference: 1.289062e-01
+  Threshold: >= 0.99
+
+VAL-DB-002: PASS
+======================================================================
+```
+
+The fix is **VERIFIED** on the dev server (4x MI50). All 20 decode steps achieved cosine similarity > 0.9999, well exceeding the 0.99 threshold.
 
 ### Next Steps After VAL-DB-002 Pass
 
