@@ -85,6 +85,83 @@ With this fix, double-buffer mode should produce **identical numerical results**
 
 ---
 
+## Deployment & Verification
+
+### Files Changed
+- `src/inference/tp_engine.py` - Fixed RMSNorm pointer updates in double-buffer mode
+- `tests/test_double_buffer_tp4.py` - Updated test comments
+- `DOUBLE_BUFFER_VALIDATION_SUMMARY.md` - This document
+
+### Deploy to Dev Server
+
+```bash
+# From project root
+./scripts/deploy_and_test_valdb002.sh
+```
+
+Or manually:
+```bash
+# Sync files
+rsync -avz src/inference/tp_engine.py tests/test_double_buffer_tp4.py \
+    root@192.168.1.198:/opt/mi50grad/
+
+# Run VAL-DB-002 test
+ssh root@192.168.1.198 "cd /opt/mi50grad && docker run --rm \
+    --device=/dev/kfd --device=/dev/dri --group-add video \
+    -e HIP_VISIBLE_DEVICES=0,1,2,3 \
+    -v /opt/mi50grad:/workspace -v /opt/models:/opt/models \
+    mi50grad python3 tests/test_double_buffer_tp4.py --correctness --steps 20"
+```
+
+### Expected Test Output
+
+```
+======================================================================
+VAL-DB-002: Numerical Correctness Test (Single-Engine Approach)
+======================================================================
+...
+Running 20 decode steps (per-step comparison)...
+  Step 1/20: cos_sim=0.999xxx, max_diff=x.xxxxe-xx
+  Step 6/20: cos_sim=0.999xxx, max_diff=x.xxxxe-xx
+  Step 11/20: cos_sim=0.999xxx, max_diff=x.xxxxe-xx
+  Step 16/20: cos_sim=0.999xxx, max_diff=x.xxxxe-xx
+  Step 20/20: cos_sim=0.999xxx, max_diff=x.xxxxe-xx
+
+======================================================================
+Results:
+  Min cosine similarity:  0.99xxxx
+  Avg cosine similarity:  0.99xxxx
+  Max absolute difference: x.xxxxe-xx
+  Threshold: >= 0.99
+
+VAL-DB-002: PASS
+======================================================================
+```
+
+### Next Steps After VAL-DB-002 Pass
+
+1. **Run full validation suite:**
+   ```bash
+   ssh root@192.168.1.198 "cd /opt/mi50grad && docker run --rm ... \
+       mi50grad python3 tests/test_double_buffer_tp4.py --all"
+   ```
+
+2. **Verify all VAL-DB assertions pass:**
+   - VAL-DB-001: Buffer swap alternation (already passing)
+   - VAL-DB-002: Numerical correctness (fixed)
+   - VAL-DB-003: Throughput improvement (should now show >= 5%)
+   - VAL-DB-004: Long-run stability (should pass with cos_sim >= 0.99)
+   - VAL-DB-005: C dispatch interaction (should pass)
+
+3. **Benchmark performance:**
+   Run `--benchmark` mode to measure actual throughput improvement from double-buffer overlap.
+
+4. **Update documentation:**
+   - Add performance numbers to this summary
+   - Update README with double-buffer usage instructions
+
+---
+
 ## Test Infrastructure
 
 Created comprehensive test file: `tests/test_double_buffer_tp4.py`
