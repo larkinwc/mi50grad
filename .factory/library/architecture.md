@@ -6,6 +6,33 @@ Architectural decisions, patterns discovered, and kernel design notes.
 
 ---
 
+## Fused GEMV+AR+RMSNorm Kernel Regression (2026-03-18)
+
+**Issue:** M2 fused kernel integration caused 71% throughput regression (45 tok/s → 13 tok/s).
+
+**Root cause:** In `c_dispatch.c:do_allreduce_gemv_fused()`, the fused kernel was passed the wrong input activation pointer:
+```c
+// WRONG - reads from residual buffer (garbage for GEMV input)
+(const void *)(uintptr_t)ar->hidden_ptrs[0],  /* A: input activation */
+
+// CORRECT - should read from FFN gate output (SiLU activation)
+(const void *)(uintptr_t)engine->d_ffn_gate,  /* A: FFN gate output after SiLU */
+```
+
+The fused GEMV kernel expects `A` to be the FFN gate output (after SiLU multiplication), but the C dispatch was passing `hidden_ptrs[0]` which contains the residual. This caused the kernel to compute garbage output, leading to the massive throughput drop.
+
+**Fix:** Disabled fused GEMV kernel by default in `tp_engine.py` until the input pointer is corrected. The kernel library is still loaded and available for future testing.
+
+**Key learning:** When fusing kernels, verify that all input pointers match the expected buffers from the original unfused path. The FFN flow is:
+1. `ffn_rmsnorm(d_normed, d_hidden)` - normalize residual
+2. `ffn_gate_up_silu(d_ffn_gate, d_normed)` - gate+up+SiLU → writes to `d_ffn_gate`
+3. `ffn_down(d_ffn_out, d_ffn_gate)` - down projection reads from `d_ffn_gate`
+4. `allreduce(d_ffn_out)` → `d_hidden`
+
+The fused kernel replaces steps 3-4, so it must read from `d_ffn_gate`, NOT `d_hidden`.
+
+---
+
 ## Sprint 5 Optimization Targets (2026-03-17)
 
 ### Current Bottleneck Analysis (38.3 tok/s, TP=4, 4xMI50)
