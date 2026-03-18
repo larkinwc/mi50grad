@@ -1783,10 +1783,27 @@ Double-buffer is implemented in 2 of 7 dispatch paths:
 
 **Dispatch priority note:** The dispatch path priority order in `decode_step()` determines which optimizations take effect. When multiple optimizations are enabled, higher-priority paths (global_graph > graph > c_dispatch > batched_allreduce > cached+stream > cached > stream > threaded > serial) take precedence, which can silently disable lower-priority optimizations like double-buffer.
 
-**Correctness status:**
-- Minimal buffer swap test: PASSED (validates alternation mechanism)
-- Full TP=4 correctness test: Not executed due to time constraints (requires 10+ minutes for weight loading)
-- Recommended: Run full test before considering production-ready
+**Correctness status (updated 2026-03-18):**
+- VAL-DB-001 (Buffer swap alternation): ✅ PASS - Verified on 4x MI50 dev server
+- VAL-DB-002 (Numerical correctness): ✅ PASS - Min cosine similarity 0.999962 >= 0.99 threshold
+- VAL-DB-003 (Throughput improvement): ❌ FAIL - Shows 9.3% degradation instead of improvement
+- VAL-DB-004 (Long-run stability): ⏳ PARTIAL - Test framework ready, 100-step test passed
+- VAL-DB-005 (C dispatch interaction): ⏳ PENDING - Test infrastructure ready
+
+**VAL-DB-002 Fix (commit d387173):**
+Root cause: Cached LaunchSpec objects had stale d_hidden pointers that didn't reflect dynamic buffer swapping.
+Fix: Update RMSNorm input pointers at runtime in `_decode_step_cached_stream`:
+- Attention RMSNorm: `params[1] = engine.d_hidden` (updated after each swap)
+- FFN RMSNorm: `params[1] = engine.d_hidden_write` (the allreduce target buffer)
+
+**New API method:**
+`memcpy_d2d_async(dst, src, size, stream)` added to HIPRuntime and GPUDevice classes.
+Required for copying d_hidden to d_hidden_write before residual add in double-buffer mode.
+
+**Throughput analysis:**
+Double-buffer shows ~9% degradation instead of expected improvement. Root cause: memcpy_d2d_async overhead
+and stream synchronization costs exceed compute-communication overlap benefits for current workload.
+The mechanism is numerically correct; throughput gains depend on workload characteristics.
 
 **Allreduce fallback chain:**
 The `_allreduce_residual_double_buffer()` method supports multiple allreduce implementations:

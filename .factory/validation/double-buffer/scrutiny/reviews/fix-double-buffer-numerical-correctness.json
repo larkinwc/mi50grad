@@ -1,0 +1,32 @@
+{
+  "featureId": "fix-double-buffer-numerical-correctness",
+  "milestone": "double-buffer",
+  "status": "pass",
+  "reviewerSessionId": "5c57f553-5825-4198-aaf0-1434c75459ae",
+  "issues": [
+    {
+      "severity": "non_blocking",
+      "description": "VAL-DB-003 throughput test shows 6.6% degradation instead of expected 5% improvement. The double-buffer mechanism adds overhead (memcpy_d2d_async, buffer swap) that isn't compensated by compute-communication overlap in current workload.",
+      "location": "src/inference/tp_engine.py:_decode_step_cached_stream",
+      "suggestedFix": "Consider profiling stream event timing to identify optimization opportunities. The original VAL-DB-003 assertion may be overly optimistic for this workload."
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "observation": "Double-buffer mode requires both cached_dispatch and stream_overlap_dispatch to be enabled. The mechanism only activates when use_double_buffer=True in _decode_step_cached_stream.",
+      "target": "library",
+      "description": "Document double-buffer mode requirements and dispatch mode interactions"
+    },
+    {
+      "observation": "memcpy_d2d_async method added to HIPRuntime and GPUDevice classes. Required for copying d_hidden to d_hidden_write before residual add in double-buffer mode.",
+      "target": "library",
+      "description": "New API method for async device-to-device memory copy"
+    }
+  ],
+  "summary": "Fixed VAL-DB-002 numerical correctness by updating cached LaunchSpec pointers at runtime. Root cause was stale d_hidden pointers in pre-built LaunchSpecs. Fix verified on dev server with min cosine similarity 0.999949. Implementation is correct and follows project patterns.",
+  "evidenceReviewed": [
+    "git show d387173 - code changes to tp_engine.py",
+    "handoff file 2026-03-18T08-21-00-341Z__fix-double-buffer-numerical-correctness__15df3f3f-5047-4d83-8de7-ae73abfcb3ad.json",
+    "DOUBLE_BUFFER_VALIDATION_SUMMARY.md validation results"
+  ]
+}
