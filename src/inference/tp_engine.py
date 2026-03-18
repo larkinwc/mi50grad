@@ -4533,6 +4533,11 @@ class TPInferenceEngine:
                 # Kernel P2P allreduce fields (kernel-p2p-tp4-integration)
                 ('use_kernel_p2p',  ct.c_uint32),
                 ('kernel_p2p_tp4_fn', ct.c_void_p),  # kernel_p2p_tp4_fn_t function pointer
+                # Fused kernel P2P allreduce + RMSNorm fields
+                ('use_fused_kernel', ct.c_uint32),
+                ('kernel_p2p_fused_tp4_fn', ct.c_void_p),  # kernel_p2p_fused_tp4_fn_t
+                ('rmsnorm_weight_ptrs', ct.c_uint64 * 4),  # RMSNorm weight pointers per GPU
+                ('eps',             ct.c_float),  # RMSNorm epsilon
             ]
 
         class CDispatchPlan(ct.Structure):
@@ -4674,8 +4679,78 @@ class TPInferenceEngine:
                   f"(kernel_p2p_enabled={self._kernel_p2p_allreduce}, "
                   f"tp_size={self.tp_size})")
 
-        def fill_ar_spec(c_ar, partial_attr):
-            """Fill a CAllreduceSpec for one layer."""
+        # Load fused kernel P2P allreduce + RMSNorm library (if available)
+        fused_kernel_fn_ptr = None
+        use_fused_kernel_in_c = False
+        fused_lib = None
+        build_dir = Path(__file__).parent.parent.parent / "build" / "kernels"
+        fused_so_path = build_dir / "kernel_p2p_allreduce_rmsnorm.so"
+        
+        if fused_so_path.exists():
+            try:
+                fused_lib = ct.CDLL(str(fused_so_path))
+                # Set function signature
+                fused_lib.kernel_p2p_allreduce_rmsnorm_tp4.argtypes = [
+                    ct.c_void_p,  # output
+                    ct.c_void_p,  # partial_local
+                    ct.c_void_p,  # partial_peer0
+                    ct.c_void_p,  # partial_peer1
+                    ct.c_void_p,  # partial_peer2
+                    ct.c_void_p,  # weight
+                    ct.c_uint,    # dim
+                    ct.c_uint,    # batch_size
+                    ct.c_float,   # eps
+                    ct.c_void_p,  # stream
+                ]
+                fused_lib.kernel_p2p_allreduce_rmsnorm_tp4.restype = ct.c_int
+                fused_kernel_fn_ptr = ct.cast(
+                    fused_lib.kernel_p2p_allreduce_rmsnorm_tp4,
+                    ct.c_void_p
+                ).value
+                # Enable fused kernel only for TP=4
+                if self.tp_size == 4:
+                    use_fused_kernel_in_c = True
+                    print(f"C dispatch: fused kernel allreduce+RMSNorm enabled "
+                          f"(fn_ptr=0x{fused_kernel_fn_ptr:016x})")
+                else:
+                    print(f"C dispatch: fused kernel available but TP={self.tp_size} "
+                          f"(requires TP=4)")
+            except Exception as e:
+                print(f"C dispatch: failed to load fused kernel library: {e}")
+                fused_lib = None
+        else:
+            print(f"C dispatch: fused kernel library not found at {fused_so_path}")
+
+        # We need to access layer-specific RMSNorm weights for the fused kernel.
+        # The fused kernel is called after allreduce and does the RMSNorm that would
+        # normally be done by the next kernel:
+        # - Attention allreduce → fused does ffn_rmsnorm (same layer)
+        # - FFN allreduce → fused does attn_rmsnorm (next layer)
+        #
+        # Since each layer has different weights, we need to fill the specs per-layer
+        # with the correct weight pointers.
+        
+        # Get RMSNorm weight pointers for each layer and engine
+        layer_attn_norm_ptrs = []  # [layer_idx][engine_idx] -> d_attn_norm
+        layer_ffn_norm_ptrs = []    # [layer_idx][engine_idx] -> d_ffn_norm
+        for layer_idx in range(num_layers):
+            attn_ptrs = []
+            ffn_ptrs = []
+            for engine_idx, engine in enumerate(self.engines):
+                lw = engine.layers[layer_idx]
+                attn_ptrs.append(lw.attn_norm)
+                ffn_ptrs.append(lw.ffn_norm)
+            layer_attn_norm_ptrs.append(attn_ptrs)
+            layer_ffn_norm_ptrs.append(ffn_ptrs)
+
+        def fill_ar_spec(c_ar, partial_attr, rmsnorm_weight_ptrs):
+            """Fill a CAllreduceSpec for one layer.
+            
+            Args:
+                c_ar: CAllreduceSpec to fill
+                partial_attr: Attribute name for partial pointers ('d_proj_out' or 'd_ffn_out')
+                rmsnorm_weight_ptrs: List of RMSNorm weight pointers [engine_idx] -> ptr
+            """
             c_ar.reduce_tp2 = reduce_tp2
             c_ar.reduce_tp3 = reduce_tp3
             c_ar.reduce_tp4 = reduce_tp4
@@ -4697,10 +4772,21 @@ class TPInferenceEngine:
             # Kernel P2P allreduce fields
             c_ar.use_kernel_p2p = 1 if use_kernel_p2p_in_c else 0
             c_ar.kernel_p2p_tp4_fn = kernel_p2p_fn_ptr
+            # Fused kernel fields
+            c_ar.use_fused_kernel = 1 if use_fused_kernel_in_c else 0
+            c_ar.kernel_p2p_fused_tp4_fn = fused_kernel_fn_ptr
+            # RMSNorm weight pointers for fused kernel (per-GPU)
+            for i in range(self.tp_size):
+                c_ar.rmsnorm_weight_ptrs[i] = rmsnorm_weight_ptrs[i]
+            c_ar.eps = 1e-6  # Default RMSNorm epsilon
 
         for layer_idx in range(num_layers):
-            fill_ar_spec(attn_ar_array[layer_idx], 'd_proj_out')
-            fill_ar_spec(ffn_ar_array[layer_idx],  'd_ffn_out')
+            # Attention allreduce: fused kernel does ffn_rmsnorm (same layer)
+            fill_ar_spec(attn_ar_array[layer_idx], 'd_proj_out', layer_ffn_norm_ptrs[layer_idx])
+            # FFN allreduce: fused kernel does attn_rmsnorm (next layer)
+            # For the last layer, use the last layer's attn_norm (won't be used anyway)
+            next_layer_idx = min(layer_idx + 1, num_layers - 1)
+            fill_ar_spec(ffn_ar_array[layer_idx], 'd_ffn_out', layer_attn_norm_ptrs[next_layer_idx])
 
         # Build the CDispatchPlan
         plan = CDispatchPlan()
@@ -4757,6 +4843,9 @@ class TPInferenceEngine:
             'hip_get_last_error_fn':    hip_get_last_error_fn,
             'hip_module_launch_fn':     hip_module_launch_fn,
         }
+        # Keep fused kernel library alive (prevent GC)
+        if fused_lib is not None:
+            self._c_dispatch_objects['fused_kernel_lib'] = fused_lib
 
         print(f"C dispatch plan built: {num_layers} layers × {num_engines} engines")
         return plan

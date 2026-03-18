@@ -75,6 +75,24 @@ typedef int (*kernel_p2p_tp4_fn_t)(
     void* stream  /* hipStream_t */
 );
 
+/* kernel_p2p_allreduce_rmsnorm_tp4(output, partial_local, peer0, peer1, peer2,
+ *                                    weight, dim, batch, eps, stream)
+ * Host-callable C wrapper from kernel_p2p_allreduce_rmsnorm.so.
+ * Fused P2P allreduce + RMSNorm kernel.
+ */
+typedef int (*kernel_p2p_fused_tp4_fn_t)(
+    void* output,
+    const void* partial_local,
+    const void* partial_peer0,
+    const void* partial_peer1,
+    const void* partial_peer2,
+    const void* weight,
+    unsigned int dim,
+    unsigned int batch,
+    float eps,
+    void* stream  /* hipStream_t */
+);
+
 /* ---------------------------------------------------------------------- */
 /* Data structures (must match Python ctypes definitions exactly)           */
 /* ---------------------------------------------------------------------- */
@@ -179,8 +197,15 @@ typedef struct {
     /* Kernel P2P allreduce fields (added for kernel-p2p-tp4-integration) */
     uint32_t use_kernel_p2p;          /* 1=use kernel P2P, 0=use star topology */
     kernel_p2p_tp4_fn_t kernel_p2p_tp4_fn; /* ptr to kernel_p2p_allreduce_residual_tp4 */
-    /* 8 bytes padding to maintain 8-byte alignment (fn ptr is 8 bytes on 64-bit) */
-    /* Note: no extra padding needed, fn ptr aligns naturally after uint32_t */
+    
+    /* Fused kernel P2P allreduce + RMSNorm fields */
+    uint32_t use_fused_kernel;        /* 1=use fused allreduce+RMSNorm, 0=separate */
+    kernel_p2p_fused_tp4_fn_t kernel_p2p_fused_tp4_fn; /* ptr to fused kernel */
+    uint64_t rmsnorm_weight_ptrs[4];  /* RMSNorm weight pointers for each GPU */
+    float eps;                        /* RMSNorm epsilon (default: 1e-6) */
+    /* Padding for 8-byte alignment: kernel_p2p_fused_tp4_fn is 8 bytes,
+     * rmsnorm_weight_ptrs[4] is 32 bytes, eps is 4 bytes
+     * Total after use_fused_kernel(4): 4+8+32+4 = 48 bytes (aligned) */
 } CAllreduceSpec;
 
 /*
@@ -382,19 +407,86 @@ static void wait_for_allreduce(CAllreduceSpec *ar, CDispatchPlan *plan)
  * the AR done events (same protocol as the star topology path).
  *
  * Supports TP=4 only (TP=2 falls back to star topology).
+ *
+ * Fused kernel mode (use_fused_kernel=1):
+ *   Launches kernel_p2p_allreduce_rmsnorm_tp4 which performs:
+ *   - P2P allreduce (sum partials from all GPUs)
+ *   - RMSNorm normalization
+ *   - Write normalized result to hidden buffer
+ *   This eliminates the separate RMSNorm kernel launch.
  */
 static int do_allreduce_kernel_p2p(CAllreduceSpec *ar, CDispatchPlan *plan)
 {
     int tp = ar->tp_size;
     if (tp <= 1) return 0;
 
+    int i, j, err;
+    uint32_t n = ar->num_elems;
+
+    /* Fused kernel mode: use fused allreduce+RMSNorm kernel */
+    if (ar->use_fused_kernel && ar->kernel_p2p_fused_tp4_fn != NULL && tp == 4) {
+        /* Step 1: Record compute events on each GPU */
+        for (i = tp - 1; i >= 0; i--) {
+            plan->hipSetDevice_fn(ar->device_ids[i]);
+            plan->hipEventRecord_fn(
+                (void *)(uintptr_t)ar->compute_events[i],
+                (void *)(uintptr_t)ar->compute_streams[i]);
+        }
+
+        /* Step 2: Each GPU's AR stream waits for ALL compute events */
+        for (j = 0; j < tp; j++) {
+            plan->hipStreamWaitEvent_fn(
+                (void *)(uintptr_t)ar->allreduce_streams[0],
+                (void *)(uintptr_t)ar->compute_events[j], 0);
+        }
+        for (i = 1; i < tp; i++) {
+            plan->hipSetDevice_fn(ar->device_ids[i]);
+            for (j = 0; j < tp; j++) {
+                plan->hipStreamWaitEvent_fn(
+                    (void *)(uintptr_t)ar->allreduce_streams[i],
+                    (void *)(uintptr_t)ar->compute_events[j], 0);
+            }
+        }
+
+        /* Step 3: Launch fused kernel on each GPU's AR stream.
+         * The fused kernel performs allreduce + RMSNorm in one launch.
+         * Output is written directly to hidden_ptrs (normalized).
+         */
+        for (i = 0; i < tp; i++) {
+            plan->hipSetDevice_fn(ar->device_ids[i]);
+            int p0 = (i + 1) % 4;
+            int p1 = (i + 2) % 4;
+            int p2 = (i + 3) % 4;
+            err = ar->kernel_p2p_fused_tp4_fn(
+                (void *)(uintptr_t)ar->hidden_ptrs[i],  /* output (normalized) */
+                (const void *)(uintptr_t)ar->partial_ptrs[i],
+                (const void *)(uintptr_t)ar->partial_ptrs[p0],
+                (const void *)(uintptr_t)ar->partial_ptrs[p1],
+                (const void *)(uintptr_t)ar->partial_ptrs[p2],
+                (const void *)(uintptr_t)ar->rmsnorm_weight_ptrs[i],
+                n,
+                1,  /* batch_size */
+                ar->eps,
+                (void *)(uintptr_t)ar->allreduce_streams[i]
+            );
+            if (err) return err;
+        }
+
+        /* Step 4: Record AR done events on each GPU's AR stream */
+        for (i = tp - 1; i >= 0; i--) {
+            plan->hipSetDevice_fn(ar->device_ids[i]);
+            plan->hipEventRecord_fn(
+                (void *)(uintptr_t)ar->ar_done_events[i],
+                (void *)(uintptr_t)ar->allreduce_streams[i]);
+        }
+
+        return 0;
+    }
+
     /* Kernel P2P only implemented for TP=4 */
     if (tp != 4 || ar->kernel_p2p_tp4_fn == NULL) {
         return do_allreduce_async(ar, plan);
     }
-
-    int i, j, err;
-    uint32_t n = ar->num_elems;
 
     /* Step 1: Record compute events on each GPU */
     for (i = tp - 1; i >= 0; i--) {
@@ -458,15 +550,22 @@ static int do_allreduce_kernel_p2p(CAllreduceSpec *ar, CDispatchPlan *plan)
 /*
  * dispatch_allreduce: dispatch allreduce using the appropriate method.
  *
- * Checks use_kernel_p2p flag in the CAllreduceSpec and routes to either:
- *   - do_allreduce_kernel_p2p: kernel P2P (each GPU reads peers via BAR1)
- *   - do_allreduce_async:      star topology (gather + reduce + broadcast)
+ * Checks use_fused_kernel, use_kernel_p2p flags in the CAllreduceSpec and routes to:
+ *   - do_allreduce_kernel_p2p with fused kernel: fused allreduce+RMSNorm
+ *   - do_allreduce_kernel_p2p:                   kernel P2P (each GPU reads peers via BAR1)
+ *   - do_allreduce_async:                        star topology (gather + reduce + broadcast)
  */
 static int dispatch_allreduce(CAllreduceSpec *ar, CDispatchPlan *plan)
 {
+    /* Fused kernel mode takes priority */
+    if (ar->use_fused_kernel && ar->kernel_p2p_fused_tp4_fn != NULL && ar->tp_size == 4) {
+        return do_allreduce_kernel_p2p(ar, plan);
+    }
+    /* Regular kernel P2P mode */
     if (ar->use_kernel_p2p && ar->kernel_p2p_tp4_fn != NULL && ar->tp_size == 4) {
         return do_allreduce_kernel_p2p(ar, plan);
     }
+    /* Fall back to star topology */
     return do_allreduce_async(ar, plan);
 }
 
@@ -479,6 +578,17 @@ static int dispatch_allreduce(CAllreduceSpec *ar, CDispatchPlan *plan)
  *   seq_len:    decode attention seq_len = kv_cache.current_len + 1
  *
  * Returns: 0 on success, non-zero HIP error code on failure.
+ *
+ * Fused kernel mode (use_fused_kernel=1 in CAllreduceSpec):
+ *   When the FFN allreduce uses the fused kernel, it performs:
+ *   - P2P allreduce + RMSNorm in one kernel launch
+ *   - The output is already RMSNorm-normalized
+ *   - The next layer's attn_rmsnorm is skipped (already done by fused kernel)
+ *   
+ *   When the attention allreduce uses the fused kernel:
+ *   - P2P allreduce + RMSNorm in one kernel launch  
+ *   - The output is already RMSNorm-normalized
+ *   - The ffn_rmsnorm is skipped (already done by fused kernel)
  */
 int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
 {
@@ -496,6 +606,11 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
     int use_overlap = plan->use_stream_overlap;
     int layer_idx, engine_idx;
     int err = 0;
+    
+    /* Track whether previous allreduce used fused kernel.
+     * If attn_ar used fused, skip ffn_rmsnorm.
+     * If ffn_ar used fused, skip next layer's attn_rmsnorm. */
+    int prev_ffn_used_fused = 0;
 
     /* Clear any stale HIP errors */
     if (plan->hipGetLastError_fn) {
@@ -518,9 +633,11 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
 
             plan->hipSetDevice_fn(attn_ar->device_ids[engine_idx]);
 
-            /* RMSNorm */
-            err = launch_kernel(&es->attn_rmsnorm, plan);
-            if (err) return err;
+            /* RMSNorm: skip if previous FFN allreduce used fused kernel */
+            if (!prev_ffn_used_fused) {
+                err = launch_kernel(&es->attn_rmsnorm, plan);
+                if (err) return err;
+            }
 
             if (es->layer_type == 0) {
                 /* ---- Full attention ---- */
@@ -610,13 +727,23 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
             wait_for_allreduce(attn_ar, plan);
         }
 
+        /* Track whether attention allreduce used fused kernel */
+        int attn_used_fused = (attn_ar->use_fused_kernel && 
+                                attn_ar->kernel_p2p_fused_tp4_fn != NULL &&
+                                attn_ar->tp_size == 4);
+
         /* Per-engine FFN kernels */
         for (engine_idx = 0; engine_idx < num_engines; engine_idx++) {
             CEngineLayerSpec *es =
                 &all_specs[layer_idx * num_engines + engine_idx];
             plan->hipSetDevice_fn(ffn_ar->device_ids[engine_idx]);
-            err = launch_kernel(&es->ffn_rmsnorm, plan);
-            if (err) return err;
+            
+            /* FFN RMSNorm: skip if attention allreduce used fused kernel */
+            if (!attn_used_fused) {
+                err = launch_kernel(&es->ffn_rmsnorm, plan);
+                if (err) return err;
+            }
+            
             err = launch_kernel(&es->ffn_gate_up_silu, plan);
             if (err) return err;
             err = launch_kernel(&es->ffn_down, plan);
@@ -628,6 +755,11 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
             err = dispatch_allreduce(ffn_ar, plan);
             if (err) return err;
         }
+        
+        /* Track whether FFN allreduce used fused kernel (affects next layer) */
+        prev_ffn_used_fused = (ffn_ar->use_fused_kernel && 
+                                ffn_ar->kernel_p2p_fused_tp4_fn != NULL &&
+                                ffn_ar->tp_size == 4);
     }
 
     /* Wait for the last FFN allreduce */

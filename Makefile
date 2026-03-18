@@ -79,13 +79,33 @@ $(BUILD_DIR)/probes $(BUILD_DIR)/bench $(BUILD_DIR)/kernels:
 	mkdir -p $@
 
 # ============================================================
+# HIP Kernel Libraries (shared libraries for ctypes loading)
+# ============================================================
+
+KERNEL_HIP_SRCS = $(wildcard src/kernels/kernel_*.hip)
+KERNEL_SO = $(patsubst src/kernels/%.hip,$(BUILD_DIR)/kernels/%.so,$(KERNEL_HIP_SRCS))
+
+.PHONY: hip_kernels
+hip_kernels: $(KERNEL_SO)
+
+$(BUILD_DIR)/kernels/%.so: src/kernels/%.hip | $(BUILD_DIR)/kernels
+	$(HIPCC) $(HIPCC_FLAGS) -shared -fPIC -o $@ $<
+	@echo "Built $@"
+
+# ============================================================
 # C Extensions (host-side C shared libraries)
 # ============================================================
 
 .PHONY: c_extensions
-c_extensions: src/runtime/c_graph_dispatch.so
+c_extensions: src/runtime/c_graph_dispatch.so src/runtime/c_dispatch.so
 
 src/runtime/c_graph_dispatch.so: src/runtime/c_graph_dispatch.c
+	gcc -O3 -shared -fPIC -I$(ROCM_PATH)/include \
+	    -L$(ROCM_PATH)/lib -lamdhip64 \
+	    -o $@ $<
+	@echo "Built $@"
+
+src/runtime/c_dispatch.so: src/runtime/c_dispatch.c
 	gcc -O3 -shared -fPIC -I$(ROCM_PATH)/include \
 	    -L$(ROCM_PATH)/lib -lamdhip64 \
 	    -o $@ $<
@@ -97,7 +117,7 @@ src/runtime/c_graph_dispatch.so: src/runtime/c_graph_dispatch.c
 
 .PHONY: all clean
 
-all: probes bench kernels c_extensions
+all: probes bench kernels hip_kernels c_extensions
 
 clean:
 	rm -rf $(BUILD_DIR)
