@@ -81,6 +81,8 @@ class KVCache:
     
     Supports batched decoding with per-sequence position tracking.
     Layout: [num_layers, batch_size, max_seq, local_kv_heads, head_dim] FP16
+    For each layer, batches are stored consecutively, and within each batch,
+    sequence positions are stored consecutively.
     """
 
     def __init__(self, config: QwenConfig, max_seq_len: int, device: GPUDevice,
@@ -98,9 +100,14 @@ class KVCache:
 
         # K cache: [num_full_layers, batch_size, max_seq, local_kv_heads, head_dim] FP16
         self.local_num_kv_heads = config.num_key_value_heads // tp_size
-        # Stride per sequence position: [batch, local_kv_heads, head_dim] * 2 bytes
-        self.pos_stride = self.batch_size * self.local_num_kv_heads * self.config.head_dim * 2
-        per_layer = max_seq_len * self.pos_stride
+        # Size of one position for one batch: [local_kv_heads, head_dim] * 2 bytes
+        self.pos_size_per_batch = self.local_num_kv_heads * self.config.head_dim * 2
+        # Stride between consecutive positions within a batch
+        self.pos_stride = self.pos_size_per_batch
+        # Stride between batches (all positions for one batch)
+        self.batch_stride = max_seq_len * self.pos_stride
+        # Size per layer
+        per_layer = self.batch_size * self.batch_stride
         self.k_size = self.num_full_layers * per_layer
         self.v_size = self.k_size
 
@@ -114,37 +121,44 @@ class KVCache:
         return self.full_layer_indices.index(layer_idx)
 
     def layer_k_ptr(self, layer_idx: int, batch_idx: int = 0) -> int:
-        """Get K cache pointer for a layer and batch index.
+        """Get K cache BASE pointer for a layer and batch index.
+        
+        The base pointer points to position 0 for the given batch.
+        The attention kernel reads positions 0..seq_len-1 consecutively from this base.
         
         Args:
             layer_idx: Layer index
             batch_idx: Batch index (0..batch_size-1), defaults to 0 for single-sequence
             
         Returns:
-            GPU pointer to start of K cache for this layer and batch
+            GPU pointer to start of K cache for this layer and batch (position 0)
         """
         slot = self._full_layer_slot(layer_idx)
-        layer_offset = slot * self.max_seq_len * self.pos_stride
-        batch_offset = batch_idx * self.local_num_kv_heads * self.config.head_dim * 2
+        layer_offset = slot * self.batch_size * self.batch_stride
+        batch_offset = batch_idx * self.batch_stride
         return self.d_k + layer_offset + batch_offset
 
     def layer_v_ptr(self, layer_idx: int, batch_idx: int = 0) -> int:
-        """Get V cache pointer for a layer and batch index.
+        """Get V cache BASE pointer for a layer and batch index.
+        
+        The base pointer points to position 0 for the given batch.
         
         Args:
             layer_idx: Layer index
             batch_idx: Batch index (0..batch_size-1), defaults to 0 for single-sequence
             
         Returns:
-            GPU pointer to start of V cache for this layer and batch
+            GPU pointer to start of V cache for this layer and batch (position 0)
         """
         slot = self._full_layer_slot(layer_idx)
-        layer_offset = slot * self.max_seq_len * self.pos_stride
-        batch_offset = batch_idx * self.local_num_kv_heads * self.config.head_dim * 2
+        layer_offset = slot * self.batch_size * self.batch_stride
+        batch_offset = batch_idx * self.batch_stride
         return self.d_v + layer_offset + batch_offset
 
     def get_kv_ptr(self, layer_idx: int, position: int, batch_idx: int = 0):
         """Get K and V cache pointers for a specific position and batch.
+        
+        Used for writing a single position's KV data.
         
         Args:
             layer_idx: Layer index
@@ -155,8 +169,8 @@ class KVCache:
             Tuple of (k_ptr, v_ptr) GPU pointers
         """
         slot = self._full_layer_slot(layer_idx)
-        layer_offset = slot * self.max_seq_len * self.pos_stride
-        batch_offset = batch_idx * self.local_num_kv_heads * self.config.head_dim * 2
+        layer_offset = slot * self.batch_size * self.batch_stride
+        batch_offset = batch_idx * self.batch_stride
         pos_offset = position * self.pos_stride
         base_offset = layer_offset + batch_offset + pos_offset
         return (self.d_k + base_offset, self.d_v + base_offset)
@@ -171,12 +185,12 @@ class KVCache:
             batch_idx: Batch index (0..batch_size-1)
         """
         slot = self._full_layer_slot(layer_idx)
-        kv_size = self.local_num_kv_heads * self.config.head_dim * 2
+        kv_size = self.pos_size_per_batch
 
-        layer_offset = slot * self.max_seq_len * self.pos_stride
-        batch_offset = batch_idx * self.local_num_kv_heads * self.config.head_dim * 2
+        layer_offset = slot * self.batch_size * self.batch_stride
+        batch_offset = batch_idx * self.batch_stride
         pos_offset = self.current_len * self.pos_stride
-        base_offset = (layer_offset + batch_offset + pos_offset)
+        base_offset = layer_offset + batch_offset + pos_offset
 
         self.device._ensure_device()
         self.device.hip.memcpy_h2d(self.d_k + base_offset, k_data, kv_size)
@@ -192,12 +206,12 @@ class KVCache:
             batch_idx: Batch index (0..batch_size-1)
         """
         slot = self._full_layer_slot(layer_idx)
-        kv_size = self.local_num_kv_heads * self.config.head_dim * 2
+        kv_size = self.pos_size_per_batch
 
-        layer_offset = slot * self.max_seq_len * self.pos_stride
-        batch_offset = batch_idx * self.local_num_kv_heads * self.config.head_dim * 2
+        layer_offset = slot * self.batch_size * self.batch_stride
+        batch_offset = batch_idx * self.batch_stride
         pos_offset = self.current_len * self.pos_stride
-        base_offset = (layer_offset + batch_offset + pos_offset)
+        base_offset = layer_offset + batch_offset + pos_offset
 
         self.device._ensure_device()
         self.device.hip.memcpy_d2d(self.d_k + base_offset, d_k_src, kv_size)
