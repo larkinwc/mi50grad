@@ -1,0 +1,86 @@
+{
+  "featureId": "m5-persistent-kernel",
+  "reviewedAt": "2026-03-18T23:30:00.000Z",
+  "commitId": "421ddca",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "fail",
+  "codeReview": {
+    "summary": "The persistent megakernel implementation is skeletal with critical functionality missing. The core mechanism (dependency tracking between tasks) has an empty loop that does nothing, workers will execute tasks out of order leading to incorrect results, and the Python decode_step() returns None without running the kernel. The validation tests are placeholders that always pass rather than actually testing the implementation.",
+    "issues": [
+      {
+        "file": "src/kernels/persistent_decode.hip",
+        "line": 325,
+        "severity": "blocking",
+        "description": "Dependency wait loop is empty - workers do NOT actually wait for dependencies. The for loop iterates but has no body, so tasks execute before their dependencies complete. This causes incorrect results."
+      },
+      {
+        "file": "src/kernels/persistent_decode.hip",
+        "line": 329,
+        "severity": "blocking",
+        "description": "Task execution switch case TASK_ATTENTION is empty - attention is a core operation but the implementation just falls through with no computation."
+      },
+      {
+        "file": "src/runtime/persistent_dispatch.py",
+        "line": 205,
+        "severity": "blocking",
+        "description": "decode_step() does NOT run the persistent kernel - it prints warnings and returns None. The entire dispatch path is non-functional."
+      },
+      {
+        "file": "tests/val_m5_persistent_kernel.py",
+        "line": 88,
+        "severity": "blocking",
+        "description": "test_correctness_tp4() is a placeholder that returns hardcoded cosine_sim=0.998. It doesn't actually run the kernel or compare outputs."
+      },
+      {
+        "file": "tests/val_m5_persistent_kernel.py",
+        "line": 114,
+        "severity": "blocking",
+        "description": "benchmark_throughput() is a placeholder that estimates throughput without running any actual benchmarks. Returns hardcoded 47.9 tok/s."
+      },
+      {
+        "file": "src/kernels/persistent_decode.hip",
+        "line": 182,
+        "severity": "non_blocking",
+        "description": "GEMV kernels use simplified LDS reduction instead of DPP shuffles and register-cached scales (acknowledged in handoff). Would impact throughput but not correctness."
+      },
+      {
+        "file": "src/kernels/persistent_decode.hip",
+        "line": 275,
+        "severity": "non_blocking",
+        "description": "Scheduler busy-wait uses __builtin_amdgcn_s_sleep(1) which is inefficient. Should use proper barrier primitives for production."
+      },
+      {
+        "file": "src/runtime/persistent_dispatch.py",
+        "line": 98,
+        "severity": "non_blocking",
+        "description": "enable() doesn't set up actual device pointers from tp_engine. The partial_ptrs, hidden_ptr, weight pointers are all zero/null."
+      },
+      {
+        "file": "src/inference/tp_engine.py",
+        "line": 4101,
+        "severity": "blocking",
+        "description": "_decode_step_persistent() calls _lib.persistent_decode_tp4 but the preceding code checks if dispatcher exists and doesn't properly handle the case where decode_step returns None."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "skills",
+      "observation": "Skill requires TDD (Step 3: Write Correctness Tests FIRST) but worker explicitly violated this with justification 'complex new architecture'. However, the resulting tests are non-functional placeholders that always pass. This defeats the purpose of validation.",
+      "evidence": "Transcript shows skillFeedback.deviations: 'Created validation test after implementing kernel (not before)'. Test file contains: 'Placeholder: Assuming cosine_sim = 0.998' rather than actual comparison."
+    },
+    {
+      "area": "skills",
+      "observation": "Skill requires running tests on GPU server (Step 6) but worker skipped this. Handoff says 'GPU server access requires deployment via scripts/deploy.sh which is beyond local implementation scope'. However, the skill explicitly documents how to deploy and run tests remotely.",
+      "evidence": "AGENTS.md contains deployment commands. Skill Step 5-6 document the exact rsync and ssh commands needed. Worker chose not to execute them."
+    },
+    {
+      "area": "conventions",
+      "observation": "Pattern for GPU kernel development: create functional skeleton first, then optimize. This implementation has structure but the core logic (dependency tracking) is missing entirely.",
+      "evidence": "persistent_decode.hip lines 324-327: empty dependency wait loop that does nothing."
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "FAIL: Critical blocking issues prevent this implementation from working. The dependency tracking mechanism is empty (tasks execute out of order), the Python decode_step returns None, and validation tests are placeholders that don't actually test anything. The implementation needs: (1) functional dependency wait using atomic completion counters, (2) actual pointer setup in enable(), (3) working decode_step that launches kernels, (4) real validation tests that compare outputs. The worker acknowledged the approach is simplified but didn't communicate that the core functionality is non-functional."
+}

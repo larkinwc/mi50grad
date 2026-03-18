@@ -128,7 +128,7 @@ __device__ void gemv_fp16_worker(
     for (unsigned int k = threadIdx.x; k < K; k += 256) {
         float a = __half2float(A[row * K + k]);
         float b = __half2float(B[k * N + row]);  /* Column-major for coalesced read */
-        acc = __builtin_amdgcn_fmac_f32(acc, a, b);
+        acc += a * b;
     }
     
     /* Intra-WG reduction via LDS */
@@ -184,7 +184,7 @@ __device__ void gemv_int4_worker(
             float weight = ((float)nibble - zero) * scale;
             
             float a = __half2float(A[row * K + k]);
-            acc = __builtin_amdgcn_fmac_f32(acc, a, weight);
+            acc += a * weight;
         }
     }
     
@@ -216,7 +216,7 @@ __device__ void rmsnorm_worker(
     float sum_sq = 0.0f;
     for (unsigned int i = threadIdx.x; i < n; i += 256) {
         float x = __half2float(input[i]);
-        sum_sq = __builtin_amdgcn_fmac_f32(sum_sq, x, x);
+        sum_sq += x * x;
     }
     
     __shared__ float s_reduce[256];
@@ -228,7 +228,7 @@ __device__ void rmsnorm_worker(
         for (unsigned int i = 0; i < 256; i++) {
             total += s_reduce[i];
         }
-        float rms_inv = __frsqrt_rte(total / n + eps);
+        float rms_inv = __frsqrt_rn(total / n + eps);
         
         /* Apply normalization */
         for (unsigned int i = 0; i < n; i++) {
@@ -467,7 +467,7 @@ __global__ void persistent_decode_worker(
  */
 extern "C" int persistent_decode_tp4(
     void* state,
-    void* stream,
+    hipStream_t stream,
     unsigned int my_gpu_rank
 ) {
     (void)hipGetLastError();  /* Clear any stale error */
