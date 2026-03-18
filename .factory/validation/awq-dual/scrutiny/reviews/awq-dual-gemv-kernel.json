@@ -1,0 +1,21 @@
+{
+  "featureId": "awq-dual-gemv-kernel",
+  "reviewedAt": "2026-03-18T10:20:00Z",
+  "commitId": "421e0d3",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "The AWQ dual GEMV kernel implementation is correct and well-documented. The kernel correctly implements AWQ dequantization (w = q * scale) without zero-point subtraction, saving 8 v_sub_f32 instructions per uint32 and eliminating zeros tensor loads. The persistent buffer + atomic counter protocol is correctly implemented for race-free multi-tile completion.",
+    "issues": []
+  },
+  "sharedStateObservations": [
+    {
+      "area": "knowledge",
+      "observation": "The AWQ dual GEMV kernel follows the same persistent buffer + atomic counter protocol as the GPTQ dual kernel. This pattern could be documented in the library for future kernel developers.",
+      "evidence": "gemv_int4_dual_awq.hip:115-130 shows the same atomic counter protocol as gemv_int4_dual.hip"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS: The AWQ dual GEMV kernel implementation is correct, well-tested, and achieves the expected 2-5% throughput improvement over GPTQ dual. Numerical equivalence verified with max_abs_error < 2.5e-4 (well under 1e-2 threshold). Multi-call correctness verified for persistent buffer reset."
+}
