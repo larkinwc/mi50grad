@@ -333,7 +333,7 @@ def mode_allreduce_opt() -> Dict:
     
     # Verify allreduce configuration
     print(f"  Kernel P2P allreduce: {tp_engine._p2p_ar is not None}")
-    print(f"  C dispatch: {tp_engine._c_dispatch}")
+    print(f"  C dispatch: {tp_engine._c_dispatch_enabled}")
     
     # Benchmark
     result = benchmark_throughput(tp_engine, config)

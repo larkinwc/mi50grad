@@ -1,0 +1,111 @@
+{
+  "milestone": "final-integration",
+  "round": 1,
+  "status": "partial",
+  "assertionsSummary": {
+    "total": 15,
+    "passed": 10,
+    "failed": 4,
+    "blocked": 1
+  },
+  "passedAssertions": [
+    "VAL-KERN-005",
+    "VAL-SPEC-001",
+    "VAL-SPEC-002",
+    "VAL-SPEC-003",
+    "VAL-SPEC-004",
+    "VAL-SPEC-005",
+    "VAL-FINAL-001",
+    "VAL-FINAL-002",
+    "VAL-FINAL-003",
+    "VAL-CROSS-003"
+  ],
+  "failedAssertions": [
+    {
+      "id": "VAL-BATCH-001",
+      "reason": "Batch engine memory allocation failed - BatchTPInferenceEngine not fully functional"
+    },
+    {
+      "id": "VAL-BATCH-002",
+      "reason": "Batch engine memory allocation failed - BatchTPInferenceEngine not fully functional"
+    },
+    {
+      "id": "VAL-BATCH-003",
+      "reason": "Batch engine memory allocation failed - BatchTPInferenceEngine not fully functional"
+    },
+    {
+      "id": "VAL-BATCH-004",
+      "reason": "Batch engine memory allocation failed - BatchTPInferenceEngine not fully functional"
+    },
+    {
+      "id": "VAL-BATCH-005",
+      "reason": "Batch engine memory allocation failed - BatchTPInferenceEngine not fully functional"
+    },
+    {
+      "id": "VAL-BATCH-006",
+      "reason": "Batch engine memory allocation failed - BatchTPInferenceEngine not fully functional"
+    },
+    {
+      "id": "VAL-CROSS-002",
+      "reason": "Batch + speculative decoding combined test failed - batch engine not functional"
+    }
+  ],
+  "blockedAssertions": [
+    {
+      "id": "VAL-CROSS-001",
+      "blockedBy": "No native AWQ model available"
+    }
+  ],
+  "appliedUpdates": [],
+  "previousRound": null,
+  "testExecutionSummary": {
+    "bench_tp4_sprint5.py": {
+      "status": "passed",
+      "throughput_tps": 44.41,
+      "threshold_tps": 38.0,
+      "evidence": "GEMV v6 enabled for N<=4096, v5 fallback for N>4096. Kernel P2P allreduce active."
+    },
+    "bench_tp4_sprint4.py": {
+      "status": "passed",
+      "tests_passed": "7/7",
+      "throughput_tps": {
+        "cached_stream": 32.4,
+        "c_dispatch_p2p": 35.4,
+        "global_graph": 35.5
+      },
+      "cosine_sim_min": 0.994816
+    },
+    "test_ngram_speculative.py": {
+      "status": "passed",
+      "tests_passed": "all",
+      "greedy_equivalence": true,
+      "acceptance_rate": 1.0
+    },
+    "test_eagle_speculative.py": {
+      "status": "passed",
+      "tests_passed": "all",
+      "greedy_equivalence": true,
+      "acceptance_rate": 1.0
+    },
+    "test_val_spec.py": {
+      "status": "passed",
+      "assertions_passed": "5/5",
+      "throughput_tps": 44.59
+    },
+    "test_batch_engine.py": {
+      "status": "failed",
+      "error": "HIP error 2: hipMalloc(62914560) - memory allocation failure"
+    }
+  },
+  "throughputResults": {
+    "sprint5_tps": 44.41,
+    "sprint4_baseline_tps": 38.3,
+    "improvement_factor": 1.16,
+    "single_gpu_tps": 22.1
+  },
+  "recommendations": [
+    "Batch>1 support requires fixing BatchTPInferenceEngine memory allocation",
+    "AWQ E2E testing requires finding a true AWQ-format model (current model is GPTQ)",
+    "Speculative decoding infrastructure is ready - TP=4 engine integration pending"
+  ]
+}
