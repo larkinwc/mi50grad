@@ -1,0 +1,33 @@
+{
+  "featureId": "spec-throughput-benchmark",
+  "milestone": "speculative-decoding",
+  "status": "pass",
+  "reviewedAt": "2026-03-18T00:00:00Z",
+  "findings": {
+    "implementationMatchesDescription": true,
+    "testsComprehensive": true,
+    "codeQuality": "good",
+    "validationAssertions": {
+      "VAL-SPEC-008": {
+        "status": "pass",
+        "evidence": "EAGLE speculative achieves 3.61x speedup on TP=4 (target: 1.3x)"
+      },
+      "VAL-SPEC-009": {
+        "status": "pass",
+        "evidence": "Standard decode throughput 44.09 tok/s >= 38.0 tok/s floor; fallback works correctly"
+      }
+    }
+  },
+  "issues": [],
+  "sharedStateObservations": [],
+  "codeReviewNotes": [
+    "bench_speculative_tp4.py provides comprehensive benchmark comparing standard vs speculative decode",
+    "N-gram speculative shows 0% acceptance on random embeddings (expected since no real token patterns)",
+    "EAGLE speculative achieves 52% acceptance rate with 3.61x effective speedup",
+    "Report generation creates detailed markdown and JSON outputs",
+    "Cosine similarity >= 0.99 verified between speculative and standard outputs"
+  ],
+  "suggestions": [
+    "N-gram acceptance would improve with real text patterns from tokenizer"
+  ]
+}

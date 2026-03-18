@@ -194,7 +194,15 @@ def benchmark_standard_decode(tp_engine, config, steps: int = BENCH_STEPS,
         per_token_latencies.append((step_end - step_start) * 1000)  # ms
         
         # Collect hidden state from engine 0 for comparison
-        hidden_states.append(tp_engine.engines[0].d_hidden.copy())
+        # d_hidden is a GPU pointer, need to download
+        hidden = np.frombuffer(
+            tp_engine.engines[0].device.download(
+                tp_engine.engines[0].d_hidden, 
+                config.hidden_size * 2
+            ), 
+            dtype=np.float16
+        ).copy()
+        hidden_states.append(hidden)
     
     tp_engine.synchronize()
     t1 = time.perf_counter()
@@ -327,7 +335,15 @@ def benchmark_speculative_ngram(tp_engine, config, steps: int = BENCH_STEPS,
         effective_latency = (step_end - step_start) * 1000
         per_token_latencies.append(effective_latency)
         
-        hidden_states.append(tp_engine.engines[0].d_hidden.copy())
+        # d_hidden is a GPU pointer, need to download
+        hidden = np.frombuffer(
+            tp_engine.engines[0].device.download(
+                tp_engine.engines[0].d_hidden, 
+                config.hidden_size * 2
+            ), 
+            dtype=np.float16
+        ).copy()
+        hidden_states.append(hidden)
     
     tp_engine.synchronize()
     t1 = time.perf_counter()
@@ -444,7 +460,15 @@ def benchmark_speculative_eagle(tp_engine, config, steps: int = BENCH_STEPS,
         effective_latency = (step_end - step_start) * 1000
         per_token_latencies.append(effective_latency)
         
-        hidden_states.append(tp_engine.engines[0].d_hidden.copy())
+        # d_hidden is a GPU pointer, need to download
+        hidden = np.frombuffer(
+            tp_engine.engines[0].device.download(
+                tp_engine.engines[0].d_hidden, 
+                config.hidden_size * 2
+            ), 
+            dtype=np.float16
+        ).copy()
+        hidden_states.append(hidden)
     
     tp_engine.synchronize()
     t1 = time.perf_counter()
@@ -522,7 +546,15 @@ def test_fallback_to_standard(tp_engine, config) -> Dict:
         
         step_end = time.perf_counter()
         per_token_latencies.append((step_end - step_start) * 1000)
-        hidden_states.append(tp_engine.engines[0].d_hidden.copy())
+        # d_hidden is a GPU pointer, need to download
+        hidden = np.frombuffer(
+            tp_engine.engines[0].device.download(
+                tp_engine.engines[0].d_hidden, 
+                config.hidden_size * 2
+            ), 
+            dtype=np.float16
+        ).copy()
+        hidden_states.append(hidden)
     
     tp_engine.synchronize()
     t1 = time.perf_counter()
@@ -530,10 +562,14 @@ def test_fallback_to_standard(tp_engine, config) -> Dict:
     elapsed = t1 - t0
     tok_s = steps / elapsed
     ms_per_tok = (elapsed / steps) * 1000
+    median_latency = np.median(per_token_latencies)
+    p99_latency = np.percentile(per_token_latencies, 99)
     
     result = {
         'throughput_tps': tok_s,
         'latency_ms_per_tok': ms_per_tok,
+        'median_latency_ms': median_latency,
+        'p99_latency_ms': p99_latency,
         'elapsed_seconds': elapsed,
         'total_drafts': 0,
         'total_accepted': 0,
