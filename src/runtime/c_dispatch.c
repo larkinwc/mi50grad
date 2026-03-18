@@ -75,13 +75,15 @@ typedef int (*kernel_p2p_tp4_fn_t)(
     void* stream  /* hipStream_t */
 );
 
-/* kernel_p2p_allreduce_rmsnorm_tp4(output, partial_local, peer0, peer1, peer2,
+/* kernel_p2p_allreduce_rmsnorm_tp4(output, hidden, partial_local, peer0, peer1, peer2,
  *                                    weight, dim, batch, eps, stream)
  * Host-callable C wrapper from kernel_p2p_allreduce_rmsnorm.so.
  * Fused P2P allreduce + RMSNorm kernel.
+ * hidden: hidden residual input (ADD to sum of partials)
  */
 typedef int (*kernel_p2p_fused_tp4_fn_t)(
     void* output,
+    const void* hidden,
     const void* partial_local,
     const void* partial_peer0,
     const void* partial_peer1,
@@ -459,6 +461,7 @@ static int do_allreduce_kernel_p2p(CAllreduceSpec *ar, CDispatchPlan *plan)
             int p2 = (i + 3) % 4;
             err = ar->kernel_p2p_fused_tp4_fn(
                 (void *)(uintptr_t)ar->hidden_ptrs[i],  /* output (normalized) */
+                (const void *)(uintptr_t)ar->hidden_ptrs[i],  /* hidden input (residual) */
                 (const void *)(uintptr_t)ar->partial_ptrs[i],
                 (const void *)(uintptr_t)ar->partial_ptrs[p0],
                 (const void *)(uintptr_t)ar->partial_ptrs[p1],

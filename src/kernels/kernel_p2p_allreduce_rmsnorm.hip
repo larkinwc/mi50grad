@@ -38,10 +38,11 @@
  * kernel_p2p_allreduce_rmsnorm_tp4_kernel:
  *
  *   fused_op[i] = rmsnorm(
- *     partial_local[i] + partial_peer0[i] + partial_peer1[i] + partial_peer2[i]
+ *     hidden[i] + partial_local[i] + partial_peer0[i] + partial_peer1[i] + partial_peer2[i]
  *   ) * weight[i]
  *
  * Runs on EACH GPU simultaneously. Each GPU:
+ *   - hidden:          hidden residual input (local memory)
  *   - partial_local:   its own partial GEMV result (local memory)
  *   - partial_peer0/1/2: the other 3 GPUs' partial buffers (P2P pointers via BAR1)
  *   - weight:          RMSNorm weight buffer (local memory)
@@ -56,6 +57,7 @@
  *   Scalar tail for elements [(dim/8)*8, dim-1] when dim%8 != 0.
  *
  * @param output        Output buffer (RMSNorm result), one per batch item
+ * @param hidden        Hidden residual input (ADD to sum of partials)
  * @param partial_local This GPU's partial buffer
  * @param partial_peer0 First peer GPU's partial buffer (P2P pointer)
  * @param partial_peer1 Second peer GPU's partial buffer (P2P pointer)
@@ -67,6 +69,7 @@
 __attribute__((amdgpu_flat_work_group_size(256, 256)))
 __global__ void kernel_p2p_allreduce_rmsnorm_tp4_kernel(
     __half* __restrict__ output,
+    const __half* hidden,  // No __restrict__ - may alias with output
     const __half* __restrict__ partial_local,
     const __half* __restrict__ partial_peer0,
     const __half* __restrict__ partial_peer1,
@@ -79,6 +82,7 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp4_kernel(
     unsigned int lane   = threadIdx.x % 64;
 
     // Pointer to this batch item's data
+    const __half* h_ptr   = hidden + blockIdx.x * dim;
     const __half* p_local = partial_local + blockIdx.x * dim;
     const __half* p_peer0 = partial_peer0 + blockIdx.x * dim;
     const __half* p_peer1 = partial_peer1 + blockIdx.x * dim;
@@ -94,12 +98,15 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp4_kernel(
     // Vectorized path: thread t covers {t*8, t*8+2048, t*8+4096, ...}
     // while t*8 + k*2048 + 7 < dim
     for (unsigned int i = threadIdx.x * 8; i + 7 < dim; i += 256 * 8) {
+        // Load 8 elements from hidden buffer
+        float4 h4 = *reinterpret_cast<const float4*>(h_ptr + i);
         // Load 8 elements from each partial buffer (float4 = 128-bit = 8 FP16)
         float4 pl4 = *reinterpret_cast<const float4*>(p_local + i);
         float4 p04 = *reinterpret_cast<const float4*>(p_peer0 + i);
         float4 p14 = *reinterpret_cast<const float4*>(p_peer1 + i);
         float4 p24 = *reinterpret_cast<const float4*>(p_peer2 + i);
 
+        const __half2* h_h2  = reinterpret_cast<const __half2*>(&h4);
         const __half2* pl_h2 = reinterpret_cast<const __half2*>(&pl4);
         const __half2* p0_h2 = reinterpret_cast<const __half2*>(&p04);
         const __half2* p1_h2 = reinterpret_cast<const __half2*>(&p14);
@@ -111,11 +118,14 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp4_kernel(
         #pragma unroll
         for (int k = 0; k < 4; k++) {
             // FP32 accumulation for each of the 8 elements
-            float v0 = __half2float(__low2half (pl_h2[k]))
+            // IMPORTANT: Add hidden residual to the sum of partials
+            float v0 = __half2float(__low2half (h_h2[k]))
+                     + __half2float(__low2half (pl_h2[k]))
                      + __half2float(__low2half (p0_h2[k]))
                      + __half2float(__low2half (p1_h2[k]))
                      + __half2float(__low2half (p2_h2[k]));
-            float v1 = __half2float(__high2half(pl_h2[k]))
+            float v1 = __half2float(__high2half(h_h2[k]))
+                     + __half2float(__high2half(pl_h2[k]))
                      + __half2float(__high2half(p0_h2[k]))
                      + __half2float(__high2half(p1_h2[k]))
                      + __half2float(__high2half(p2_h2[k]));
@@ -134,7 +144,9 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp4_kernel(
     {
         unsigned int vec_dim = (dim / 8) * 8;
         for (unsigned int i = vec_dim + threadIdx.x; i < dim; i += 256) {
-            float v = __half2float(p_local[i])
+            // Add hidden residual to sum of partials
+            float v = __half2float(h_ptr[i])
+                    + __half2float(p_local[i])
                     + __half2float(p_peer0[i])
                     + __half2float(p_peer1[i])
                     + __half2float(p_peer2[i]);
@@ -218,13 +230,14 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp4_kernel(
 /**
  * kernel_p2p_allreduce_rmsnorm_tp2_kernel:
  *
- *   fused_op[i] = rmsnorm(partial_local[i] + partial_peer0[i]) * weight[i]
+ *   fused_op[i] = rmsnorm(hidden[i] + partial_local[i] + partial_peer0[i]) * weight[i]
  *
  * Runs on BOTH GPUs simultaneously (TP=2).
  */
 __attribute__((amdgpu_flat_work_group_size(256, 256)))
 __global__ void kernel_p2p_allreduce_rmsnorm_tp2_kernel(
     __half* __restrict__ output,
+    const __half* hidden,  // No __restrict__ - may alias with output
     const __half* __restrict__ partial_local,
     const __half* __restrict__ partial_peer0,
     const __half* __restrict__ weight,
@@ -234,6 +247,7 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp2_kernel(
     unsigned int wf_id = threadIdx.x / 64;
     unsigned int lane   = threadIdx.x % 64;
 
+    const __half* h_ptr   = hidden + blockIdx.x * dim;
     const __half* p_local = partial_local + blockIdx.x * dim;
     const __half* p_peer0 = partial_peer0 + blockIdx.x * dim;
     __half* out           = output + blockIdx.x * dim;
@@ -242,9 +256,11 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp2_kernel(
     float sum_sq = 0.0f;
 
     for (unsigned int i = threadIdx.x * 8; i + 7 < dim; i += 256 * 8) {
+        float4 h4 = *reinterpret_cast<const float4*>(h_ptr + i);
         float4 pl4 = *reinterpret_cast<const float4*>(p_local + i);
         float4 p04 = *reinterpret_cast<const float4*>(p_peer0 + i);
 
+        const __half2* h_h2  = reinterpret_cast<const __half2*>(&h4);
         const __half2* pl_h2 = reinterpret_cast<const __half2*>(&pl4);
         const __half2* p0_h2 = reinterpret_cast<const __half2*>(&p04);
 
@@ -253,9 +269,11 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp2_kernel(
 
         #pragma unroll
         for (int k = 0; k < 4; k++) {
-            float v0 = __half2float(__low2half (pl_h2[k]))
+            float v0 = __half2float(__low2half (h_h2[k]))
+                     + __half2float(__low2half (pl_h2[k]))
                      + __half2float(__low2half (p0_h2[k]));
-            float v1 = __half2float(__high2half(pl_h2[k]))
+            float v1 = __half2float(__high2half(h_h2[k]))
+                     + __half2float(__high2half(pl_h2[k]))
                      + __half2float(__high2half(p0_h2[k]));
 
             sum_h2[k] = __halves2half2(__float2half(v0), __float2half(v1));
@@ -268,7 +286,9 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp2_kernel(
     {
         unsigned int vec_dim = (dim / 8) * 8;
         for (unsigned int i = vec_dim + threadIdx.x; i < dim; i += 256) {
-            float v = __half2float(p_local[i]) + __half2float(p_peer0[i]);
+            float v = __half2float(h_ptr[i])
+                    + __half2float(p_local[i])
+                    + __half2float(p_peer0[i]);
             out[i] = __float2half(v);
             sum_sq += v * v;
         }
@@ -346,6 +366,7 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp2_kernel(
  *
  * Args:
  *   output:        Output buffer (RMSNorm result), one per batch item
+ *   hidden:        Hidden residual input (ADD to sum of partials)
  *   partial_local: This GPU's partial buffer
  *   partial_peer0: First peer GPU's partial buffer (P2P pointer)
  *   partial_peer1: Second peer GPU's partial buffer (P2P pointer)
@@ -358,6 +379,7 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp2_kernel(
  */
 extern "C" int kernel_p2p_allreduce_rmsnorm_tp4(
     void* output,
+    const void* hidden,
     const void* partial_local,
     const void* partial_peer0,
     const void* partial_peer1,
@@ -372,6 +394,7 @@ extern "C" int kernel_p2p_allreduce_rmsnorm_tp4(
     hipLaunchKernelGGL(kernel_p2p_allreduce_rmsnorm_tp4_kernel,
                        dim3(batch_size), dim3(256), 0, stream,
                        (__half*)output,
+                       (const __half*)hidden,
                        (const __half*)partial_local,
                        (const __half*)partial_peer0,
                        (const __half*)partial_peer1,
@@ -388,6 +411,7 @@ extern "C" int kernel_p2p_allreduce_rmsnorm_tp4(
  */
 extern "C" int kernel_p2p_allreduce_rmsnorm_tp2(
     void* output,
+    const void* hidden,
     const void* partial_local,
     const void* partial_peer0,
     const void* weight,
@@ -400,6 +424,7 @@ extern "C" int kernel_p2p_allreduce_rmsnorm_tp2(
     hipLaunchKernelGGL(kernel_p2p_allreduce_rmsnorm_tp2_kernel,
                        dim3(batch_size), dim3(256), 0, stream,
                        (__half*)output,
+                       (const __half*)hidden,
                        (const __half*)partial_local,
                        (const __half*)partial_peer0,
                        (const __half*)weight,

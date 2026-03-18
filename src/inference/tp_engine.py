@@ -4707,9 +4707,10 @@ class TPInferenceEngine:
         if fused_so_path.exists():
             try:
                 fused_lib = ct.CDLL(str(fused_so_path))
-                # Set function signature
+                # Set function signature (includes hidden residual parameter)
                 fused_lib.kernel_p2p_allreduce_rmsnorm_tp4.argtypes = [
                     ct.c_void_p,  # output
+                    ct.c_void_p,  # hidden (residual input)
                     ct.c_void_p,  # partial_local
                     ct.c_void_p,  # partial_peer0
                     ct.c_void_p,  # partial_peer1
