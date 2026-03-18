@@ -1,6 +1,6 @@
 {
   "milestone": "awq-dual",
-  "round": 1,
+  "round": 3,
   "status": "partial",
   "assertionsSummary": {
     "total": 4,
@@ -16,21 +16,21 @@
   "blockedAssertions": [
     {
       "id": "VAL-AWQ-002",
-      "blockedBy": "Test design issue: test_awq_dual_dispatch.py creates engine without loading weights, so build_dispatch_cache() returns empty layer cache. Code inspection confirms correct implementation in engine.py lines 3455-3477."
+      "blockedBy": "No true AWQ model available. Model at /opt/models/Qwen3.5-27B-AWQ has qzeros tensors (GPTQ format). AWQ kernel selection code verified correct by code inspection (engine.py lines 3455-3477). Test test_awq_dual_dispatch.py fails due to test design issue (no weights loaded, empty layer cache). Kernel loads successfully: 'GEMV INT4 dual AWQ (fused gate+up+silu, no zero-point) loaded'. AWQ mode propagates to all 4 GPUs."
     },
     {
       "id": "VAL-AWQ-004",
-      "blockedBy": "AWQ model format detection: /opt/models/Qwen3.5-27B-AWQ is detected as 'gptq' format. Need true AWQ model (zeros=0) to validate E2E. Running AWQ kernel with GPTQ weights causes NaN/Inf."
+      "blockedBy": "No true AWQ model available. Model at /opt/models/Qwen3.5-27B-AWQ has qzeros tensors (GPTQ format). C dispatch integration code verified correct by code inspection. E2E validation blocked - running AWQ kernel mode with GPTQ weights causes NaN/Inf (AWQ kernel skips zero-point subtraction, GPTQ weights have non-zero zeros)."
     }
   ],
   "appliedUpdates": [
     {
       "target": "user-testing.md",
-      "description": "Added note about AWQ model format detection - need true AWQ model to test AWQ kernel E2E",
+      "description": "Updated note about AWQ model format detection - model at /opt/models/Qwen3.5-27B-AWQ has qzeros tensors, detected as GPTQ",
       "source": "flow-report"
     }
   ],
-  "previousRound": null,
+  "previousRound": ".factory/validation/awq-dual/user-testing/synthesis.json (round 2)",
   "testExecutionDetails": {
     "devServer": "root@192.168.1.198",
     "dockerImage": "mixa3607/rocm-gfx906:7.1.0-complete",
@@ -38,8 +38,7 @@
     "buildCommand": "make all",
     "testFiles": [
       "tests/test_awq_dual_gemv.py",
-      "tests/test_awq_dual_dispatch.py",
-      "tests/test_awq_e2e.py"
+      "tests/test_awq_dual_dispatch.py"
     ]
   },
   "keyFindings": {
@@ -55,11 +54,11 @@
     },
     "VAL-AWQ-003": {
       "result": "PASS",
-      "summary": "AWQ dual kernel shows 3.4-5.8% speedup over GPTQ dual kernel",
+      "summary": "AWQ dual kernel shows 2.6-4.7% speedup over GPTQ dual kernel",
       "metrics": {
-        "speedup_N11008": "1.034x",
-        "speedup_N13696": "1.037x",
-        "speedup_N17408": "1.058x",
+        "speedup_N11008": "1.026x",
+        "speedup_N13696": "1.029x",
+        "speedup_N17408": "1.047x",
         "target": ">= 1.02x"
       }
     }
@@ -67,13 +66,45 @@
   "recommendations": [
     {
       "priority": "high",
-      "description": "Obtain true AWQ model (with zeros=0 in quantization) to validate VAL-AWQ-002 and VAL-AWQ-004 E2E",
-      "rationale": "Current AWQ model directory is detected as GPTQ format; AWQ kernel mode with GPTQ weights causes NaN/Inf"
+      "description": "Obtain true AWQ model (with qweight/scales but no qzeros) to validate VAL-AWQ-002 and VAL-AWQ-004 E2E",
+      "rationale": "Current 'AWQ' model directory has qzeros tensors, making it GPTQ format. AWQ kernel mode with GPTQ weights produces NaN/Inf."
     },
     {
       "priority": "medium",
       "description": "Fix test_awq_dual_dispatch.py to load mock weights or use real model",
       "rationale": "Test creates engine without weights, leading to empty layer cache and false failures"
     }
-  ]
+  ],
+  "codeInspectionNotes": {
+    "VAL-AWQ-002": {
+      "file": "src/inference/engine.py",
+      "lines": "3455-3477",
+      "finding": "Correct implementation: when _awq_mode=True and _gemv_int4_dual_awq_fused is available, selects AWQ dual kernel (12 params, no zeros) instead of GPTQ dual kernel (14 params)"
+    },
+    "kernelLoading": {
+      "finding": "AWQ dual kernel loads successfully: 'GEMV INT4 dual AWQ (fused gate+up+silu, no zero-point) loaded'",
+      "propagation": "set_awq_mode(True) correctly propagates to all 4 TP engines"
+    }
+  },
+  "modelFormatVerification": {
+    "Qwen3.5-27B-AWQ": {
+      "has_qzeros": true,
+      "has_qweight": true,
+      "has_g_idx": false,
+      "detectedAs": "gptq",
+      "note": "Model labeled 'AWQ' is actually GPTQ format (has qzeros tensors)"
+    },
+    "Qwen3.5-27B-CT-4bit": {
+      "has_qzeros": false,
+      "has_qweight": false,
+      "has_weight_packed": true,
+      "has_weight_scale": true,
+      "detectedAs": "compressed-tensors"
+    },
+    "Qwen3.5-27B-GPTQ-Int4": {
+      "has_qzeros": true,
+      "has_qweight": true,
+      "detectedAs": "gptq"
+    }
+  }
 }
