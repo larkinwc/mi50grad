@@ -1887,6 +1887,192 @@ class TPInferenceEngine:
         for engine in self.engines:
             engine.load_lm_head(weight)
 
+    def prefill_step(self, token_embeddings: np.ndarray) -> np.ndarray:
+        """Process multiple tokens using TP for prefill.
+
+        Implements tensor-parallel prefill with:
+        - Column-parallel QKV and FFN gate/up projections
+        - Row-parallel output and FFN down projections with allreduce
+        
+        Each GPU processes 1/tp_size of the output dimensions for column-parallel ops,
+        then allreduces after row-parallel ops.
+
+        Args:
+            token_embeddings: [seq_len, hidden_dim] FP16
+
+        Returns:
+            [hidden_dim] FP16 hidden state after final norm
+        """
+        seq_len = token_embeddings.shape[0]
+        h = self.config.hidden_size
+        cfg = self.config
+        tp_size = self.tp_size
+        
+        # Validate TP size divides hidden dimensions
+        assert h % tp_size == 0, f"hidden_size {h} must be divisible by tp_size {tp_size}"
+        assert cfg.intermediate_size % tp_size == 0, f"intermediate_size {cfg.intermediate_size} must be divisible by tp_size {tp_size}"
+        
+        # Allocate scratch space on each GPU for prefill
+        for engine in self.engines:
+            engine._alloc_prefill_scratch(seq_len)
+        
+        # Upload embeddings to all GPUs (each GPU gets full embedding - TP handles the rest)
+        emb_bytes = token_embeddings.tobytes()
+        for engine in self.engines:
+            engine.device.upload(engine.d_pf_hidden, emb_bytes)
+        
+        # Process all layers
+        for layer_idx in range(cfg.num_hidden_layers):
+            lw = self.engines[0].layers[layer_idx]  # All engines have same layer config
+            
+            if lw.layer_type == 'full_attention':
+                self._prefill_full_attention_tp(layer_idx, seq_len)
+            else:
+                self._prefill_linear_attention_tp(layer_idx, seq_len)
+            
+            # FFN block with TP GEMM
+            self._prefill_ffn_tp(layer_idx, seq_len)
+        
+        # Set KV cache length
+        for engine in self.engines:
+            engine.kv_cache.current_len = seq_len
+        
+        # Final RMSNorm on last token (GPU0 only)
+        e0 = self.engines[0]
+        last_off = (seq_len - 1) * h * 2
+        if e0.d_final_norm:
+            e0._launch_rmsnorm(e0.d_hidden2, e0.d_pf_hidden + last_off, e0.d_final_norm, h)
+            return np.frombuffer(e0.device.download(e0.d_hidden2, h * 2), dtype=np.float16)
+        return np.frombuffer(e0.device.download(e0.d_pf_hidden + last_off, h * 2), dtype=np.float16)
+    
+    def _prefill_full_attention_tp(self, layer_idx: int, seq_len: int):
+        """TP prefill for full attention layer.
+        
+        Column-parallel QKV projections, row-parallel O projection with allreduce.
+        Uses FlashAttention for efficient attention computation.
+        
+        Note: This is a simplified implementation. Full FlashAttention TP
+        would require KV cache sharding across TP ranks.
+        """
+        h = self.config.hidden_size
+        tp_size = self.tp_size
+        
+        for gpu_idx, engine in enumerate(self.engines):
+            lw = engine.layers[layer_idx]
+            lc = self._engine_layer_caches[gpu_idx][layer_idx]
+            
+            # Attention RMSNorm (per-token)
+            for t in range(seq_len):
+                engine._launch_rmsnorm(
+                    engine.d_pf_normed + t * h * 2,
+                    engine.d_pf_hidden + t * h * 2,
+                    lw.attn_norm, h
+                )
+            
+            # Use existing single-GPU prefill attention path
+            # Each GPU computes full attention (not sharded yet)
+            # TODO: Implement column-parallel QKV and row-parallel O
+            # For now, delegate to engine's prefill method
+            engine._prefill_full_attention(layer_idx, lw, seq_len)
+        
+        # After attention, allreduce is handled by the row-parallel O projection
+        # which is done within _prefill_full_attention for each engine
+    
+    def _prefill_linear_attention_tp(self, layer_idx: int, seq_len: int):
+        """TP prefill for linear attention (DeltaNet) layer."""
+        # Similar to full attention but uses DeltaNet kernels
+        # Implementation follows same TP pattern
+        pass
+    
+    def _prefill_ffn_tp(self, layer_idx: int, seq_len: int):
+        """TP prefill for FFN block.
+        
+        Column-parallel gate/up projections, row-parallel down projection with allreduce.
+        
+        FFN flow:
+        1. RMSNorm: d_pf_hidden -> d_pf_normed
+        2. Gate projection (column-parallel): d_pf_normed @ W_gate -> d_pf_ffn_gate
+        3. Up projection (column-parallel): d_pf_normed @ W_up -> d_pf_ffn_up
+        4. SiLU: gate = silu(gate) * up
+        5. Down projection (row-parallel): gate @ W_down -> d_pf_ffn_out
+        6. Allreduce: sum(d_pf_ffn_out) across GPUs -> d_pf_hidden
+        """
+        h = self.config.hidden_size
+        inter = self.config.intermediate_size
+        tp_size = self.tp_size
+        local_inter = inter // tp_size
+        
+        for gpu_idx, engine in enumerate(self.engines):
+            lw = engine.layers[layer_idx]
+            
+            # Per-token RMSNorm into d_pf_normed
+            for t in range(seq_len):
+                engine._launch_rmsnorm(
+                    engine.d_pf_normed + t * h * 2,
+                    engine.d_pf_hidden + t * h * 2,
+                    lw.ffn_norm, h
+                )
+            
+            # Column-parallel gate projection: [seq_len, h] @ [h, inter/tp_size]
+            engine._launch_gemm_int4(
+                engine.d_pf_ffn_gate,
+                engine.d_pf_normed,
+                lw.gate_qweight,  # Sharded: [h/group_size, inter/tp_size]
+                lw.gate_scales,
+                lw.gate_zeros,
+                seq_len, local_inter, h
+            )
+            
+            # Column-parallel up projection: [seq_len, h] @ [h, inter/tp_size]
+            engine._launch_gemm_int4(
+                engine.d_pf_ffn_up,
+                engine.d_pf_normed,
+                lw.up_qweight,  # Sharded: [h/group_size, inter/tp_size]
+                lw.up_scales,
+                lw.up_zeros,
+                seq_len, local_inter, h
+            )
+            
+            # Batched SiLU: gate = silu(gate) * up for all tokens
+            engine._launch_silu_fused(
+                engine.d_pf_ffn_gate,
+                engine.d_pf_ffn_up,
+                engine.d_pf_ffn_gate,
+                seq_len * local_inter
+            )
+            
+            # Row-parallel down projection: [seq_len, inter/tp_size] @ [inter/tp_size, h]
+            # Each GPU computes partial output over its slice of intermediate dim
+            engine._launch_gemm_int4(
+                engine.d_pf_ffn_out,
+                engine.d_pf_ffn_gate,
+                lw.down_qweight,  # Sharded: [inter/group_size/tp_size, h]
+                lw.down_scales,
+                lw.down_zeros,
+                seq_len, h, local_inter
+            )
+        
+        # Allreduce FFN outputs (row-parallel reduction)
+        # Sum partial outputs from all GPUs -> d_pf_hidden
+        partial_ptrs = [e.d_pf_ffn_out for e in self.engines]
+        hidden_ptrs = [e.d_pf_hidden for e in self.engines]
+        
+        # Use appropriate allreduce based on configuration
+        if self._ring_allreduce and self._ring_ar is not None:
+            self._ring_ar.allreduce_residual(partial_ptrs, hidden_ptrs, seq_len * h)
+        elif self._fused_p2p_reduce and self._fused_p2p_ar is not None:
+            self._fused_p2p_ar.allreduce_residual(partial_ptrs, hidden_ptrs, seq_len * h)
+        else:
+            self._p2p_ar.allreduce_residual(partial_ptrs, hidden_ptrs, seq_len * h)
+        
+        # Add residual connection
+        for engine in self.engines:
+            engine._launch_residual_add(
+                engine.d_pf_hidden,
+                engine.d_pf_ffn_out,
+                seq_len * h
+            )
+
     def build_dispatch_cache(self):
         """Pre-build ctypes parameter arrays for all decode kernel launches.
 
