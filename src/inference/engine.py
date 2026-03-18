@@ -1588,8 +1588,11 @@ class InferenceEngine:
             self._d_attn_out_batch = self.device.malloc(batch_size * self.q_dim * 2)
             print(f"  Allocated batched attention buffers for batch_size={batch_size}")
 
-        # For batch>1, use GEMM: [batch, out_dim] = [batch, h] @ [out_dim, h]^T
-        if self._gemm_fp16_prefill and batch_size >= 2:
+        # For batch>1, decide between GEMM and GEMV based on batch size
+        # GEMM is more efficient for larger batches (M >= 4), GEMV for small batches
+        use_gemm = self._gemm_fp16_prefill and batch_size >= 4
+        
+        if use_gemm:
             # FP16 GEMM for Q+Qgate projection
             # [batch, 2*q_dim] = [batch, h] @ [2*q_dim, h]^T
             q_fused_ptr = lw.q_fused_weight if hasattr(lw, 'q_fused_weight') else lw.q_weight
@@ -1603,7 +1606,7 @@ class InferenceEngine:
                                     self._d_normed_batch, kv_fused_ptr,
                                     batch_size, 2 * self.kv_dim, h)
         else:
-            # Fallback to per-sequence GEMV
+            # Use per-sequence GEMV for small batches (more reliable for M < 4)
             for b in range(batch_size):
                 normed_ptr = self._d_normed_batch + b * h * 2
                 q_ptr = self._d_q_fused_batch + b * 2 * self.q_dim * 2
@@ -1616,8 +1619,9 @@ class InferenceEngine:
         # Each sequence writes to and reads from its own KV cache slot (batch_idx = b)
         for b in range(batch_size):
             q_ptr = self._d_q_fused_batch + b * 2 * self.q_dim * 2
-            k_ptr = self._d_kv_fused_batch + b * 2 * self.kv_dim * 2
-            v_ptr = k_ptr + self.kv_dim * 2  # V starts after K in the fused buffer
+            kv_base = self._d_kv_fused_batch + b * 2 * self.kv_dim * 2
+            k_ptr = kv_base
+            v_ptr = kv_base + self.kv_dim * 2  # V starts after K in the fused buffer
             attn_out_ptr = self._d_attn_out_batch + b * self.q_dim * 2
             
             # QKNorm + RoPE for Q
