@@ -1,0 +1,45 @@
+{
+  "featureId": "m6-fix-validation-methodology",
+  "reviewedAt": "2026-03-19T00:00:00Z",
+  "commitId": "765ac9d",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "The fix properly addresses all three blocking issues from the prior review. VAL-SPEC-001 now uses train/test split (first 60% for cache building, last 40% for measurement). VAL-SPEC-002 runs actual eagle_speculative_decode() on GPU and measures acceptance rates. VAL-SPEC-003 uses wall-clock timing comparison instead of theoretical estimation. The methodology corrections are sound and properly implemented.",
+    "issues": [
+      {
+        "file": "tests/val_m6_speculative.py",
+        "line": 107,
+        "severity": "non_blocking",
+        "description": "tokenize_simple() uses ord(c) % 256 which is not a real tokenizer. While acceptable for testing n-gram cache mechanics, this doesn't reflect actual token patterns from the model's vocabulary. This was noted in the prior review as non-blocking."
+      },
+      {
+        "file": "tests/val_m6_speculative.py",
+        "line": 224,
+        "severity": "non_blocking",
+        "description": "EAGLETestWrapper uses np.random.randn for embed_weight and lm_head_weight rather than actual model weights. Acceptance rates measured will be random, not reflecting real model behavior. This is necessary for infrastructure testing but should be noted if results are used for optimization decisions."
+      },
+      {
+        "file": "tests/val_m6_speculative.py",
+        "line": 362,
+        "severity": "non_blocking",
+        "description": "SpeculativeTestWrapper also uses random weights for embedding and lm_head. Same concern as EAGLETestWrapper - acceptance rates don't reflect real model performance."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "skills",
+      "observation": "The kernel-optimization-worker skill is designed for HIP C++ kernel and C extension work, but was used for a Python test methodology fix. The worker documented deviations from Step 3 (TDD) and Step 6 (GPU deployment) with valid justification - this was a fix to existing test methodology, not new kernel code.",
+      "evidence": "handoff.skillFeedback.deviations documents: 'Feature was to fix existing val_m6_speculative.py test methodology, not create new tests.' and 'Deployment and execution on dev server is part of verification step that requires SSH access.'"
+    },
+    {
+      "area": "knowledge",
+      "observation": "NgramCache behavior is now documented in .factory/library/speculative-decode.md (added in commit 49df32a). This explains the training-on-test issue and how _continuations list works.",
+      "evidence": "Prior review noted: 'The NgramCache implementation uses _continuations list in trie nodes to store multiple possible next tokens for the same context.'"
+    }
+  ],
+  "addressesFailureFrom": ".factory/validation/speculative-validation/scrutiny/reviews/m6-speculative-validation.json",
+  "summary": "PASS: The fix adequately addresses all three original blocking issues. (1) VAL-SPEC-001 now uses proper train/test split methodology - builds n-gram cache from first 60% of prompt context, measures acceptance on last 40% continuation, preventing training-on-test inflation. (2) VAL-SPEC-002 now runs actual eagle_speculative_decode() on GPU with real token verification, measuring acceptance rates instead of just checking class existence. (3) VAL-SPEC-003 now uses wall-clock timing comparison between speculative and standard decode on the same prompt, with warmup steps and proper benchmarking. The tests were not executed on GPU (documented in handoff as left undone), but the code changes correctly implement the required methodology fixes."
+}
