@@ -6,15 +6,15 @@
 
 ---
 
-## Validation Status
+## Validation Status (Updated 2026-03-18)
 
 | Assertion | Description | Status | Notes |
 |-----------|-------------|--------|-------|
-| VAL-DB-001 | Buffer swap alternation | ✅ PASS | Even layers read A→write B, odd layers read B→write A |
-| VAL-DB-002 | Numerical correctness (cos_sim >= 0.99) | ✅ PASS | **FIXED & VERIFIED** - Min cos_sim=0.999949 on dev server |
-| VAL-DB-003 | Throughput improvement (>= 5%) | ❌ FAIL | Shows 0.934x (6.6% degradation) - needs investigation |
-| VAL-DB-004 | Long-run stability (1000+ tokens) | ⏳ PENDING | Requires extended test run |
-| VAL-DB-005 | C dispatch interaction | ❌ FAIL | C dispatch plan build failing - pre-existing issue |
+| VAL-DB-001 | Buffer swap alternation | ✅ PASS | Verified on dev server - even layers read A→write B, odd layers read B→write A |
+| VAL-DB-002 | Numerical correctness (cos_sim >= 0.99) | ✅ PASS | **VERIFIED** - Min cos_sim=0.997815 >= 0.99 (test_val_ar_004_005.py) |
+| VAL-DB-003 | Throughput improvement (>= 5%) | ❌ FAIL | Shows 0.577x (42% degradation) - double-buffer has overhead |
+| VAL-DB-004 | Long-run stability (1000+ tokens) | ⏳ PENDING | Requires extended test run (test timeout) |
+| VAL-DB-005 | C dispatch interaction | ⏳ PENDING | Test timeout - needs shorter test variant |
 
 ---
 
@@ -140,48 +140,44 @@ VAL-DB-002: PASS
 
 ### Actual Test Output (2026-03-18) ✅ PASS
 
+**From test_val_ar_004_005.py:**
 ```
-Running 20 decode steps (per-step comparison)...
-  Step 1/20: cos_sim=0.999994, max_diff=4.687500e-02
-  Step 6/20: cos_sim=0.999987, max_diff=1.093750e-01
-  Step 11/20: cos_sim=0.999968, max_diff=9.008789e-02
-  Step 16/20: cos_sim=0.999981, max_diff=3.955078e-02
-  Step 20/20: cos_sim=0.999992, max_diff=3.906250e-02
-
-======================================================================
-Results:
-  Min cosine similarity:  0.999949
-  Avg cosine similarity:  0.999985
-  Max absolute difference: 1.289062e-01
+VAL-AR-004 (Correctness):
+  Min cosine similarity: 0.997815
+  Avg cosine similarity: 0.999437
   Threshold: >= 0.99
-
-VAL-DB-002: PASS
-======================================================================
+  Result: PASS
 ```
 
-The fix is **VERIFIED** on the dev server (4x MI50). All 20 decode steps achieved cosine similarity > 0.9999, well exceeding the 0.99 threshold.
+The numerical correctness is **VERIFIED** on the dev server (4x MI50). The minimum cosine similarity of 0.997815 exceeds the 0.99 threshold, confirming that double-buffer mode produces numerically equivalent output to the standard path.
 
-### Next Steps After VAL-DB-002 Pass
+### VAL-DB-003 Throughput Analysis ❌ FAIL
 
-1. **Run full validation suite:**
-   ```bash
-   ssh root@192.168.1.198 "cd /opt/mi50grad && docker run --rm ... \
-       mi50grad python3 tests/test_double_buffer_tp4.py --all"
-   ```
+**Test:** `test_val_ar_004_005.py` (VAL-AR-005)
 
-2. **Verify all VAL-DB assertions pass:**
-   - VAL-DB-001: Buffer swap alternation (already passing)
-   - VAL-DB-002: Numerical correctness (fixed)
-   - VAL-DB-003: Throughput improvement (should now show >= 5%)
-   - VAL-DB-004: Long-run stability (should pass with cos_sim >= 0.99)
-   - VAL-DB-005: C dispatch interaction (should pass)
+**Result:**
+```
+VAL-AR-005 (Throughput):
+  Standard: 28.51 ms/step
+  Double-buffer: 49.39 ms/step
+  Speedup: 0.577x
+  Threshold: >= 1.05x
+  Result: FAIL
+```
 
-3. **Benchmark performance:**
-   Run `--benchmark` mode to measure actual throughput improvement from double-buffer overlap.
+**Analysis:**
+The double-buffer implementation shows **42% degradation** instead of the expected 5%+ improvement. This is unexpected and suggests:
 
-4. **Update documentation:**
-   - Add performance numbers to this summary
-   - Update README with double-buffer usage instructions
+1. **Stream synchronization overhead:** The GPU stream event mechanism may be introducing more overhead than anticipated
+2. **Python dispatch bottleneck:** The additional buffer swap operations in Python may be adding overhead
+3. **Suboptimal overlap:** The allreduce may be completing faster than expected, reducing the benefit of overlap
+4. **Test configuration:** The test uses only 10 steps after 5 warmup - may not represent steady-state behavior
+
+**Next Steps for Throughput Investigation:**
+1. Profile the stream event overhead to quantify synchronization cost
+2. Test with longer sequences to amortize Python overhead
+3. Verify that stream events are correctly ordered and not causing unnecessary waits
+4. Consider removing buffer swap from hot path or optimizing the swap operation
 
 ---
 
@@ -208,7 +204,92 @@ ssh root@192.168.1.198 "cd /opt/mi50grad && docker run --rm \
 
 ---
 
-## Detailed Results
+## Detailed Test Results (2026-03-18)
+
+### VAL-DB-001: Buffer Swap Alternation ✅ PASS
+
+**Test Command:**
+```bash
+ssh root@192.168.1.198 "cd /opt/mi50grad && docker run --rm ... mi50grad python3 tests/test_double_buffer_tp4.py --buffer-swap"
+```
+
+**Result:**
+```
+Buffer usage pattern (first 8 layers):
+  Layer  0: read=A, write=B ✓
+  Layer  1: read=B, write=A ✓
+  Layer  2: read=A, write=B ✓
+  Layer  3: read=B, write=A ✓
+  ...
+After 64 layers:
+  Final d_hidden: A (expected: A)
+
+VAL-DB-001: PASS - Buffer alternation correct
+```
+
+**Validation:**
+- Even layers correctly read from `d_hidden_A` and write to `d_hidden_B`
+- Odd layers correctly read from `d_hidden_B` and write to `d_hidden_A`
+- After 64 layers (even number), `d_hidden` returns to `d_hidden_A`
+- Buffer swap mechanism (`_swap_hidden_buffers()`) working correctly
+
+---
+
+### VAL-DB-002: Numerical Correctness ✅ PASS
+
+**Test Command:**
+```bash
+ssh root@192.168.1.198 "cd /opt/mi50grad && docker run --rm ... mi50grad python3 tests/test_val_ar_004_005.py"
+```
+
+**Result:**
+```
+VAL-AR-004 (Correctness):
+  Min cosine similarity: 0.997815
+  Avg cosine similarity: 0.999437
+  Threshold: >= 0.99
+  Result: PASS
+```
+
+**Validation:**
+- Double-buffer produces numerically equivalent output to standard path
+- All 10 decode steps achieved cosine similarity > 0.99
+- Fix applied in _decode_step_cached_stream() correctly updates RMSNorm pointers at runtime
+- The single-engine comparison approach eliminates cross-engine state differences
+
+---
+
+### VAL-DB-003: Throughput ❌ FAIL
+
+**Test Command:**
+```bash
+ssh root@192.168.1.198 "cd /opt/mi50grad && docker run --rm ... mi50grad python3 tests/test_val_ar_004_005.py"
+```
+
+**Result:**
+```
+VAL-AR-005 (Throughput):
+  Standard: 28.51 ms/step
+  Double-buffer: 49.39 ms/step
+  Speedup: 0.577x
+  Threshold: >= 1.05x
+  Result: FAIL
+```
+
+**Analysis:**
+Double-buffer shows 42% degradation instead of expected 5%+ improvement.
+
+**Potential Causes:**
+1. Stream event synchronization overhead exceeds expected allreduce hide time
+2. Python-side buffer swap adds overhead to hot path
+3. Allreduce completes faster than expected, reducing overlap benefit
+4. Test configuration (10 steps) may not represent steady-state
+
+**Recommendation:** Further profiling needed to identify the source of overhead. The double-buffer mechanism is numerically correct but requires performance tuning.
+
+---
+
+## Detailed Results (Previous)
 
 ### VAL-DB-001: Buffer Swap Alternation ✅ PASS
 
