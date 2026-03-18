@@ -6,7 +6,7 @@ Architectural decisions, patterns discovered, and kernel design notes.
 
 ---
 
-## Fused GEMV+AR+RMSNorm Kernel Regression (2026-03-18)
+## Fused GEMV+AR+RMSNorm Kernel Fix (2026-03-18)
 
 **Issue:** M2 fused kernel integration caused 71% throughput regression (45 tok/s → 13 tok/s).
 
@@ -16,12 +16,19 @@ Architectural decisions, patterns discovered, and kernel design notes.
 (const void *)(uintptr_t)ar->hidden_ptrs[0],  /* A: input activation */
 
 // CORRECT - should read from FFN gate output (SiLU activation)
-(const void *)(uintptr_t)engine->d_ffn_gate,  /* A: FFN gate output after SiLU */
+(const void *)(uintptr_t)ar->ffn_gate_ptrs[i],  /* A: FFN gate output after SiLU */
 ```
 
 The fused GEMV kernel expects `A` to be the FFN gate output (after SiLU multiplication), but the C dispatch was passing `hidden_ptrs[0]` which contains the residual. This caused the kernel to compute garbage output, leading to the massive throughput drop.
 
-**Fix:** Disabled fused GEMV kernel by default in `tp_engine.py` until the input pointer is corrected. The kernel library is still loaded and available for future testing.
+**Fix Applied:**
+1. Added `ffn_gate_ptrs[4]` field to `CAllreduceSpec` struct in `c_dispatch.c`
+2. Updated `do_allreduce_gemv_fused()` to read from `ar->ffn_gate_ptrs[i]` instead of `ar->hidden_ptrs[0]`
+3. Updated Python `CAllreduceSpec` ctypes structure in `tp_engine.py` to include `ffn_gate_ptrs`
+4. Updated `fill_ar_spec()` in `tp_engine.py` to populate `ffn_gate_ptrs` with `engine.d_ffn_gate`
+5. Enabled fused kernel in `tp_engine.py` (was previously disabled due to bug)
+
+**Expected Result:** With the fix, the fused kernel should achieve 50+ tok/s with cosine similarity >= 0.99 vs the separate kernel path.
 
 **Key learning:** When fusing kernels, verify that all input pointers match the expected buffers from the original unfused path. The FFN flow is:
 1. `ffn_rmsnorm(d_normed, d_hidden)` - normalize residual

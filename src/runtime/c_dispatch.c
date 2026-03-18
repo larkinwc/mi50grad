@@ -239,14 +239,16 @@ typedef struct {
     /* For FFN down-proj fusion: replaces ffn_down + allreduce + next_layer attn_rmsnorm */
     uint32_t use_gemv_fused;          /* 1=use fused GEMV+allreduce+RMSNorm for FFN down */
     gemv_int4_fused_tp4_fn_t gemv_fused_tp4_fn; /* ptr to gemv_int4_p2p_allreduce_rmsnorm_tp4 */
+    /* Input activation pointer: FFN gate output after SiLU (replicated across GPUs) */
+    uint64_t ffn_gate_ptrs[4];        /* FFN gate output pointers per GPU (input to down proj) */
     /* INT4 weight parameters for fused GEMV (FFN down projection) */
     uint64_t ffn_down_qweight_ptrs[4]; /* FFN down proj INT4 weights per GPU */
     uint64_t ffn_down_scales_ptrs[4];  /* FFN down proj scales per GPU */
     uint64_t ffn_down_zeros_ptrs[4];   /* FFN down proj zeros per GPU */
     uint32_t ffn_K;                    /* FFN intermediate size (input to down proj) */
     uint32_t ffn_group_size;           /* Quantization group size */
-    /* Padding for 8-byte alignment: total adds 4+8+32+32+32+4+4 = 116 bytes */
-    /* Total struct size with previous 48: 48 + 116 = 164 bytes (aligned to 8: 168) */
+    /* Padding for 8-byte alignment: total adds 4+8+32+32+32+32+4+4 = 148 bytes */
+    /* Total struct size with previous 48: 48 + 148 = 196 bytes (aligned to 8: 200) */
 } CAllreduceSpec;
 
 /*
@@ -659,7 +661,7 @@ static int do_allreduce_gemv_fused(CAllreduceSpec *ar, CDispatchPlan *plan)
     /* Step 3: Launch fused GEMV+AR+RMSNorm kernel on each GPU's AR stream.
      * Each GPU processes its partition of the output columns.
      * The kernel reads:
-     *   - A (input activation): same for all GPUs (FFN gate output after SiLU)
+     *   - A (input activation): FFN gate output after SiLU (from ffn_gate_ptrs)
      *   - B_q4, scales, zeros: partitioned INT4 weights (FFN down proj)
      *   - partial_peer*: peer GPU partials via P2P BAR1 (for allreduce)
      *   - weight: next layer's attn_norm weights (for RMSNorm)
@@ -670,12 +672,12 @@ static int do_allreduce_gemv_fused(CAllreduceSpec *ar, CDispatchPlan *plan)
         int p1 = (i + 2) % 4;
         int p2 = (i + 3) % 4;
         
-        /* Note: A (input activation) is the same for all GPUs - it's the
-         * FFN gate output after SiLU, which is replicated across all GPUs.
-         * We use hidden_ptrs[0] as the source since it holds the replicated input. */
+        /* Use ffn_gate_ptrs which points to the FFN gate output after SiLU.
+         * This is the correct input for the down projection GEMV.
+         * Previously buggy: used hidden_ptrs[0] which contains residual, not SiLU output. */
         err = ar->gemv_fused_tp4_fn(
             (void *)(uintptr_t)ar->hidden_ptrs[i],        /* output (normalized) */
-            (const void *)(uintptr_t)ar->hidden_ptrs[0],  /* A: input activation (replicated) */
+            (const void *)(uintptr_t)ar->ffn_gate_ptrs[i],  /* A: FFN gate output after SiLU */
             (const unsigned int*)(uintptr_t)ar->ffn_down_qweight_ptrs[i],
             (const void *)(uintptr_t)ar->ffn_down_scales_ptrs[i],
             (const void *)(uintptr_t)ar->ffn_down_zeros_ptrs[i],
