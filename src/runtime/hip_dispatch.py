@@ -353,6 +353,17 @@ class HIPRuntime:
             "hipMemcpyAsync D2H"
         )
 
+    def memcpy_d2d_async(self, dst: int, src: int, size: int, stream: int = 0):
+        """Async device to device copy on stream."""
+        self._check(
+            self._lib.hipMemcpyAsync(
+                ctypes.c_void_p(dst),
+                ctypes.c_void_p(src),
+                size, 1, ctypes.c_void_p(stream)  # hipMemcpyDeviceToDevice = 1
+            ),
+            "hipMemcpyAsync D2D"
+        )
+
     def memset(self, ptr: int, value: int, size: int):
         self._check(
             self._lib.hipMemset(ctypes.c_void_p(ptr), value, size),
@@ -624,6 +635,10 @@ class GPUDevice:
     def memcpy_d2d(self, dst: int, src: int, size: int):
         self._ensure_device()
         self.hip.memcpy_d2d(dst, src, size)
+
+    def memcpy_d2d_async(self, dst: int, src: int, size: int, stream: int = 0):
+        self._ensure_device()
+        self.hip.memcpy_d2d_async(dst, src, size, stream)
 
     def synchronize(self):
         self._ensure_device()
