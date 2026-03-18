@@ -73,15 +73,52 @@ python3 tests/test_fused_kernel_c_dispatch.py
 
 ### Key Assertions
 
+### M2: Fused GEMV Allreduce
+
 | Assertion | Description | Test File |
 |-----------|-------------|-----------|
-| VAL-FUSE-001 | Numerical equivalence vs separate kernels (max_abs_error < 5e-3) | test_fused_allreduce_rmsnorm.py |
-| VAL-FUSE-002 | Kernel launch count reduction (128 -> 64 per token) | Implementation verification |
-| VAL-FUSE-003 | Per-layer latency improvement >= 10% | Requires benchmark |
-| VAL-FUSE-004 | Dimension alignment edge cases | test_fused_allreduce_rmsnorm.py |
-| VAL-FUSE-005 | C dispatch path integration | test_fused_kernel_c_dispatch.py |
-| VAL-FUSE-006 | Fallback to separate kernels | test_fused_kernel_c_dispatch.py |
-| VAL-FUSE-007 | Multi-GPU output consistency | test_fused_allreduce_rmsnorm.py |
+| VAL-FUSED-GEMV-001 | Cosine similarity >= 0.99 vs separate kernels | val_m2_fused_gemv_ar.py |
+| VAL-FUSED-GEMV-002 | Throughput >= 50 tok/s (10% improvement) | val_m2_fused_gemv_ar.py |
+| VAL-FUSED-GEMV-003 | Kernel launch count reduced to 64 | Implementation verification |
+
+### M3: Reduced Allreduce Count
+
+| Assertion | Description | Test File |
+|-----------|-------------|-----------|
+| VAL-REDUCED-AR-001 | Cosine similarity >= 0.99 vs full AR | val_m3_reduced_ar_count.py |
+| VAL-REDUCED-AR-002 | Exactly 64 allreduce ops per token | Implementation verification |
+| VAL-REDUCED-AR-003 | Throughput >= 55 tok/s | val_m3_reduced_ar_count.py |
+
+### M4: TP Prefill
+
+| Assertion | Description | Test File |
+|-----------|-------------|-----------|
+| VAL-TP-PREFILL-001 | Cosine similarity >= 0.99 vs single-GPU | val_m4_tp_prefill.py |
+| VAL-TP-PREFILL-002 | 512-token prefill in < 0.5s | val_m4_tp_prefill.py |
+| VAL-TP-PREFILL-003 | KV cache correct for decode | val_m4_tp_prefill.py |
+
+### M5: Persistent Kernel
+
+| Assertion | Description | Test File |
+|-----------|-------------|-----------|
+| VAL-PERSISTENT-001 | Cosine similarity >= 0.99 vs C dispatch | val_m5_persistent_kernel.py |
+| VAL-PERSISTENT-002 | Throughput >= 48 tok/s | val_m5_persistent_kernel.py |
+
+### M6: Speculative Decode
+
+| Assertion | Description | Test File |
+|-----------|-------------|-----------|
+| VAL-SPEC-001 | N-gram acceptance >= 50% | val_m6_speculative.py |
+| VAL-SPEC-002 | EAGLE acceptance >= 60% | val_m6_speculative.py |
+| VAL-SPEC-003 | Speedup >= 1.3x | val_m6_speculative.py |
+
+### Cross-Area
+
+| Assertion | Description | Test File |
+|-----------|-------------|-----------|
+| VAL-CROSS-001 | Full pipeline >= 60 tok/s | bench_current_state.py |
+| VAL-CROSS-002 | Memory within 32GB per GPU | bench_current_state.py |
+| VAL-CROSS-003 | Coherent text generation | bench_current_state.py |
 
 ## Validation Concurrency
 
