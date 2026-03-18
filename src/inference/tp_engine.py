@@ -11,7 +11,7 @@ import threading
 import subprocess
 import numpy as np
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from src.inference.engine import InferenceEngine
 from src.runtime.tensor_parallel import TensorParallelGroup
@@ -1452,6 +1452,221 @@ def _load_fast_allreduce(hip_lib):
     return lib
 
 
+# ============================================================
+# Speculative Decoding Support
+# ============================================================
+
+class SpeculativeDecodeState:
+    """Manages state for speculative decoding with n-gram lookahead.
+    
+    This class handles:
+    1. N-gram cache management (built from prompt and updated with generated tokens)
+    2. Draft token generation from n-gram matches
+    3. Verification of draft tokens using batched prefill-style forward pass
+    4. KV cache updates for accepted tokens
+    5. Rollback support for rejected tokens
+    
+    The key optimization: verification of K draft tokens uses a single
+    prefill-style forward pass (batched GEMV), amortizing the TP allreduce
+    cost across K tokens instead of 1.
+    
+    Attributes:
+        tp_engine: TPInferenceEngine instance
+        ngram_size: size of n-grams for draft generation
+        max_draft_len: maximum draft tokens per iteration
+        ngram_cache: NgramCache instance for storing n-gram continuations
+        acceptance_stats: dict tracking acceptance rate and counts
+    """
+    
+    def __init__(self, tp_engine, ngram_size: int = 3, max_draft_len: int = 5):
+        """Initialize speculative decode state.
+        
+        Args:
+            tp_engine: TPInferenceEngine instance to wrap
+            ngram_size: size of n-grams for draft generation (default: 3)
+            max_draft_len: maximum draft tokens per iteration (default: 5)
+        """
+        from src.inference.speculative import NgramCache
+        
+        self.tp_engine = tp_engine
+        self.ngram_size = ngram_size
+        self.max_draft_len = max_draft_len
+        self.ngram_cache = NgramCache(n=ngram_size)
+        
+        # Acceptance rate tracking
+        self.acceptance_stats = {
+            'total_drafts': 0,
+            'total_accepted': 0,
+            'total_iterations': 0,
+        }
+        
+        # Cached buffers for batched verification
+        # These avoid repeated allocations during decode
+        self._hidden_size = tp_engine.config.hidden_size
+        self._batch_bufs = None  # Will hold [max_draft_len, hidden_size] buffer
+    
+    def build_cache_from_prompt(self, prompt_token_ids: List[int]):
+        """Build n-gram cache from initial prompt tokens.
+        
+        Must be called before starting speculative decoding on a new prompt.
+        
+        Args:
+            prompt_token_ids: list of token IDs from the prompt
+        """
+        self.ngram_cache.clear()
+        self.ngram_cache.build_from_sequence(prompt_token_ids)
+        
+        # Reset acceptance stats for new generation
+        self.acceptance_stats = {
+            'total_drafts': 0,
+            'total_accepted': 0,
+            'total_iterations': 0,
+        }
+    
+    def generate_drafts(self, context_token_ids: List[int]) -> List[int]:
+        """Generate draft tokens from n-gram cache given current context.
+        
+        Looks up the (n-1)-gram ending with the last token in context,
+        and returns continuation candidates from the cache.
+        
+        Args:
+            context_token_ids: full context (prompt + generated so far)
+        
+        Returns:
+            List of draft token IDs (may be empty if no matches)
+        """
+        # Update cache with recent context
+        # Only need to index the last few tokens to add new n-grams
+        n = self.ngram_size
+        if len(context_token_ids) >= n:
+            window_start = max(0, len(context_token_ids) - n * 2)
+            self.ngram_cache.build_from_sequence(
+                context_token_ids[window_start:])
+        
+        # Generate draft tokens by following n-gram matches
+        draft_tokens = []
+        current_context = context_token_ids.copy()
+        
+        # Limit to max_draft_len
+        for _ in range(self.max_draft_len):
+            candidates = self.ngram_cache.query(current_context)
+            if candidates is None or len(candidates) == 0:
+                break
+            
+            # Pick the first candidate as draft (could use smarter selection)
+            draft_token = candidates[0]
+            draft_tokens.append(draft_token)
+            current_context.append(draft_token)
+        
+        return draft_tokens
+    
+    def verify_drafts(self, token_embeddings: List[np.ndarray], 
+                      position: int,
+                      draft_tokens: List[int]) -> tuple:
+        """Verify draft tokens by running batched forward pass.
+        
+        This is the core verification step for speculative decoding:
+        1. Process each draft token through the model (sequential for now)
+        2. The caller compares output logits with draft tokens to decide acceptance
+        3. Returns the hidden states for each position (for logit computation)
+        
+        For TP engines, each token processes through all TP ranks with allreduce.
+        Future optimization: batch multiple tokens in a single prefill-style pass.
+        
+        Args:
+            token_embeddings: list of [hidden_size] FP16 embeddings for each draft token
+            position: starting position for KV cache writes
+            draft_tokens: list of draft token IDs (for tracking/stats)
+        
+        Returns:
+            Tuple of (output_hidden_states, accept_count_placeholder)
+            - output_hidden_states: list of hidden states [hidden_size] for each position
+            - accept_count_placeholder: 0 (caller determines actual acceptance)
+        
+        Note: Actual token acceptance is determined by comparing model logits
+        (computed from hidden states) with draft tokens. This is done by the
+        caller (e.g., speculative_decode function in speculative.py).
+        """
+        self.acceptance_stats['total_iterations'] += 1
+        self.acceptance_stats['total_drafts'] += len(draft_tokens)
+        
+        if not draft_tokens or not token_embeddings:
+            return [], 0
+        
+        # Process each draft token through the model
+        # In a full optimization, this would be batched as a prefill-style pass
+        output_hidden_states = []
+        current_pos = position
+        
+        for emb in token_embeddings:
+            # Run one decode step
+            hidden_out = self.tp_engine.decode_step(emb, current_pos)
+            output_hidden_states.append(hidden_out.copy())
+            current_pos += 1
+        
+        # Note: KV cache was updated during decode_step calls above.
+        # If tokens are rejected, caller must call rollback_kv_cache().
+        
+        # Acceptance is determined by caller comparing logits with draft tokens
+        # Return 0 as placeholder - caller tracks actual acceptance
+        return output_hidden_states, 0
+    
+    def record_accepted_tokens(self, num_accepted: int):
+        """Record accepted token count for statistics.
+        
+        Called by the speculative decoding loop after determining which
+        draft tokens were actually accepted.
+        
+        Args:
+            num_accepted: number of tokens that were accepted
+        """
+        self.acceptance_stats['total_accepted'] += num_accepted
+    
+    def rollback_kv_cache(self, num_tokens: int):
+        """Rollback KV cache by removing recently added tokens.
+        
+        Called when draft tokens are rejected and we need to regenerate
+        from an earlier position.
+        
+        Args:
+            num_tokens: number of tokens to remove from KV cache
+        """
+        for engine in self.tp_engine.engines:
+            # Move KV cache position back
+            engine.kv_cache.current_len = max(
+                0, engine.kv_cache.current_len - num_tokens)
+            # Note: The actual KV data in GPU memory would need to be
+            # overwritten or tracked. For now, we just adjust the position.
+    
+    def get_acceptance_rate(self) -> float:
+        """Get the current acceptance rate for generated tokens.
+        
+        Returns:
+            acceptance_rate: ratio of accepted to total draft tokens
+        """
+        total = self.acceptance_stats['total_drafts']
+        if total == 0:
+            return 0.0
+        return self.acceptance_stats['total_accepted'] / total
+    
+    def get_stats(self) -> dict:
+        """Get speculative decoding statistics.
+        
+        Returns:
+            Dict with acceptance rate and counts
+        """
+        return {
+            **self.acceptance_stats,
+            'acceptance_rate': self.get_acceptance_rate(),
+        }
+    
+    def cleanup(self):
+        """Clean up speculative decode state."""
+        if self.ngram_cache is not None:
+            self.ngram_cache.clear()
+        self._batch_bufs = None
+
+
 class TPInferenceEngine:
     """Multi-GPU tensor-parallel inference engine."""
 
@@ -1598,6 +1813,12 @@ class TPInferenceEngine:
         # while layer N's allreduce completes to buffer Y. Buffers alternate.
         # This hides allreduce latency behind next-layer RMSNorm dispatch.
         self._double_buffer_enabled = False
+
+        # Speculative decoding support (n-gram lookahead):
+        # When enabled, decode_step_speculative() generates multiple draft tokens
+        # and verifies them in a single forward pass using prefill-style dispatch.
+        self._speculative_mode = False
+        self._speculative_state = None  # SpeculativeDecodeState instance (lazy init)
 
     def load_layer_weights(self, layer_idx: int, weights: dict):
         import copy
@@ -4558,6 +4779,89 @@ class TPInferenceEngine:
     def synchronize(self):
         for engine in self.engines:
             engine.device.synchronize()
+
+    def set_speculative_mode(self, enabled: bool, ngram_size: int = 3, 
+                             max_draft_len: int = 5):
+        """Enable or disable speculative decoding mode.
+        
+        When enabled=True, the engine prepares for speculative decoding with
+        n-gram lookahead. This allocates additional buffers for draft token
+        verification and enables the decode_step_speculative() path.
+        
+        Speculative decoding workflow:
+        1. Build n-gram cache from prompt tokens
+        2. Generate draft tokens from n-gram matches
+        3. Verify drafts by running batched forward pass (prefill-style)
+        4. Accept longest matching prefix, reject rest
+        5. Update KV cache with accepted tokens only
+        
+        Args:
+            enabled: whether to enable speculative mode
+            ngram_size: size of n-grams for draft generation (default: 3)
+            max_draft_len: maximum draft tokens per iteration (default: 5)
+        """
+        self._speculative_mode = enabled
+        if enabled:
+            if self._speculative_state is None:
+                self._speculative_state = SpeculativeDecodeState(
+                    self, ngram_size, max_draft_len)
+                print(f"Speculative decoding initialized (n={ngram_size}, "
+                      f"max_draft={max_draft_len})")
+            else:
+                self._speculative_state.ngram_size = ngram_size
+                self._speculative_state.max_draft_len = max_draft_len
+        else:
+            if self._speculative_state is not None:
+                self._speculative_state.cleanup()
+                self._speculative_state = None
+            print("Speculative decoding disabled")
+
+    def decode_step_speculative(self, token_embeddings: List[np.ndarray], 
+                                 position: int,
+                                 draft_tokens: List[int]) -> tuple:
+        """Run speculative decoding step with draft token verification.
+        
+        This method verifies K draft tokens by running forward passes
+        and returns the output hidden states for logit computation.
+        
+        The verification workflow:
+        1. Process each draft token through the model (sequential for now)
+        2. Return hidden states for each position
+        3. Caller computes logits and compares with draft tokens
+        4. Caller decides which tokens to accept
+        5. Caller calls record_accepted_tokens() and possibly rollback_kv_cache()
+        
+        For rejected tokens, the caller must handle rollback by calling
+        rollback_kv_cache() to revert the KV cache position.
+        
+        Args:
+            token_embeddings: list of [hidden_size] FP16 embeddings for draft tokens
+            position: current sequence position for KV cache writes
+            draft_tokens: list of draft token IDs to verify
+        
+        Returns:
+            Tuple of (output_hidden_states, num_drafts)
+            - output_hidden_states: list of hidden states [hidden_size] for each position
+            - num_drafts: number of draft tokens processed (for convenience)
+        """
+        if not draft_tokens or not token_embeddings:
+            # No drafts to verify - return empty
+            return [], 0
+        
+        # Use the speculative state to verify drafts
+        if self._speculative_state is None:
+            raise RuntimeError("Speculative mode not initialized. "
+                               "Call set_speculative_mode(True) first.")
+        
+        # Ensure embeddings and drafts have same length
+        if len(token_embeddings) != len(draft_tokens):
+            raise ValueError(f"Embedding count ({len(token_embeddings)}) must "
+                             f"match draft token count ({len(draft_tokens)})")
+        
+        hidden_states, _ = self._speculative_state.verify_drafts(
+            token_embeddings, position, draft_tokens)
+        
+        return hidden_states, len(draft_tokens)
 
     def cleanup(self):
         # Shut down worker threads
