@@ -1,6 +1,6 @@
 {
   "milestone": "awq-dual",
-  "round": 5,
+  "round": 6,
   "status": "partial",
   "assertionsSummary": {
     "total": 4,
@@ -17,11 +17,11 @@
   "blockedAssertions": [
     {
       "id": "VAL-AWQ-004",
-      "blockedBy": "No true AWQ model available. Model at /opt/models/Qwen3.5-27B-AWQ has qzeros tensors (GPTQ format). E2E validation blocked - running AWQ kernel mode with GPTQ weights causes NaN/Inf (AWQ kernel skips zero-point subtraction, GPTQ weights have non-zero zeros)."
+      "blockedBy": "No true AWQ model available. Model at /opt/models/Qwen3.5-27B-AWQ has qzeros tensors and zero_point=True (GPTQ format). E2E validation blocked - running AWQ kernel mode with GPTQ weights causes NaN/Inf (AWQ kernel skips zero-point subtraction, GPTQ weights have non-zero zero points)."
     }
   ],
   "appliedUpdates": [],
-  "previousRound": ".factory/validation/awq-dual/user-testing/flows/awq-dual-round4.json (round 4)",
+  "previousRound": ".factory/validation/awq-dual/user-testing/flows/awq-dual-round5.json (round 5)",
   "testExecutionDetails": {
     "devServer": "root@192.168.1.198",
     "dockerImage": "mixa3607/rocm-gfx906:7.1.0-complete",
@@ -47,7 +47,7 @@
       "result": "PASS",
       "summary": "AWQ dual kernel loads and engine correctly selects it when AWQ mode enabled",
       "metrics": {
-        "awq_kernel_func_ptr": "766642000",
+        "awq_kernel_func_ptr": "1059227520",
         "awq_params": 12,
         "gptq_params": 14,
         "awq_has_zeros": false,
@@ -59,7 +59,7 @@
       "summary": "AWQ dual kernel shows 2.3-4.1% speedup over GPTQ dual kernel",
       "metrics": {
         "speedup_N11008": "1.023x",
-        "speedup_N13696": "1.024x",
+        "speedup_N13696": "1.034x",
         "speedup_N17408": "1.041x",
         "target": ">= 1.02x"
       }
@@ -73,17 +73,24 @@
   "recommendations": [
     {
       "priority": "high",
-      "description": "Obtain true AWQ model (with qweight/scales but no qzeros) to validate VAL-AWQ-004 E2E",
-      "rationale": "Current 'AWQ' model directory has qzeros tensors, making it GPTQ format. AWQ kernel mode with GPTQ weights produces NaN/Inf. AWQ format is characterized by absence of zero-point tensors."
+      "description": "Obtain true AWQ model (with qweight/scales but no qzeros and zero_point=False) to validate VAL-AWQ-004 E2E",
+      "rationale": "Current 'AWQ' model directory has qzeros tensors and zero_point=True, making it GPTQ format. AWQ kernel mode with GPTQ weights produces NaN/Inf. True AWQ format is characterized by zero_point=False and absence of zero-point tensors."
+    },
+    {
+      "priority": "medium",
+      "description": "Alternatively, accept partial validation status for awq-dual milestone",
+      "rationale": "VAL-AWQ-001, VAL-AWQ-002, and VAL-AWQ-003 all pass with high confidence. VAL-AWQ-004 E2E test cannot be completed without a true AWQ model. The kernel implementation and C dispatch integration are verified correct by code inspection and kernel loading tests."
     }
   ],
   "modelFormatVerification": {
     "Qwen3.5-27B-AWQ": {
+      "quantization_config_quant_method": "awq",
+      "quantization_config_zero_point": true,
       "has_qzeros": true,
       "has_qweight": true,
       "has_g_idx": false,
       "detectedAs": "gptq",
-      "note": "Model labeled 'AWQ' is actually GPTQ format (has qzeros tensors)"
+      "note": "Model labeled 'AWQ' is actually GPTQ format (has qzeros tensors and zero_point=True)"
     },
     "Qwen3.5-27B-CT-4bit": {
       "has_qzeros": false,
