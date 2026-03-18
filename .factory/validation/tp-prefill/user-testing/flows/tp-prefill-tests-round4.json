@@ -1,0 +1,62 @@
+{
+  "milestone": "tp-prefill",
+  "round": 4,
+  "timestamp": "2026-03-18T17:50:00Z",
+  "validatorSession": "c896c3af-74e7-48f1-a7a2-0cae5c79b83d",
+  "assertions": [
+    {
+      "id": "VAL-TP-PREFILL-001",
+      "status": "passed",
+      "evidence": {
+        "testOutput": "Weight Sharding: PASS\nTP FFN GEMM Execution: PASS\nOutput Sanity: PASS (no NaN/Inf)",
+        "infrastructureChecks": [
+          "prefill_step method found",
+          "_prefill_ffn_tp method found",
+          "_prefill_full_attention_tp method found",
+          "_prefill_linear_attention_tp method found",
+          "P2P allreduce initialized (type: P2PAllreduce)",
+          "TP size verified: 4"
+        ]
+      },
+      "testCommand": "ssh root@192.168.1.198 docker run ... python3 tests/val_m4_tp_prefill.py",
+      "notes": "Infrastructure re-verified in round 4. All TP prefill components functional."
+    },
+    {
+      "id": "VAL-TP-PREFILL-002",
+      "status": "blocked",
+      "evidence": {
+        "testOutput": "Throughput: 0.0 tok/s\nPerformance (>= 1000 tok/s): NEEDS OPTIMIZATION",
+        "reason": "Performance test shows 0.0 tok/s - infrastructure test does not measure actual timed prefill throughput. 1000 tok/s target requires GEMM kernel optimization which is deferred future work."
+      },
+      "testCommand": "ssh root@192.168.1.198 docker run ... python3 tests/val_m4_tp_prefill.py",
+      "notes": "Blocked on performance optimization. Infrastructure is complete; throughput optimization is iterative work."
+    },
+    {
+      "id": "VAL-TP-PREFILL-003",
+      "status": "passed",
+      "evidence": {
+        "testOutput": "KV cache sharding verified: 1 KV heads/GPU ✓\nQ heads sharding verified: 8 Q heads/GPU ✓\nOverall: PASS",
+        "infrastructureChecks": [
+          "Column-parallel QKV: IMPLEMENTED",
+          "Row-parallel O with allreduce: IMPLEMENTED"
+        ]
+      },
+      "testCommand": "ssh root@192.168.1.198 docker run ... python3 tests/val_m4_tp_flash_attention.py",
+      "notes": "GQA+TP design allows each GPU to process its KV head independently."
+    }
+  ],
+  "environment": {
+    "devServer": "root@192.168.1.198",
+    "dockerImage": "mixa3607/rocm-gfx906:7.1.0-complete",
+    "gpus": "4x AMD MI50 (HIP_VISIBLE_DEVICES=0,1,2,3)"
+  },
+  "toolsUsed": ["ssh", "docker", "python3"],
+  "frictions": [],
+  "blockers": [
+    {
+      "assertion": "VAL-TP-PREFILL-002",
+      "description": "1000 tok/s throughput target not achieved. Infrastructure test shows 0.0 tok/s (not measuring actual prefill timing). Performance optimization is deferred future work.",
+      "suggestedResolution": "Implement timed prefill execution in validation test; optimize GEMM kernels for throughput."
+    }
+  ]
+}
