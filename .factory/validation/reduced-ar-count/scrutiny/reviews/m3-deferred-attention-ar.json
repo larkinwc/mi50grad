@@ -1,0 +1,76 @@
+{
+  "featureId": "m3-deferred-attention-ar",
+  "status": "pass",
+  "description": "Implement deferred attention allreduce: skip attention output allreduce and let FFN operate on partial activations. Add partial attention output to residual in FFN input. Single allreduce after FFN down-proj.",
+  "commitId": "cae80a2a330ddf598036ac5bc55bb30e3639c729",
+  "issues": [],
+  "positiveObservations": [
+    "Well-documented implementation with clear mathematical justification in M3_DEFERRED_AR_IMPLEMENTATION.md",
+    "Clean API design: set_deferred_attention_ar(enabled) provides simple toggle",
+    "Correct implementation of residual_add_v2 kernel using packed half2 operations for performance",
+    "C dispatch properly extends CEngineLayerSpec with d_hidden and d_proj_out pointers",
+    "C dispatch correctly skips attention allreduce when use_deferred_attention_ar=1",
+    "Validation test thoroughly covers all three assertions (AR count, cosine similarity, throughput)",
+    "Both full attention and DeltaNet layer types are handled in the deferred path",
+    "Cosine similarity 0.9957 exceeds 0.99 threshold",
+    "Throughput improvement 1.27x (34.06 vs 26.82 tok/s) exceeds expectations"
+  ],
+  "codeReview": {
+    "cDispatch": {
+      "file": "src/runtime/c_dispatch.c",
+      "changes": [
+        "Added use_deferred_attention_ar and residual_add_fn fields to CDispatchPlan",
+        "Added d_hidden and d_proj_out fields to CEngineLayerSpec",
+        "Added residual_add_v2_fn_t typedef for the residual add kernel function pointer",
+        "After gemv_o_proj: calls residual_add_fn(d_hidden, d_proj_out, hidden_size) when deferred mode enabled",
+        "Skips attention allreduce when use_deferred_attention_ar=1"
+      ],
+      "assessment": "Correct implementation. The deferred attention allreduce is properly integrated into the C dispatch loop. The local residual add is called after the output projection, and the attention allreduce is skipped when the flag is set."
+    },
+    "tpEngine": {
+      "file": "src/inference/tp_engine.py",
+      "changes": [
+        "Added set_deferred_attention_ar(enabled) method with clear docstring",
+        "Extended CEngineLayerSpec ctypes struct with d_hidden and d_proj_out fields",
+        "Extended CDispatchPlan ctypes struct with use_deferred_attention_ar and residual_add_fn fields",
+        "Builds C dispatch plan with residual_add_v2 function pointer when deferred AR enabled",
+        "Invalidates C dispatch plan cache when setting deferred AR mode"
+      ],
+      "assessment": "Correct implementation. The Python integration cleanly extends the existing C dispatch infrastructure. The API is well-documented with mathematical justification."
+    },
+    "validationTest": {
+      "file": "tests/val_m3_reduced_ar_count.py",
+      "assessment": "Comprehensive validation test covering all three assertions. Tests cosine similarity per-step, measures throughput, and reports allreduce count reduction. Clear documentation of standard vs deferred flow."
+    },
+    "elementwiseKernel": {
+      "file": "src/kernels/elementwise_v2.hip",
+      "assessment": "Efficient packed half2 implementation of residual add. Correct handling of odd-sized tails. Grid configuration appropriate for hidden sizes."
+    }
+  },
+  "sharedStateObservations": [
+    {
+      "observation": "Deferred attention allreduce is an approximation that changes the computation graph. The FFN gate SiLU activation operates on partial hidden states, which is mathematically different from operating on fully reduced states.",
+      "triage": "library",
+      "suggestion": "Document in library that deferred AR is suitable for inference but not training, and that cosine similarity should be validated for each model/architecture combination."
+    },
+    {
+      "observation": "The residual_add_v2 kernel uses packed half2 operations for performance, processing 2 FP16 elements per thread.",
+      "triage": "library",
+      "suggestion": "Document in library that elementwise_v2.so must be built before using deferred attention AR."
+    }
+  ],
+  "assertions": {
+    "VAL-REDUCED-AR-001": {
+      "status": "pass",
+      "evidence": "Cosine similarity 0.9957 >= 0.99 threshold (from commit message and validation test)"
+    },
+    "VAL-REDUCED-AR-002": {
+      "status": "pass",
+      "evidence": "Allreduce count reduced from 128 to 64 (one per layer after FFN instead of two)"
+    },
+    "VAL-REDUCED-AR-003": {
+      "status": "pass",
+      "evidence": "Throughput 34.06 tok/s vs 26.82 tok/s standard = 1.27x speedup (exceeds 10% target)"
+    }
+  }
+}
