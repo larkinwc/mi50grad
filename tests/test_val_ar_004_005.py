@@ -8,7 +8,8 @@ Tests:
 """
 
 import sys
-sys.path.insert(0, "/opt/mi50grad")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 import time
