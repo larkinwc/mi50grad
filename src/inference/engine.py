@@ -323,6 +323,21 @@ class LayerWeights:
         self.o_weight = 0       # [hidden, Q_dim]
         self.q_norm = 0         # [head_dim]
         self.k_norm = 0         # [head_dim]
+        
+        # INT4 attention weights for compressed-tensors format
+        # q/k/v/o projections are INT4 quantized (AWQ-style, symmetric)
+        self.q_qweight = 0      # [Q_dim/8, hidden] INT32 packed
+        self.q_scales = 0       # [Q_dim/group_size, hidden] FP16
+        self.q_zeros = 0        # [Q_dim/group_size, hidden] FP16 (all zeros)
+        self.k_qweight = 0      # [KV_dim/8, hidden] INT32 packed
+        self.k_scales = 0       # [KV_dim/group_size, hidden] FP16
+        self.k_zeros = 0        # [KV_dim/group_size, hidden] FP16 (all zeros)
+        self.v_qweight = 0      # [KV_dim/8, hidden] INT32 packed
+        self.v_scales = 0       # [KV_dim/group_size, hidden] FP16
+        self.v_zeros = 0        # [KV_dim/group_size, hidden] FP16 (all zeros)
+        self.o_qweight = 0      # [hidden/8, Q_dim] INT32 packed
+        self.o_scales = 0       # [hidden/group_size, Q_dim] FP16
+        self.o_zeros = 0        # [hidden/group_size, Q_dim] FP16 (all zeros)
 
         # Linear attention weights — large projections on GPU, small ops on CPU/GPU
         self.la_in_proj_qkv = 0     # GPU ptr [10240, 5120]
@@ -383,6 +398,9 @@ class InferenceEngine:
       'w4a16' (default): INT4 weights, FP16 activations (existing path)
       'w8a8':            INT8 weights, INT8 activations (W8A8 GEMV/GEMM)
       'w4a8':            INT4 weights packed for W4A8, INT8 activations
+    
+    use_int4_attention: when True, attention projections (q/k/v/o) use INT4 GEMV
+      instead of FP16 GEMV. Required for compressed-tensors format models.
     """
 
     VALID_QUANT_FORMATS = ('w4a16', 'w8a8', 'w4a8')
@@ -390,13 +408,16 @@ class InferenceEngine:
     def __init__(self, config: QwenConfig, device_id: int = 0,
                  max_seq_len: int = 2048,
                  tp_size: int = 1, tp_rank: int = 0,
-                 quant_format: str = 'w4a16'):
+                 quant_format: str = 'w4a16',
+                 use_int4_attention: bool = False):
         if quant_format not in self.VALID_QUANT_FORMATS:
             raise ValueError(
                 f"quant_format must be one of {self.VALID_QUANT_FORMATS}, got {quant_format!r}")
         self.quant_format = quant_format
         # AWQ mode: skip zero-point subtraction in GEMV (set via set_awq_mode() after loading)
         self._awq_mode = False
+        # INT4 attention projections (compressed-tensors format)
+        self.use_int4_attention = use_int4_attention
 
         self.config = config
         self.device = GPUDevice(device_id)
@@ -1152,24 +1173,54 @@ class InferenceEngine:
             h = self.config.hidden_size
             q_dim = self.q_dim
             kv_dim = self.kv_dim
-            if 'q_weight' in weights and 'q_gate_weight' in weights:
-                q_fused = np.vstack([weights['q_weight'], weights['q_gate_weight']])
-                lw.q_fused_weight = upload(q_fused)
-                if lw.q_weight:
-                    self.device.free(lw.q_weight)
-                if lw.q_gate_weight:
-                    self.device.free(lw.q_gate_weight)
-                lw.q_weight = lw.q_fused_weight
-                lw.q_gate_weight = lw.q_fused_weight + q_dim * h * 2
-            if 'k_weight' in weights and 'v_weight' in weights:
-                kv_fused = np.vstack([weights['k_weight'], weights['v_weight']])
-                lw.kv_fused_weight = upload(kv_fused)
-                if lw.k_weight:
-                    self.device.free(lw.k_weight)
-                if lw.v_weight:
-                    self.device.free(lw.v_weight)
-                lw.k_weight = lw.kv_fused_weight
-                lw.v_weight = lw.kv_fused_weight + kv_dim * h * 2
+            
+            # Check if using INT4 attention projections (compressed-tensors format)
+            has_int4_attn = 'q_qweight' in weights
+            
+            if has_int4_attn:
+                # INT4 attention projections: upload qweight/scales/zeros for q/k/v/o
+                # These use AWQ-style GEMV (no zero-point subtraction)
+                lw.q_qweight = upload(weights.get('q_qweight', np.zeros(1, dtype=np.int32)))
+                lw.q_scales = upload(weights.get('q_scales', np.zeros(1, dtype=np.float16)))
+                lw.q_zeros = upload(weights.get('q_zeros', np.zeros(1, dtype=np.float16)))
+                
+                lw.k_qweight = upload(weights.get('k_qweight', np.zeros(1, dtype=np.int32)))
+                lw.k_scales = upload(weights.get('k_scales', np.zeros(1, dtype=np.float16)))
+                lw.k_zeros = upload(weights.get('k_zeros', np.zeros(1, dtype=np.float16)))
+                
+                lw.v_qweight = upload(weights.get('v_qweight', np.zeros(1, dtype=np.int32)))
+                lw.v_scales = upload(weights.get('v_scales', np.zeros(1, dtype=np.float16)))
+                lw.v_zeros = upload(weights.get('v_zeros', np.zeros(1, dtype=np.float16)))
+                
+                lw.o_qweight = upload(weights.get('o_qweight', np.zeros(1, dtype=np.int32)))
+                lw.o_scales = upload(weights.get('o_scales', np.zeros(1, dtype=np.float16)))
+                lw.o_zeros = upload(weights.get('o_zeros', np.zeros(1, dtype=np.float16)))
+                
+                # Also handle q_gate_weight (INT4)
+                if 'q_gate_qweight' in weights:
+                    lw.q_gate_qweight = upload(weights['q_gate_qweight'])
+                    lw.q_gate_scales = upload(weights['q_gate_scales'])
+                    lw.q_gate_zeros = upload(weights['q_gate_zeros'])
+            else:
+                # FP16 attention projections (standard GPTQ/AWQ format)
+                if 'q_weight' in weights and 'q_gate_weight' in weights:
+                    q_fused = np.vstack([weights['q_weight'], weights['q_gate_weight']])
+                    lw.q_fused_weight = upload(q_fused)
+                    if lw.q_weight:
+                        self.device.free(lw.q_weight)
+                    if lw.q_gate_weight:
+                        self.device.free(lw.q_gate_weight)
+                    lw.q_weight = lw.q_fused_weight
+                    lw.q_gate_weight = lw.q_fused_weight + q_dim * h * 2
+                if 'k_weight' in weights and 'v_weight' in weights:
+                    kv_fused = np.vstack([weights['k_weight'], weights['v_weight']])
+                    lw.kv_fused_weight = upload(kv_fused)
+                    if lw.k_weight:
+                        self.device.free(lw.k_weight)
+                    if lw.v_weight:
+                        self.device.free(lw.v_weight)
+                    lw.k_weight = lw.kv_fused_weight
+                    lw.v_weight = lw.kv_fused_weight + kv_dim * h * 2
 
         # Fuse linear attention input projections (4 GEMV → 1)
         if lw.layer_type == 'linear_attention':
@@ -1734,7 +1785,11 @@ class InferenceEngine:
 
         With TP: each GPU handles local_num_attention_heads Q heads and
         local_num_kv_heads KV heads. O projection is row-parallel with allreduce.
-
+        
+        When use_int4_attention=True (compressed-tensors format):
+        - Uses INT4 GEMV (AWQ kernel) for q/k/v/o projections
+        - Attention weights are INT4 quantized with symmetric quantization
+        
         When _direct_kv_write=True:
         - K GEMV writes to d_k (working buffer for qknorm_rope)
         - V GEMV writes directly to cache position (eliminates V D2D copy)
@@ -1744,29 +1799,66 @@ class InferenceEngine:
         cfg = self.config
         h = cfg.hidden_size
 
-        # Q+Qgate and K+V projections run sequentially on the default stream.
-        # For decode (batch=1), these are tiny GEMVs (~30µs each) where concurrency
-        # benefit is negligible compared to the 2 host-blocking sync calls per layer.
-        # Sequential execution on the default stream guarantees ordering for QKNorm
-        # without explicit stream synchronization.
-        # Stream 1: Q+Qgate fused GEMV → d_q_fused ([Q, Q_gate])
-        self._launch_gemv_fp16(self.d_q_fused, self.d_normed, lw.q_fused_weight,
-                                h, 2 * self.q_dim)
-
-        if self._direct_kv_write:
-            # Split KV GEMV into K GEMV (working buffer) + V GEMV (direct cache write)
-            # K GEMV: writes to d_k (working buffer, needed for qknorm_rope)
-            self._launch_gemv_fp16(self.d_k, self.d_normed, lw.k_weight,
-                                    h, self.kv_dim)
-            # V GEMV: writes directly to cache position (eliminates V D2D copy)
-            # Use get_kv_ptr to get the correct cache position for batch_idx=0
-            _, cache_v_ptr = self.kv_cache.get_kv_ptr(layer_idx, self.kv_cache.current_len, batch_idx=0)
-            self._launch_gemv_fp16(cache_v_ptr, self.d_normed, lw.v_weight,
-                                    h, self.kv_dim)
+        if self.use_int4_attention:
+            # INT4 attention projections (compressed-tensors format)
+            # Use AWQ GEMV kernel (no zero-point subtraction) for q/k/v/o
+            # Enable AWQ mode temporarily if not already enabled
+            was_awq = self._awq_mode
+            if not was_awq and self._gemv_int4_v5_awq:
+                self._awq_mode = True
+            
+            # Q+Qgate fused INT4 GEMV → d_q_fused
+            self._launch_gemv_int4(self.d_q_fused, self.d_normed,
+                                    lw.q_qweight, lw.q_scales, lw.q_zeros,
+                                    h, 2 * self.q_dim)
+            
+            if self._direct_kv_write:
+                # Split KV: K GEMV to working buffer, V GEMV direct to cache
+                self._launch_gemv_int4(self.d_k, self.d_normed,
+                                        lw.k_qweight, lw.k_scales, lw.k_zeros,
+                                        h, self.kv_dim)
+                _, cache_v_ptr = self.kv_cache.get_kv_ptr(layer_idx, self.kv_cache.current_len, batch_idx=0)
+                self._launch_gemv_int4(cache_v_ptr, self.d_normed,
+                                        lw.v_qweight, lw.v_scales, lw.v_zeros,
+                                        h, self.kv_dim)
+            else:
+                # Fused K+V projection
+                # Note: for INT4 we don't have fused KV, so we do sequential
+                self._launch_gemv_int4(self.d_k, self.d_normed,
+                                        lw.k_qweight, lw.k_scales, lw.k_zeros,
+                                        h, self.kv_dim)
+                self._launch_gemv_int4(self.d_v, self.d_normed,
+                                        lw.v_qweight, lw.v_scales, lw.v_zeros,
+                                        h, self.kv_dim)
+            
+            # Restore AWQ mode
+            if not was_awq:
+                self._awq_mode = False
         else:
-            # Fused K+V projection: normed_hidden → [K, V] [2*kv_dim]
-            self._launch_gemv_fp16(self.d_kv_fused, self.d_normed, lw.kv_fused_weight,
-                                    h, 2 * self.kv_dim)
+            # FP16 attention projections (standard GPTQ/AWQ format)
+            # Q+Qgate and K+V projections run sequentially on the default stream.
+            # For decode (batch=1), these are tiny GEMVs (~30µs each) where concurrency
+            # benefit is negligible compared to the 2 host-blocking sync calls per layer.
+            # Sequential execution on the default stream guarantees ordering for QKNorm
+            # without explicit stream synchronization.
+            # Stream 1: Q+Qgate fused GEMV → d_q_fused ([Q, Q_gate])
+            self._launch_gemv_fp16(self.d_q_fused, self.d_normed, lw.q_fused_weight,
+                                    h, 2 * self.q_dim)
+
+            if self._direct_kv_write:
+                # Split KV GEMV into K GEMV (working buffer) + V GEMV (direct cache write)
+                # K GEMV: writes to d_k (working buffer, needed for qknorm_rope)
+                self._launch_gemv_fp16(self.d_k, self.d_normed, lw.k_weight,
+                                        h, self.kv_dim)
+                # V GEMV: writes directly to cache position (eliminates V D2D copy)
+                # Use get_kv_ptr to get the correct cache position for batch_idx=0
+                _, cache_v_ptr = self.kv_cache.get_kv_ptr(layer_idx, self.kv_cache.current_len, batch_idx=0)
+                self._launch_gemv_fp16(cache_v_ptr, self.d_normed, lw.v_weight,
+                                        h, self.kv_dim)
+            else:
+                # Fused K+V projection: normed_hidden → [K, V] [2*kv_dim]
+                self._launch_gemv_fp16(self.d_kv_fused, self.d_normed, lw.kv_fused_weight,
+                                        h, 2 * self.kv_dim)
 
         # No stream sync needed: both GEMVs now run on the default stream,
         # so QKNorm ordering is guaranteed by the null stream's serial execution.
@@ -1809,12 +1901,30 @@ class InferenceEngine:
         # pre-FFN norm in decode_step becomes plain rmsnorm (not skip_rmsnorm).
         # For TP: write to d_proj_out; TPInferenceEngine allreduces first, then
         # decode_step falls through to skip_rmsnorm to handle residual+norm.
-        if self.tp_size <= 1:
-            self._launch_gemv_fp16(self.d_hidden, self.d_attn_out, lw.o_weight,
-                                    self.q_dim, h, residual=self.d_hidden)
+        if self.use_int4_attention:
+            # INT4 O projection (AWQ kernel)
+            was_awq = self._awq_mode
+            if not was_awq and self._gemv_int4_v5_awq:
+                self._awq_mode = True
+            
+            if self.tp_size <= 1:
+                self._launch_gemv_int4(self.d_hidden, self.d_attn_out,
+                                        lw.o_qweight, lw.o_scales, lw.o_zeros,
+                                        self.q_dim, h, residual=self.d_hidden)
+            else:
+                self._launch_gemv_int4(self.d_proj_out, self.d_attn_out,
+                                        lw.o_qweight, lw.o_scales, lw.o_zeros,
+                                        self.q_dim, h)
+            
+            if not was_awq:
+                self._awq_mode = False
         else:
-            self._launch_gemv_fp16(self.d_proj_out, self.d_attn_out, lw.o_weight,
-                                    self.q_dim, h)
+            if self.tp_size <= 1:
+                self._launch_gemv_fp16(self.d_hidden, self.d_attn_out, lw.o_weight,
+                                        self.q_dim, h, residual=self.d_hidden)
+            else:
+                self._launch_gemv_fp16(self.d_proj_out, self.d_attn_out, lw.o_weight,
+                                        self.q_dim, h)
 
         # Note: for tp_size <= 1, d_hidden now contains (old_hidden + out_proj_result).
         # decode_step will run plain rmsnorm on d_hidden for the pre-FFN position.

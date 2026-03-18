@@ -387,9 +387,15 @@ class CompressedTensorsLoader:
           q_proj, k_proj, v_proj, o_proj: weight_packed, weight_scale, weight_shape
         Norm weights remain FP16/BF16.
         
-        Output format matches GPTQ loader:
-          q_weight, q_gate_weight: split from q_proj
-          k_weight, v_weight, o_weight: from respective projections
+        Output format for INT4 attention (use_int4_attention=True in engine):
+          q_qweight, q_scales, q_zeros: INT4 packed Q projection (+ gate)
+          k_qweight, k_scales, k_zeros: INT4 packed K projection
+          v_qweight, v_scales, v_zeros: INT4 packed V projection
+          o_qweight, o_scales, o_zeros: INT4 packed O projection
+        
+        For compatibility with FP16 path (legacy), also provides unpacked:
+          q_weight, q_gate_weight: split from q_proj (FP16 unpacked)
+          k_weight, v_weight, o_weight: from respective projections (FP16)
         """
         # Load quantized attention projections (compressed-tensors format)
         q_proj = self.load_ct_linear_weights(f"{prefix}.self_attn", "q_proj")
@@ -397,45 +403,68 @@ class CompressedTensorsLoader:
         v_proj = self.load_ct_linear_weights(f"{prefix}.self_attn", "v_proj")
         o_proj = self.load_ct_linear_weights(f"{prefix}.self_attn", "o_proj")
         
-        # q_proj is packed: qweight shape [K/8, N] where K=12288 (Q+gate), N=5120
+        # Q projection: q_proj is packed [K/8, N] where K=12288 (Q+gate), N=5120
         # Split into q_weight and q_gate_weight
-        # Original q_proj shape: [12288, 5120] = [num_heads * head_dim * 2, hidden]
-        # qweight: [12288/8, 5120] = [1536, 5120]
-        # After unpacking: [12288, 5120] -> reshape to [24, 512, 5120] -> split on dim 1
         num_heads = self.config.num_attention_heads  # 24
         head_dim = self.config.head_dim  # 256
         hidden = self.config.hidden_size  # 5120
         
-        # Unpack q_proj from [K/8, N] to [K, N]
+        # For INT4 path: keep q_proj in packed format, split q/q_gate
+        # q_proj qweight: [1536, 5120] = [12288/8, 5120]
         K_q, N_q = q_proj['qweight'].shape
+        # Split along K dimension: first half is Q, second half is Q_gate
+        K_q_half = K_q // 2  # 768 = 6144/8
+        weights['q_qweight'] = q_proj['qweight'][:K_q_half, :].copy()  # [768, 5120]
+        weights['q_gate_qweight'] = q_proj['qweight'][K_q_half:, :].copy()  # [768, 5120]
+        # Scales: split along K/group_size dimension
+        K_q_grp = q_proj['scales'].shape[0]
+        K_q_grp_half = K_q_grp // 2
+        weights['q_scales'] = q_proj['scales'][:K_q_grp_half, :].copy()
+        weights['q_gate_scales'] = q_proj['scales'][K_q_grp_half:, :].copy()
+        weights['q_zeros'] = q_proj['zeros'][:K_q_grp_half, :].copy()
+        weights['q_gate_zeros'] = q_proj['zeros'][K_q_grp_half:, :].copy()
+        
+        # For FP16 compatibility path: unpack to FP16
         q_unpacked = np.zeros((K_q * 8, N_q), dtype=np.uint8)
         mask = 0xF
         for b in range(8):
             q_unpacked[b::8, :] = (q_proj['qweight'] >> (b * 4)) & mask
-        
-        # Reshape and split: [12288, 5120] -> [24, 512, 5120] -> [24, 256, 5120] each
         q_reshaped = q_unpacked.reshape(num_heads, head_dim * 2, hidden)
         weights['q_weight'] = q_reshaped[:, :head_dim, :].reshape(
             num_heads * head_dim, hidden).copy()
         weights['q_gate_weight'] = q_reshaped[:, head_dim:, :].reshape(
             num_heads * head_dim, hidden).copy()
         
-        # k_proj, v_proj, o_proj: keep as unpacked FP32 for now (simplified)
-        # Unpack k_proj
+        # K projection: keep packed for INT4 path
+        weights['k_qweight'] = k_proj['qweight'].copy()
+        weights['k_scales'] = k_proj['scales'].copy()
+        weights['k_zeros'] = k_proj['zeros'].copy()
+        
+        # For FP16 compatibility: unpack
         K_k, N_k = k_proj['qweight'].shape
         k_unpacked = np.zeros((K_k * 8, N_k), dtype=np.uint8)
         for b in range(8):
             k_unpacked[b::8, :] = (k_proj['qweight'] >> (b * 4)) & mask
         weights['k_weight'] = k_unpacked.astype(np.float16)
         
-        # Unpack v_proj
+        # V projection: keep packed for INT4 path
+        weights['v_qweight'] = v_proj['qweight'].copy()
+        weights['v_scales'] = v_proj['scales'].copy()
+        weights['v_zeros'] = v_proj['zeros'].copy()
+        
+        # For FP16 compatibility: unpack
         K_v, N_v = v_proj['qweight'].shape
         v_unpacked = np.zeros((K_v * 8, N_v), dtype=np.uint8)
         for b in range(8):
             v_unpacked[b::8, :] = (v_proj['qweight'] >> (b * 4)) & mask
         weights['v_weight'] = v_unpacked.astype(np.float16)
         
-        # Unpack o_proj
+        # O projection: keep packed for INT4 path
+        weights['o_qweight'] = o_proj['qweight'].copy()
+        weights['o_scales'] = o_proj['scales'].copy()
+        weights['o_zeros'] = o_proj['zeros'].copy()
+        
+        # For FP16 compatibility: unpack
         K_o, N_o = o_proj['qweight'].shape
         o_unpacked = np.zeros((K_o * 8, N_o), dtype=np.uint8)
         for b in range(8):
@@ -454,14 +483,28 @@ class CompressedTensorsLoader:
         Quantized projections (INT4): in_proj_qkv, in_proj_z, out_proj
         FP16 projections: in_proj_a, in_proj_b
         Other FP16 tensors: conv1d, A_log, dt_bias, norm
+        
+        For INT4 projections, outputs both packed INT4 format and unpacked FP16:
+          la_in_proj_qkv, la_in_proj_qkv_scales, la_in_proj_qkv_zeros: INT4 packed
+          la_in_proj_qkv: FP16 unpacked (for compatibility)
         """
         la = f"{prefix}.linear_attn"
         
         # Quantized projections (compressed-tensors format)
         for proj in self.QUANTIZED_LINEAR_ATTN:
             w = self.load_ct_linear_weights(la, proj)
-            weights[f'la_{proj}'] = w['qweight']
+            proj_short = proj.replace('in_proj_', '')
+            # Store packed INT4 format
+            weights[f'la_{proj}_qweight'] = w['qweight']
             weights[f'la_{proj}_scales'] = w['scales']
+            weights[f'la_{proj}_zeros'] = w['zeros']
+            # For backward compatibility, also unpack to FP16
+            K, N = w['qweight'].shape
+            unpacked = np.zeros((K * 8, N), dtype=np.uint8)
+            mask = 0xF
+            for b in range(8):
+                unpacked[b::8, :] = (w['qweight'] >> (b * 4)) & mask
+            weights[f'la_{proj}'] = unpacked.astype(np.float16)
         
         # FP16 projections (not quantized)
         weights['la_in_proj_a'] = self.load_tensor(f"{la}.in_proj_a.weight")

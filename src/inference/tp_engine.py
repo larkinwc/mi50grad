@@ -1456,7 +1456,9 @@ class TPInferenceEngine:
     """Multi-GPU tensor-parallel inference engine."""
 
     def __init__(self, config: QwenConfig, device_ids: list,
-                 max_seq_len: int = 2048):
+                 max_seq_len: int = 2048,
+                 quant_format: str = 'w4a16',
+                 use_int4_attention: bool = False):
         self.config = config
         self.tp_size = len(device_ids)
         self.device_ids = device_ids
@@ -1468,6 +1470,8 @@ class TPInferenceEngine:
             engine = InferenceEngine(
                 config, device_id=dev_id, max_seq_len=max_seq_len,
                 tp_size=self.tp_size, tp_rank=rank,
+                quant_format=quant_format,
+                use_int4_attention=use_int4_attention,
             )
             self.engines.append(engine)
 
