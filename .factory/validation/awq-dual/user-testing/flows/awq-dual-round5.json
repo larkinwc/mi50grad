@@ -1,0 +1,121 @@
+{
+  "assertionResults": [
+    {
+      "id": "VAL-AWQ-001",
+      "status": "pass",
+      "evidence": "test_awq_dual_gemv.py: All numerical equivalence tests PASSED. max_abs_err=2.094e-04 to 2.456e-04 < 1e-2 threshold. Tested shapes: N=11008/13696/17408, K=5120, group_size=128.",
+      "metrics": {
+        "max_abs_err_N11008": 2.094209e-04,
+        "max_abs_err_N13696": 2.033412e-04,
+        "max_abs_err_N17408": 2.456307e-04,
+        "threshold": 1e-2
+      },
+      "consoleOutput": "VAL-AWQ-DUAL-001: ALL equivalence tests PASSED\n  ✓ N=11008, K=5120: max_abs_err=2.094209e-04\n  ✓ N=13696, K=5120: max_abs_err=2.033412e-04\n  ✓ N=17408, K=5120: max_abs_err=2.456307e-04"
+    },
+    {
+      "id": "VAL-AWQ-002",
+      "status": "pass",
+      "evidence": "test_awq_dual_dispatch.py: ALL TESTS PASSED. AWQ dual kernel loads successfully (func=766642000). Code inspection confirms engine.py correctly selects AWQ dual kernel (12 params, no zeros) when AWQ mode enabled.",
+      "metrics": {
+        "awq_dual_kernel_loaded": true,
+        "awq_kernel_func_ptr": 766642000,
+        "awq_mode_kernel_params": 12,
+        "gptq_mode_kernel_params": 14,
+        "awq_kernel_has_zeros": false,
+        "gptq_kernel_has_zeros": true
+      },
+      "consoleOutput": "--- Test 1: AWQ Dual Kernel Loads ---\n  PASS: AWQ dual kernel loaded successfully (func=766642000)\n--- Test 2: AWQ vs GPTQ Kernel Parameter Count ---\n  AWQ dual kernel has 12 parameters (no zeros ptr)\n  GPTQ dual kernel has 14 parameters (with gate_zeros and up_zeros)\n  PASS: Parameter count verified by code inspection\n--- Test 3: Engine AWQ Mode Kernel Selection (Code Inspection) ---\n  PASS: Engine correctly selects AWQ dual kernel (12 params, no zeros) when AWQ mode enabled\n  PASS: Engine correctly selects GPTQ dual kernel (14 params, with zeros) when AWQ mode disabled"
+    },
+    {
+      "id": "VAL-AWQ-003",
+      "status": "pass",
+      "evidence": "test_awq_dual_gemv.py: All throughput benchmarks PASSED. AWQ dual kernel shows 2.3-4.1% speedup over GPTQ dual kernel, exceeding 1.02x target.",
+      "metrics": {
+        "speedup_N11008": "1.023x",
+        "speedup_N13696": "1.024x",
+        "speedup_N17408": "1.041x",
+        "target_speedup": ">= 1.02x"
+      },
+      "consoleOutput": "Throughput Report:\n  ✓ N=11008, K=5120: GPTQ=143.0us, AWQ=139.8us, speedup=1.023x\n  ✓ N=13696, K=5120: GPTQ=167.5us, AWQ=163.6us, speedup=1.024x\n  ✓ N=17408, K=5120: GPTQ=218.7us, AWQ=210.1us, speedup=1.041x"
+    },
+    {
+      "id": "VAL-AWQ-004",
+      "status": "blocked",
+      "evidence": "E2E validation blocked: No true AWQ model available. Model at /opt/models/Qwen3.5-27B-AWQ is actually GPTQ format (has qzeros tensors). Running AWQ kernel mode with GPTQ weights causes NaN/Inf because AWQ kernel skips zero-point subtraction (assumes zeros=0), but GPTQ weights have non-zero zero points. C dispatch integration code verified correct by code inspection and kernel loading tests.",
+      "metrics": {
+        "awq_model_detected_as": "gptq",
+        "awq_model_has_qzeros": true,
+        "dispatch_integration_verified": true,
+        "kernel_selection_code_inspected": true
+      },
+      "consoleOutput": "Model format check: Qwen3.5-27B-AWQ has qzeros=True, detected as GPTQ format\nC dispatch integration verified via code inspection (engine.py lines 3449-3503)\nAWQ dual kernel correctly selected when AWQ mode enabled"
+    }
+  ],
+  "frictions": [],
+  "blockers": [
+    {
+      "id": "NO-TRUE-AWQ-MODEL",
+      "description": "Model labeled 'AWQ' at /opt/models/Qwen3.5-27B-AWQ has qzeros tensors (GPTQ format). No true AWQ model (qweight/scales without qzeros) is available on the dev server.",
+      "severity": "blocking",
+      "affectedAssertions": ["VAL-AWQ-004"],
+      "suggestedResolution": "Download true AWQ Qwen 3.5 27B model from HuggingFace (e.g., from casper-hansen/AwqModels or similar) that has qweight/scales but NO qzeros tensors. AWQ format is characterized by absence of zero-point tensors."
+    }
+  ],
+  "toolsUsed": ["ssh", "docker", "python3", "hipcc"],
+  "testFiles": [
+    "tests/test_awq_dual_gemv.py",
+    "tests/test_awq_dual_dispatch.py"
+  ],
+  "testEnvironment": {
+    "devServer": "root@192.168.1.198",
+    "dockerImage": "mixa3607/rocm-gfx906:7.1.0-complete",
+    "gpus": "4x AMD MI50 (gfx906)",
+    "modelPaths": {
+      "gptq": "/opt/models/Qwen3.5-27B-GPTQ-Int4",
+      "awq_labeled": "/opt/models/Qwen3.5-27B-AWQ (actually GPTQ format - has qzeros)",
+      "compressed_tensors": "/opt/models/Qwen3.5-27B-CT-4bit"
+    }
+  },
+  "keyFindings": {
+    "VAL-AWQ-001": {
+      "result": "PASS",
+      "summary": "AWQ dual kernel produces numerically correct output (max_abs_err < 1e-2)",
+      "confidence": "high"
+    },
+    "VAL-AWQ-002": {
+      "result": "PASS",
+      "summary": "AWQ dual kernel loads and engine correctly selects it when AWQ mode enabled",
+      "confidence": "high - kernel loading and code inspection verified"
+    },
+    "VAL-AWQ-003": {
+      "result": "PASS",
+      "summary": "AWQ dual kernel shows 2.3-4.1% speedup over GPTQ dual kernel",
+      "confidence": "high"
+    },
+    "VAL-AWQ-004": {
+      "result": "BLOCKED",
+      "summary": "C dispatch integration code correct, cannot validate E2E without true AWQ model",
+      "confidence": "medium - code inspection confirms implementation correctness"
+    }
+  },
+  "modelFormatSurvey": {
+    "Qwen3.5-27B-AWQ": {
+      "has_qzeros": true,
+      "has_qweight": true,
+      "has_weight_packed": false,
+      "detectedAs": "gptq",
+      "note": "Model labeled 'AWQ' is actually GPTQ format (has qzeros tensors)"
+    },
+    "Qwen3.5-27B-GPTQ-Int4": {
+      "has_qzeros": true,
+      "has_qweight": true,
+      "detectedAs": "gptq"
+    },
+    "Qwen3.5-27B-CT-4bit": {
+      "has_qzeros": false,
+      "has_qweight": false,
+      "has_weight_packed": true,
+      "detectedAs": "compressed-tensors"
+    }
+  }
+}
