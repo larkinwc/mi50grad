@@ -260,13 +260,9 @@ def mode_combined_all(ref_outputs: List[np.ndarray]) -> Dict:
     tp_engine.set_kernel_p2p_allreduce(True)
     print("    - Fused AllReduce+RMSNorm: ENABLED (C dispatch + kernel P2P)")
     
-    # 3. Speculative decoding infrastructure
-    print("    - Speculative decoding: ENABLED (infrastructure)")
-    try:
-        tp_engine.set_speculative_mode(True, ngram_size=5)
-        print("    Speculative mode enabled")
-    except Exception as e:
-        print(f"    Speculative mode: {e}")
+    # Note: Speculative decoding requires decode_step_speculative() API, not compatible with standard decode_step
+    # Speculative infrastructure is available but not enabled for this combined throughput test
+    print("    - Speculative decoding: AVAILABLE (not enabled - requires decode_step_speculative API)")
     
     # Build dispatch cache AFTER all mode settings
     tp_engine.build_dispatch_cache()
