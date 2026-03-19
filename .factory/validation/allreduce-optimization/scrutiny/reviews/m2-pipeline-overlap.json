@@ -1,0 +1,44 @@
+{
+  "featureId": "m2-pipeline-overlap",
+  "reviewedAt": "2026-03-19T14:45:00.000Z",
+  "commitId": "d42449e",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "Feature implementation is complete and meets all requirements. The worker discovered that the aggressive pipelining requested in the feature was already implemented via double-buffer + stream overlap infrastructure, then created a comprehensive benchmark to measure the benefit. Results show 48.1% throughput improvement (21.8 → 32.2 tok/s) with 0.999990 cosine similarity, far exceeding the 2% improvement target.",
+    "issues": [
+      {
+        "file": "tests/bench_m2_pipeline_overlap.py",
+        "line": 221,
+        "severity": "non_blocking",
+        "description": "Benchmark creates two separate TP engines (tp_std and tp_db) which requires loading model weights twice. This increases memory pressure and test time, but is acceptable for a benchmark that runs infrequently."
+      },
+      {
+        "file": "bench/M2_PIPELINE_OVERLAP_ANALYSIS.md",
+        "line": 97,
+        "severity": "suggestion",
+        "description": "The analysis notes 'Expected real speedup: 2-5%' but measured 48.1%. The explanation for this discrepancy is speculative. Could benefit from deeper investigation into why standard overlap is so much slower, but this is beyond the scope of the current feature."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "skills",
+      "observation": "Worker deviated from 'Write Tests First (RED)' step in gpu-kernel-worker skill. This was justified because the feature infrastructure already existed - the double-buffer implementation was complete. Worker created benchmark for validation rather than new implementation.",
+      "evidence": "handoff.skillFeedback.deviations: 'Created benchmark directly since the implementation already exists' - The feature description asked to 'explore' and 'measure', not implement new code."
+    },
+    {
+      "area": "conventions",
+      "observation": "The double-buffer implementation in _decode_step_cached_stream() is a well-established pattern. Other workers should be aware this path exists for compute-communication overlap.",
+      "evidence": "src/inference/tp_engine.py lines 2947-3128 show comprehensive double-buffer support with buffer swap logic. The existing test_double_buffer_tp4.py and test_overlap_double_buffer.py validate this functionality."
+    },
+    {
+      "area": "library",
+      "observation": "The benchmark demonstrates a significant performance gap between standard stream overlap (21.8 tok/s) and double-buffer overlap (32.2 tok/s). This 48% improvement is much larger than the theoretical 2-5% expectation, suggesting the standard path has overhead issues worth investigating.",
+      "evidence": "bench/M2_PIPELINE_OVERLAP_ANALYSIS.md lines 84-95 document this discrepancy. The standard path appears to have suboptimal event synchronization or CPU-blocking behavior."
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS - Feature fully meets requirements. Worker correctly identified that aggressive pipelining was already implemented via double-buffer + stream overlap. Created comprehensive benchmark (tests/bench_m2_pipeline_overlap.py) with thorough documentation (bench/M2_PIPELINE_OVERLAP_ANALYSIS.md). Measured 48.1% throughput improvement (exceeds 2% target) with 0.999990 cosine similarity (exceeds 0.99 threshold). Documented that overlap is absolutely worth the complexity. Skill deviation from TDD was justified since feature was about exploring/measuring existing infrastructure, not implementing new code."
+}

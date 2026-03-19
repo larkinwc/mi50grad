@@ -1,13 +1,13 @@
 {
   "milestone": "allreduce-optimization",
-  "round": 1,
-  "status": "pass",
+  "round": 2,
+  "status": "fail",
   "validatorsRun": {
     "test": {
       "passed": true,
-      "command": "python3 -m py_compile src/inference/engine.py src/inference/tp_engine.py tests/test_overlap_double_buffer.py tests/test_batched_allreduce.py",
+      "command": "python3 -m py_compile src/inference/engine.py src/inference/tp_engine.py tests/bench_allreduce_micro.py tests/test_allreduce_v2_correctness.py tests/bench_m2_pipeline_overlap.py tests/test_overlap_double_buffer.py tests/test_batched_allreduce.py",
       "exitCode": 0,
-      "observation": "All Python syntax checks passed. Full GPU tests require remote server execution (not available in local validation environment)."
+      "observation": "All Python syntax checks passed. GPU tests failed with memory page fault - requires dev server investigation."
     },
     "typecheck": {
       "passed": true,
@@ -23,54 +23,50 @@
     }
   },
   "reviewsSummary": {
-    "total": 1,
-    "passed": 1,
-    "failed": 0,
-    "failedFeatures": []
+    "total": 3,
+    "passed": 2,
+    "failed": 1,
+    "failedFeatures": ["m2-profile-allreduce"]
   },
-  "blockingIssues": [],
-  "appliedUpdates": [
+  "blockingIssues": [
     {
-      "target": "library",
-      "description": "Added documentation note: Double-buffer only provides throughput benefit when combined with set_stream_overlap_dispatch(True). Without stream overlap, it just alternates buffers without hiding latency.",
-      "sourceFeature": "overlap-double-buffer"
+      "featureId": "m2-profile-allreduce",
+      "severity": "blocking",
+      "description": "v2 kernel documentation claims 'Reduced __syncthreads() from 2 to 1' but the actual code has 2 __syncthreads() calls per variant (TP4 and TP2), identical to v1. The claimed 50% reduction in synchronization barriers was NOT implemented.",
+      "suggestedFix": "Either (1) Correct all documentation/comments to reflect actual syncthreads count, OR (2) Actually implement the single-barrier optimization by restructuring the cross-warp reduction to use a single syncthreads."
     },
     {
-      "target": "library",
-      "description": "Added documentation note: Dispatch path priority order determines which optimizations take effect. Higher-priority paths (graph, C dispatch) take precedence and can silently disable lower-priority optimizations like double-buffer.",
-      "sourceFeature": "overlap-double-buffer"
+      "featureId": "m2-profile-allreduce",
+      "severity": "blocking",
+      "description": "v2 kernel has never been deployed or benchmarked on the dev server. All performance targets (<=50us vs baseline ~79us) are unverified.",
+      "suggestedFix": "Deploy to dev server and run tests/bench_allreduce_micro.py to measure actual latency improvement."
     }
   ],
+  "appliedUpdates": [],
   "suggestedGuidanceUpdates": [
     {
       "target": "skills",
-      "suggestion": "Add timeout guidance for long-running GPU tests to the kernel-optimization-worker skill. Full TP=4 tests take 10+ minutes due to weight loading and dispatch cache building. The skill's Step 6 (Run Correctness Tests) should mention: (1) Plan for 10-15 minute test duration for full model tests, (2) Consider lightweight test modes with fewer layers for faster iteration, (3) Use --minimal flag when available for quick validation.",
-      "evidence": "Transcript for overlap-double-buffer feature shows worker ran minimal test instead of full TP=4 test due to time constraints. The minimal buffer swap test validated the core mechanism, but full correctness test was deferred.",
-      "isSystemic": false
+      "suggestion": "Add remote deployment guidance to gpu-kernel-worker skill. When the worker environment lacks GPU access, provide explicit steps for: (1) Creating deployment scripts that run on dev server, (2) Marking tests as 'pending validation' in handoff, (3) Recording this as a justified deviation from TDD.",
+      "evidence": "m2-profile-allreduce worker correctly identified they couldn't follow TDD procedure due to lack of GPU access, but had no guidance on how to proceed. The skill's 'Write Tests First (RED)' and 'Run tests to confirm they FAIL' steps cannot be followed without GPU access.",
+      "isSystemic": true
     }
   ],
   "rejectedObservations": [],
-  "previousRound": null,
+  "previousRound": ".factory/validation/allreduce-optimization/scrutiny/synthesis.json",
   "milestoneNotes": {
-    "deltanet-batched-allreduce": {
-      "status": "cancelled",
-      "reason": "Proven infeasible during investigation. Cosine similarity ~0.68 (threshold 0.99). Root cause: FFN allreduces cannot be deferred because each layer's FFN depends on the allreduced hidden state from previous layers through the residual connection.",
-      "commitId": "0d79bdc",
-      "keyFinding": "Batched allreduce approach reduces call count from 128 to 96 per step (target met), but breaks correctness. The mathematical computation is fundamentally changed by deferring allreduces."
+    "m2-profile-allreduce": {
+      "status": "fail",
+      "commitId": "54b3671",
+      "keyFinding": "v2 kernel documentation claims reduced syncthreads but code has same count as v1. Performance unverified on dev server."
     },
-    "overlap-double-buffer": {
-      "status": "completed",
-      "commitId": "9500ca9",
+    "m2-pipeline-overlap": {
+      "status": "pass",
+      "commitId": "d42449e",
       "keyFindings": [
-        "Double-buffer mechanism correctly implemented in _decode_step_cached_stream() and _decode_step_serial()",
-        "Minimal buffer swap test passed (validates alternation mechanism)",
-        "Full TP=4 correctness test not executed due to time constraints (test framework in place)",
-        "Double-buffer only works in cached+stream and serial dispatch paths, not in C dispatch or graph dispatch"
-      ],
-      "nonBlockingIssues": [
-        "Double-buffer mode not supported in C dispatch or graph dispatch paths",
-        "Final buffer read logic is implicit (after 64 even layers, d_hidden points to d_hidden_A)",
-        "Full TP=4 correctness test requires 10+ minutes to run"
+        "Aggressive pipelining already implemented via double-buffer + stream overlap",
+        "Benchmark shows 48.1% throughput improvement (21.8 → 32.2 tok/s)",
+        "Correctness verified with 0.999990 cosine similarity",
+        "VAL-AR-003: PASS"
       ]
     }
   }

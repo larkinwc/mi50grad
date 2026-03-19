@@ -1,0 +1,51 @@
+{
+  "featureId": "m2-profile-allreduce",
+  "reviewedAt": "2026-03-19T14:30:00.000Z",
+  "commitId": "54b3671",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "fail",
+  "codeReview": {
+    "summary": "The v2 kernel implementation contains incorrect documentation and comments claiming reduced synchronization, but the actual code has the same number of __syncthreads() calls as v1. The kernel has NOT been deployed or benchmarked on the dev server, so performance claims are unverified.",
+    "issues": [
+      {
+        "file": "src/kernels/kernel_p2p_allreduce_rmsnorm_v2.hip",
+        "line": 8,
+        "severity": "blocking",
+        "description": "Documentation claims 'Reduced __syncthreads() from 2 to 1' but the kernel actually contains 2 __syncthreads() calls (lines 188, 195 for TP4, lines 360, 365 for TP2), same as v1. The optimization claim is false - both v1 and v2 have exactly 2 __syncthreads() barriers per kernel variant."
+      },
+      {
+        "file": "src/kernels/kernel_p2p_allreduce_rmsnorm_v2.hip",
+        "line": 35,
+        "severity": "blocking",
+        "description": "Comment 'Single __syncthreads() barrier (vs 2 in v1)' contradicts the actual code which has 2 __syncthreads() calls."
+      },
+      {
+        "file": "src/kernels/kernel_p2p_allreduce_rmsnorm_v2.hip",
+        "line": 188,
+        "severity": "blocking",
+        "description": "The comment '// Single barrier' on line 188 and '// Ensure total is visible (needed for correctness)' on line 195 are contradictory. Both __syncthreads() calls are present, meaning the claimed optimization to reduce barriers from 2 to 1 was NOT implemented correctly."
+      },
+      {
+        "file": "ALLREDUCE_OPTIMIZATION_SUMMARY.md",
+        "line": 48,
+        "severity": "blocking",
+        "description": "Documentation states 'Reduced Synchronization Points (2 -> 1 __syncthreads())' and claims a 50% reduction in syncthreads, but this is false. The v2 kernel code has 2 __syncthreads() per variant, identical to v1. The 'expected improvement' calculations are based on incorrect assumptions."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "skills",
+      "observation": "The gpu-kernel-worker skill requires GPU hardware for test execution (TDD RED/GREEN phases), but the worker environment (local macOS) cannot access the dev server GPUs. The worker correctly identified this as a deviation from procedure but had no guidance on how to proceed. This is a gap in the skill for remote deployment scenarios.",
+      "evidence": "Handoff skillFeedback.deviations: 'Tests require GPU hardware on dev server which is not accessible from local environment. Created tests that will run correctly when deployed.' The skill's 'Write Tests First (RED)' and 'Run tests to confirm they FAIL' steps cannot be followed without GPU access."
+    },
+    {
+      "area": "conventions",
+      "observation": "The worker correctly followed the AGENTS.md guidance for dev server deployment (stop vLLM, run tests, restart vLLM) in the test script, but the kernel was never actually deployed or tested on hardware. The handoff correctly notes 'Deployment requires manual execution of test script on dev server'.",
+      "evidence": "scripts/test_allreduce_opt.sh correctly stops vLLM, builds kernels, runs benchmark, and restarts vLLM. Handoff.whatWasLeftUndone: 'Deployment to dev server and actual benchmarking. The optimized kernel and tests are ready but need to be deployed to the GPU server'"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "BLOCKING: The v2 kernel documentation and comments falsely claim that __syncthreads() was reduced from 2 to 1, but analysis shows both v1 and v2 have exactly 2 __syncthreads() calls per kernel variant (TP4 and TP2). The claimed 50% reduction in synchronization barriers was NOT implemented. Additionally, the kernel has never been deployed or benchmarked on the dev server, so actual performance is unknown. The worker acknowledged they could not follow the TDD procedure due to lack of GPU access, but the implementation itself contains incorrect documentation. Required fixes: (1) Correct all documentation/comments to reflect actual syncthreads count, OR (2) Actually implement the single-barrier optimization by restructuring the cross-warp reduction to use a single syncthreads."
+}
