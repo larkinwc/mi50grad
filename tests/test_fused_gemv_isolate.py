@@ -443,7 +443,7 @@ print(f"  Reference output range: [{float(result_v6.min()):.4f}, {float(result_v
 print(f"\nRunning fused kernel GEMV portion (TP=4, partitioned weights)...")
 results_fused = []
 for tp_rank in range(4):
-    result_partition = run_fused_gemv_portion(
+    result_partition = run_fused_gemv_isolated(
         A_h16, 
         B_q4_parts[tp_rank],  # Partitioned weights
         scales_parts[tp_rank],

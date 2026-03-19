@@ -1724,6 +1724,9 @@ class TPInferenceEngine:
         self.config = config
         self.tp_size = len(device_ids)
         self.device_ids = device_ids
+        
+        # Compute local intermediate size for TP sharding
+        self.local_intermediate_size = config.intermediate_size // self.tp_size
 
         self.tp_group = TensorParallelGroup(device_ids)
 
@@ -5288,10 +5291,10 @@ class TPInferenceEngine:
                     gemv_fused_lib.gemv_int4_p2p_allreduce_rmsnorm_tp4,
                     ct.c_void_p
                 ).value
-                # DISABLED: Fused GEMV+AR+RMSNorm kernel has issues that need investigation.
-                # Currently causes regression (15 tok/s vs 44 tok/s baseline).
-                # TODO: Fix and re-enable after proper validation.
-                if False:  # Disabled until fixed
+                # Fused GEMV+AR+RMSNorm kernel - enabled after fixing double-counting bug
+                # The bug was in Phase 2 where partial_local was incorrectly added to
+                # partial_result (which already contains the inline GEMV output).
+                if True:  # Enabled after fix validation
                     use_gemv_fused_in_c = True
                     print(f"C dispatch: fused GEMV+AR+RMSNorm kernel ENABLED for FFN down-proj "
                           f"(fn_ptr=0x{gemv_fused_fn_ptr:016x})")

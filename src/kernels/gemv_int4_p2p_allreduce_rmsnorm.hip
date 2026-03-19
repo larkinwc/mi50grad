@@ -243,14 +243,16 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
     // Phase 2: P2P Allreduce - Read peer partials and reduce
     // Each GPU reads all 4 partials (local + 3 peers) via P2P BAR1
     // Access uses global column index (col) for P2P buffers
+    //
+    // NOTE: partial_result already contains the inline GEMV output from Phase 1.
+    // We only add peer partials here, NOT partial_local (which would double-count).
+    // The fused kernel computes GEMV inline, so partial_local is not needed.
     // =================================================================
     float total = partial_result;
     
     // Add peer partials via P2P BAR1 pointers
-    // partial_local and peer buffers are full-size [N], accessed at global col
-    if (partial_local != nullptr) {
-        total += __half2float(partial_local[col]);
-    }
+    // Peer buffers are full-size [N], accessed at global col
+    // Do NOT add partial_local - it would double-count the GEMV result
     total += __half2float(partial_peer0[col]);
     total += __half2float(partial_peer1[col]);
     total += __half2float(partial_peer2[col]);
@@ -408,10 +410,10 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp2_kernel(
     __syncthreads();
 
     // Phase 2: P2P Allreduce (TP=2)
+    // NOTE: partial_result already contains the inline GEMV output from Phase 1.
+    // We only add peer partials here, NOT partial_local (which would double-count).
     float total = partial_result;
-    if (partial_local != nullptr) {
-        total += __half2float(partial_local[col]);
-    }
+    // Do NOT add partial_local - it would double-count the GEMV result
     total += __half2float(partial_peer0[col]);
 
     // Phase 3: RMSNorm
