@@ -78,7 +78,7 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp4_v3_kernel(
     float eps
 ) {
     const unsigned int tid = threadIdx.x;
-    const unsigned int tid64 = tid * 64;  // For 64-element stride
+    const unsigned int tid80 = tid * 80;  // Each thread processes 80 elements (5120/64=80)
     const unsigned int lane = tid;  // tid == lane for single-wavefront
     
     // Base pointers for this batch item
@@ -98,7 +98,7 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp4_v3_kernel(
     
     // Main loop: 80 elements per iteration
     // stride = num_threads * elements_per_thread = 64 * 80 = 5120
-    for (unsigned int base_idx = tid64; base_idx < dim; base_idx += 5120) {
+    for (unsigned int base_idx = tid80; base_idx < dim; base_idx += 5120) {
         #pragma unroll 80
         for (unsigned int k = 0; k < 80 && (base_idx + k) < dim; k++) {
             unsigned int idx = base_idx + k;
@@ -147,7 +147,7 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp4_v3_kernel(
     // Phase 4: Apply RMSNorm + weight
     // Each thread processes same 80 elements as Phase 1
     // ================================================================
-    for (unsigned int base_idx = tid64; base_idx < dim; base_idx += 5120) {
+    for (unsigned int base_idx = tid80; base_idx < dim; base_idx += 5120) {
         #pragma unroll 80
         for (unsigned int k = 0; k < 80 && (base_idx + k) < dim; k++) {
             unsigned int idx = base_idx + k;
@@ -178,7 +178,7 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp2_v3_kernel(
     float eps
 ) {
     const unsigned int tid = threadIdx.x;
-    const unsigned int tid64 = tid * 64;
+    const unsigned int tid80 = tid * 80;  // Each thread processes 80 elements (5120/64=80)
     const unsigned int lane = tid;
     
     const __half* h_ptr   = hidden + blockIdx.x * dim;
@@ -188,7 +188,7 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp2_v3_kernel(
     
     float sum_sq = 0.0f;
     
-    for (unsigned int base_idx = tid64; base_idx < dim; base_idx += 5120) {
+    for (unsigned int base_idx = tid80; base_idx < dim; base_idx += 5120) {
         #pragma unroll 80
         for (unsigned int k = 0; k < 80 && (base_idx + k) < dim; k++) {
             unsigned int idx = base_idx + k;
@@ -217,7 +217,7 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp2_v3_kernel(
     
     float rms_inv = rsqrtf(sum_sq / (float)dim + eps);
     
-    for (unsigned int base_idx = tid64; base_idx < dim; base_idx += 5120) {
+    for (unsigned int base_idx = tid80; base_idx < dim; base_idx += 5120) {
         #pragma unroll 80
         for (unsigned int k = 0; k < 80 && (base_idx + k) < dim; k++) {
             unsigned int idx = base_idx + k;
