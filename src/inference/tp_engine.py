@@ -5292,9 +5292,10 @@ class TPInferenceEngine:
                     ct.c_void_p
                 ).value
                 # Fused GEMV+AR+RMSNorm kernel - enabled after fixing double-counting bug
-                # The bug was in Phase 2 where partial_local was incorrectly added to
-                # partial_result (which already contains the inline GEMV output).
-                if True:  # Enabled after fix validation
+                # DEFERRED: Fused GEMV+AR+RMSNorm kernel has fundamental architectural
+                # conflict: GEMV needs multi-WG parallelism but RMSNorm needs global
+                # reduction. Double-counting bug was fixed but RMSNorm is still broken.
+                if False:  # Disabled - architectural redesign needed
                     use_gemv_fused_in_c = True
                     print(f"C dispatch: fused GEMV+AR+RMSNorm kernel ENABLED for FFN down-proj "
                           f"(fn_ptr=0x{gemv_fused_fn_ptr:016x})")
