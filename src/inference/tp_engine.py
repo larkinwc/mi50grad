@@ -5224,10 +5224,10 @@ class TPInferenceEngine:
         fused_so_path_v2 = build_dir / "kernel_p2p_allreduce_rmsnorm_v2.so"
         fused_so_path_v1 = build_dir / "kernel_p2p_allreduce_rmsnorm.so"
         
-        # Priority: v1 > v2 > v3 (v3 has regression, using v1)
+        # Priority: v3 > v2 > v1
         fused_so_path = None
         kernel_version = None
-        for path, version in [(fused_so_path_v1, "v1"), (fused_so_path_v2, "v2"), (fused_so_path_v3, "v3")]:
+        for path, version in [(fused_so_path_v3, "v3"), (fused_so_path_v2, "v2"), (fused_so_path_v1, "v1")]:
             if path.exists():
                 fused_so_path = path
                 kernel_version = version

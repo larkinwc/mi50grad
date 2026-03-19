@@ -1,45 +1,22 @@
 /**
  * Optimized Fused P2P Allreduce + RMSNorm Kernel (v3)
  * 
- * PROFILING-BASED OPTIMIZATIONS (from m2-profile-pcie4-bandwidth):
+ * FIXED: Memory access pattern now uses interleaved stride for coalescing.
+ * Uses 256 threads (4 wavefronts) to match v1 baseline.
  * 
- * Key Finding: 10KB allreduce is LATENCY-BOUND, not bandwidth-bound
- * - Kernel launch overhead: 12.20 µs (fixed cost)
- * - Total 10KB latency (benchmark): 20.37 µs
- * - Current full allreduce: ~79 µs (59 µs overhead to eliminate)
- * - Vectorization provides NO benefit for small payloads
- * - Access pattern is irrelevant (sequential == random)
- * 
- * Optimizations applied in v3:
- *   1. Single-wavefront design (64 threads instead of 128/256)
- *      - Eliminates cross-wavefront synchronization
- *      - Reduces warp scheduling overhead
- *      - Each thread does 2x more work (80 elements vs 40)
- *   
- *   2. Reduced synchronization barriers
- *      - v2: 2 __syncthreads() barriers
- *      - v3: 1 __syncthreads() barrier (single warp, no cross-warp LDS needed)
- *   
- *   3. Optimized thread configuration
- *      - 64 threads (exactly 1 wavefront)
- *      - 80 FP16 elements per thread for hidden_size=5120
- *      - Total coverage: 64 × 80 = 5120 elements (perfect fit)
- *   
- *   4. Minimized instruction overhead
- *      - Use __shfl_sync for intra-wavefront reduction (no LDS)
- *      - Wave leader computes total, broadcasts via __shfl
- *      - Eliminates LDS latency and barriers
- *   
- *   5. Streamlined memory access
- *      - Simple scalar loads (vectorization doesn't help for latency-bound)
- *      - No complex addressing logic
- *      - Direct accumulation into registers
+ * Key optimizations:
+ *   1. 256 threads (4 wavefronts) - same as v1
+ *   2. Interleaved memory access (stride 256) for coalescing
+ *   3. Vectorized float4 loads (8 FP16 at a time)
+ *   4. 2 __syncthreads() barriers (same as v1)
+ *   5. Optimized LDS reduction
+ *
+ * Memory access pattern:
+ *   Thread t accesses elements at: t*8, t*8+256, t*8+512, ...
+ *   Adjacent threads access adjacent 8-element chunks.
+ *   For hidden_size=5120: 256 threads × 20 elements = 5120 (perfect fit)
  *
  * Target: gfx906 (MI50/MI60)
- * Compilation: hipcc -O3 --offload-arch=gfx906 -std=c++17 -shared -fPIC
- *
- * Performance target: <= 40us per call (vs ~75us v2, ~79us baseline)
- * Correctness: max_abs_error < 5e-3 vs reference
  */
 
 #include <hip/hip_runtime.h>
@@ -47,25 +24,15 @@
 
 /* ===================================================================
  * Optimized GPU kernel: fused P2P allreduce + RMSNorm v3
- * Single-wavefront design for latency-bound 10KB payloads
+ * Four-wavefront design with interleaved memory access (matches v1)
  * =================================================================== */
 
 /**
  * kernel_p2p_allreduce_rmsnorm_tp4_v3_kernel:
  *
- * OPTIMIZATIONS:
- *   - 64 threads (single wavefront) instead of 128/256
- *   - 80 elements per thread (vs 16 in v2, 40 in v1)
- *   - 1 __syncthreads() barrier (vs 2 in v2/v1)
- *   - No LDS usage - pure register + __shfl reduction
- *   - Streamlined code path for minimal instruction overhead
- *
- * PERFECT FIT FOR hidden_size=5120:
- *   64 threads × 80 elements = 5120 total (no scalar tail needed)
- *
- * Grid: (batch_size, 1, 1), Block: (64, 1, 1)
+ * Grid: (batch_size, 1, 1), Block: (256, 1, 1)
  */
-__attribute__((amdgpu_flat_work_group_size(64, 64)))
+__attribute__((amdgpu_flat_work_group_size(256, 256)))
 __global__ void kernel_p2p_allreduce_rmsnorm_tp4_v3_kernel(
     __half* __restrict__ output,
     const __half* hidden,
@@ -77,9 +44,8 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp4_v3_kernel(
     unsigned int dim,
     float eps
 ) {
-    const unsigned int tid = threadIdx.x;
-    const unsigned int tid80 = tid * 80;  // Each thread processes 80 elements (5120/64=80)
-    const unsigned int lane = tid;  // tid == lane for single-wavefront
+    unsigned int wf_id = threadIdx.x / 64;
+    unsigned int lane   = threadIdx.x % 64;
     
     // Base pointers for this batch item
     const __half* h_ptr   = hidden + blockIdx.x * dim;
@@ -91,39 +57,67 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp4_v3_kernel(
     
     // ================================================================
     // Phase 1: Reduce all partials + compute sum-of-squares
-    // Each thread processes 80 elements (stride = 64*80 = 5120)
-    // For dim=5120: single iteration covers all elements
+    // Interleaved access: thread t handles {t*8, t*8+256, t*8+512, ...}
+    // Uses vectorized float4 loads (8 FP16 at a time)
     // ================================================================
     float sum_sq = 0.0f;
     
-    // Main loop: 80 elements per iteration
-    // stride = num_threads * elements_per_thread = 64 * 80 = 5120
-    for (unsigned int base_idx = tid80; base_idx < dim; base_idx += 5120) {
-        #pragma unroll 80
-        for (unsigned int k = 0; k < 80 && (base_idx + k) < dim; k++) {
-            unsigned int idx = base_idx + k;
+    // Vectorized path: each thread processes 8-element chunks with stride 256*8=2048
+    // For dim=5120: 5120/2048 = 2.5, so 2 full iterations + tail
+    for (unsigned int i = threadIdx.x * 8; i + 7 < dim; i += 256 * 8) {
+        // Vectorized loads (float4 = 128-bit = 8 FP16)
+        float4 h4  = *reinterpret_cast<const float4*>(h_ptr + i);
+        float4 pl4 = *reinterpret_cast<const float4*>(p_local + i);
+        float4 p04 = *reinterpret_cast<const float4*>(p_peer0 + i);
+        float4 p14 = *reinterpret_cast<const float4*>(p_peer1 + i);
+        float4 p24 = *reinterpret_cast<const float4*>(p_peer2 + i);
+        
+        const __half2* h_h2  = reinterpret_cast<const __half2*>(&h4);
+        const __half2* pl_h2 = reinterpret_cast<const __half2*>(&pl4);
+        const __half2* p0_h2 = reinterpret_cast<const __half2*>(&p04);
+        const __half2* p1_h2 = reinterpret_cast<const __half2*>(&p14);
+        const __half2* p2_h2 = reinterpret_cast<const __half2*>(&p24);
+        
+        float4 sum4;
+        __half2* sum_h2 = reinterpret_cast<__half2*>(&sum4);
+        
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            float v0 = __half2float(__low2half (h_h2[k]))
+                     + __half2float(__low2half (pl_h2[k]))
+                     + __half2float(__low2half (p0_h2[k]))
+                     + __half2float(__low2half (p1_h2[k]))
+                     + __half2float(__low2half (p2_h2[k]));
+            float v1 = __half2float(__high2half(h_h2[k]))
+                     + __half2float(__high2half(pl_h2[k]))
+                     + __half2float(__high2half(p0_h2[k]))
+                     + __half2float(__high2half(p1_h2[k]))
+                     + __half2float(__high2half(p2_h2[k]));
             
-            // Load from all 5 buffers (hidden + 4 partials)
-            float h  = __half2float(h_ptr[idx]);
-            float pl = __half2float(p_local[idx]);
-            float p0 = __half2float(p_peer0[idx]);
-            float p1 = __half2float(p_peer1[idx]);
-            float p2 = __half2float(p_peer2[idx]);
-            
-            // FP32 accumulation
-            float sum = h + pl + p0 + p1 + p2;
-            
-            // Store reduced sum temporarily
-            out[idx] = __float2half(sum);
-            
-            // Accumulate sum-of-squares
-            sum_sq += sum * sum;
+            sum_h2[k] = __halves2half2(__float2half(v0), __float2half(v1));
+            sum_sq += v0 * v0 + v1 * v1;
+        }
+        
+        *reinterpret_cast<float4*>(out + i) = sum4;
+    }
+    
+    // Scalar tail (for non-multiple-of-8 dims)
+    {
+        unsigned int vec_dim = (dim / 8) * 8;
+        for (unsigned int i = vec_dim + threadIdx.x; i < dim; i += 256) {
+            float v = __half2float(h_ptr[i])
+                    + __half2float(p_local[i])
+                    + __half2float(p_peer0[i])
+                    + __half2float(p_peer1[i])
+                    + __half2float(p_peer2[i]);
+            out[i] = __float2half(v);
+            sum_sq += v * v;
         }
     }
     
     // ================================================================
-    // Phase 2: Intra-wavefront reduction (single warp, no LDS)
-    // 6-step butterfly reduction across 64 lanes
+    // Phase 2: Intra-wavefront reduction (shuffle)
+    // 6-step butterfly reduction across 64 lanes within each wavefront
     // ================================================================
     sum_sq += __shfl_xor(sum_sq, 32);
     sum_sq += __shfl_xor(sum_sq, 16);
@@ -133,40 +127,68 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp4_v3_kernel(
     sum_sq += __shfl_xor(sum_sq, 1);
     
     // ================================================================
-    // Phase 3: Broadcast total sum from lane 0 to all lanes
-    // After butterfly reduction, lane 0 has the correct total.
-    // All threads need this value to compute rms_inv.
+    // Phase 3: Cross-wavefront reduction via LDS (2 barriers)
     // ================================================================
-    sum_sq = __shfl(sum_sq, 0);  // Broadcast from lane 0 to all lanes
+    __shared__ float s_wf[4];
+    if (lane == 0) s_wf[wf_id] = sum_sq;
+    __syncthreads();
     
-    // Compute inverse RMS (all threads now have correct sum_sq)
-    float rms_inv = rsqrtf(sum_sq / (float)dim + eps);
+    if (threadIdx.x < 4) {
+        float total = s_wf[0] + s_wf[1] + s_wf[2] + s_wf[3];
+        s_wf[threadIdx.x] = total;
+    }
+    __syncthreads();
+    float total_sq = s_wf[0];
+    
+    // Compute inverse RMS
+    float rms_inv = rsqrtf(total_sq / (float)dim + eps);
     
     // ================================================================
     // Phase 4: Apply RMSNorm + weight
-    // Each thread processes same 80 elements as Phase 1
+    // Same interleaved access pattern as Phase 1
     // ================================================================
-    for (unsigned int base_idx = tid80; base_idx < dim; base_idx += 5120) {
-        #pragma unroll 80
-        for (unsigned int k = 0; k < 80 && (base_idx + k) < dim; k++) {
-            unsigned int idx = base_idx + k;
+    for (unsigned int i = threadIdx.x * 8; i + 7 < dim; i += 256 * 8) {
+        float4 sum4 = *reinterpret_cast<const float4*>(out + i);
+        float4 w4   = *reinterpret_cast<const float4*>(weight + i);
+        
+        const __half2* sum_h2 = reinterpret_cast<const __half2*>(&sum4);
+        const __half2* w_h2   = reinterpret_cast<const __half2*>(&w4);
+        
+        float4 out4;
+        __half2* out_h2 = reinterpret_cast<__half2*>(&out4);
+        
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            float s0 = __half2float(__low2half (sum_h2[k]));
+            float s1 = __half2float(__high2half(sum_h2[k]));
+            float w0 = __half2float(__low2half (w_h2[k]));
+            float w1 = __half2float(__high2half(w_h2[k]));
             
-            // Load reduced sum (stored in Phase 1) and weight
-            float val = __half2float(out[idx]);
-            float w   = __half2float(weight[idx]);
-            
-            // Apply RMSNorm and weight
-            out[idx] = __float2half(val * rms_inv * w);
+            out_h2[k] = __halves2half2(
+                __float2half(s0 * rms_inv * w0),
+                __float2half(s1 * rms_inv * w1)
+            );
+        }
+        
+        *reinterpret_cast<float4*>(out + i) = out4;
+    }
+    
+    // Scalar tail
+    {
+        unsigned int vec_dim = (dim / 8) * 8;
+        for (unsigned int i = vec_dim + threadIdx.x; i < dim; i += 256) {
+            float val = __half2float(out[i]);
+            float w   = __half2float(weight[i]);
+            out[i] = __float2half(val * rms_inv * w);
         }
     }
 }
 
 /**
  * kernel_p2p_allreduce_rmsnorm_tp2_v3_kernel:
- * TP=2 variant (same single-wavefront optimizations)
- * 64 threads × 80 elements = 5120 (perfect fit for hidden_size=5120)
+ * TP=2 variant (same 256-thread design)
  */
-__attribute__((amdgpu_flat_work_group_size(64, 64)))
+__attribute__((amdgpu_flat_work_group_size(256, 256)))
 __global__ void kernel_p2p_allreduce_rmsnorm_tp2_v3_kernel(
     __half* __restrict__ output,
     const __half* hidden,
@@ -176,9 +198,8 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp2_v3_kernel(
     unsigned int dim,
     float eps
 ) {
-    const unsigned int tid = threadIdx.x;
-    const unsigned int tid80 = tid * 80;  // Each thread processes 80 elements (5120/64=80)
-    const unsigned int lane = tid;
+    unsigned int wf_id = threadIdx.x / 64;
+    unsigned int lane   = threadIdx.x % 64;
     
     const __half* h_ptr   = hidden + blockIdx.x * dim;
     const __half* p_local = partial_local + blockIdx.x * dim;
@@ -187,18 +208,44 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp2_v3_kernel(
     
     float sum_sq = 0.0f;
     
-    for (unsigned int base_idx = tid80; base_idx < dim; base_idx += 5120) {
-        #pragma unroll 80
-        for (unsigned int k = 0; k < 80 && (base_idx + k) < dim; k++) {
-            unsigned int idx = base_idx + k;
+    // Interleaved access with vectorized loads (stride 256)
+    for (unsigned int i = threadIdx.x * 8; i + 7 < dim; i += 256 * 8) {
+        float4 h4  = *reinterpret_cast<const float4*>(h_ptr + i);
+        float4 pl4 = *reinterpret_cast<const float4*>(p_local + i);
+        float4 p04 = *reinterpret_cast<const float4*>(p_peer0 + i);
+        
+        const __half2* h_h2  = reinterpret_cast<const __half2*>(&h4);
+        const __half2* pl_h2 = reinterpret_cast<const __half2*>(&pl4);
+        const __half2* p0_h2 = reinterpret_cast<const __half2*>(&p04);
+        
+        float4 sum4;
+        __half2* sum_h2 = reinterpret_cast<__half2*>(&sum4);
+        
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            float v0 = __half2float(__low2half (h_h2[k]))
+                     + __half2float(__low2half (pl_h2[k]))
+                     + __half2float(__low2half (p0_h2[k]));
+            float v1 = __half2float(__high2half(h_h2[k]))
+                     + __half2float(__high2half(pl_h2[k]))
+                     + __half2float(__high2half(p0_h2[k]));
             
-            float h  = __half2float(h_ptr[idx]);
-            float pl = __half2float(p_local[idx]);
-            float p0 = __half2float(p_peer0[idx]);
-            
-            float sum = h + pl + p0;
-            out[idx] = __float2half(sum);
-            sum_sq += sum * sum;
+            sum_h2[k] = __halves2half2(__float2half(v0), __float2half(v1));
+            sum_sq += v0 * v0 + v1 * v1;
+        }
+        
+        *reinterpret_cast<float4*>(out + i) = sum4;
+    }
+    
+    // Scalar tail
+    {
+        unsigned int vec_dim = (dim / 8) * 8;
+        for (unsigned int i = vec_dim + threadIdx.x; i < dim; i += 256) {
+            float v = __half2float(h_ptr[i])
+                    + __half2float(p_local[i])
+                    + __half2float(p_peer0[i]);
+            out[i] = __float2half(v);
+            sum_sq += v * v;
         }
     }
     
@@ -210,30 +257,63 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp2_v3_kernel(
     sum_sq += __shfl_xor(sum_sq, 2);
     sum_sq += __shfl_xor(sum_sq, 1);
     
-    // Broadcast from lane 0 to all lanes
-    sum_sq = __shfl(sum_sq, 0);
+    // Cross-wavefront reduction
+    __shared__ float s_wf[4];
+    if (lane == 0) s_wf[wf_id] = sum_sq;
+    __syncthreads();
     
-    float rms_inv = rsqrtf(sum_sq / (float)dim + eps);
+    if (threadIdx.x < 4) {
+        float total = s_wf[0] + s_wf[1] + s_wf[2] + s_wf[3];
+        s_wf[threadIdx.x] = total;
+    }
+    __syncthreads();
+    float total_sq = s_wf[0];
     
-    for (unsigned int base_idx = tid80; base_idx < dim; base_idx += 5120) {
-        #pragma unroll 80
-        for (unsigned int k = 0; k < 80 && (base_idx + k) < dim; k++) {
-            unsigned int idx = base_idx + k;
+    float rms_inv = rsqrtf(total_sq / (float)dim + eps);
+    
+    // Phase 4: Apply RMSNorm (stride 256)
+    for (unsigned int i = threadIdx.x * 8; i + 7 < dim; i += 256 * 8) {
+        float4 sum4 = *reinterpret_cast<const float4*>(out + i);
+        float4 w4   = *reinterpret_cast<const float4*>(weight + i);
+        
+        const __half2* sum_h2 = reinterpret_cast<const __half2*>(&sum4);
+        const __half2* w_h2   = reinterpret_cast<const __half2*>(&w4);
+        
+        float4 out4;
+        __half2* out_h2 = reinterpret_cast<__half2*>(&out4);
+        
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            float s0 = __half2float(__low2half (sum_h2[k]));
+            float s1 = __half2float(__high2half(sum_h2[k]));
+            float w0 = __half2float(__low2half (w_h2[k]));
+            float w1 = __half2float(__high2half(w_h2[k]));
             
-            float val = __half2float(out[idx]);
-            float w   = __half2float(weight[idx]);
-            
-            out[idx] = __float2half(val * rms_inv * w);
+            out_h2[k] = __halves2half2(
+                __float2half(s0 * rms_inv * w0),
+                __float2half(s1 * rms_inv * w1)
+            );
+        }
+        
+        *reinterpret_cast<float4*>(out + i) = out4;
+    }
+    
+    // Scalar tail
+    {
+        unsigned int vec_dim = (dim / 8) * 8;
+        for (unsigned int i = vec_dim + threadIdx.x; i < dim; i += 256) {
+            float val = __half2float(out[i]);
+            float w   = __half2float(weight[i]);
+            out[i] = __float2half(val * rms_inv * w);
         }
     }
 }
 
 /**
  * kernel_p2p_allreduce_rmsnorm_generic_v3_kernel:
- * Generic variant for non-standard hidden sizes
- * Uses dynamic loop bounds instead of hardcoded 80 elements/thread
+ * Generic variant for non-standard hidden sizes (256 threads)
  */
-__attribute__((amdgpu_flat_work_group_size(64, 64)))
+__attribute__((amdgpu_flat_work_group_size(256, 256)))
 __global__ void kernel_p2p_allreduce_rmsnorm_generic_v3_kernel(
     __half* __restrict__ output,
     const __half* hidden,
@@ -245,8 +325,8 @@ __global__ void kernel_p2p_allreduce_rmsnorm_generic_v3_kernel(
     unsigned int dim,
     float eps
 ) {
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid;
+    unsigned int wf_id = threadIdx.x / 64;
+    unsigned int lane   = threadIdx.x % 64;
     
     const __half* h_ptr   = hidden + blockIdx.x * dim;
     const __half* p_local = partial_local + blockIdx.x * dim;
@@ -257,23 +337,55 @@ __global__ void kernel_p2p_allreduce_rmsnorm_generic_v3_kernel(
     
     float sum_sq = 0.0f;
     
-    // Calculate elements per thread for this specific dim
-    // elements_per_thread = ceil(dim / 64)
-    unsigned int elements_per_thread = (dim + 63) / 64;
+    // Interleaved access with vectorized loads (stride 256)
+    for (unsigned int i = threadIdx.x * 8; i + 7 < dim; i += 256 * 8) {
+        float4 h4  = *reinterpret_cast<const float4*>(h_ptr + i);
+        float4 pl4 = *reinterpret_cast<const float4*>(p_local + i);
+        float4 p04 = *reinterpret_cast<const float4*>(p_peer0 + i);
+        float4 p14 = *reinterpret_cast<const float4*>(p_peer1 + i);
+        float4 p24 = *reinterpret_cast<const float4*>(p_peer2 + i);
+        
+        const __half2* h_h2  = reinterpret_cast<const __half2*>(&h4);
+        const __half2* pl_h2 = reinterpret_cast<const __half2*>(&pl4);
+        const __half2* p0_h2 = reinterpret_cast<const __half2*>(&p04);
+        const __half2* p1_h2 = reinterpret_cast<const __half2*>(&p14);
+        const __half2* p2_h2 = reinterpret_cast<const __half2*>(&p24);
+        
+        float4 sum4;
+        __half2* sum_h2 = reinterpret_cast<__half2*>(&sum4);
+        
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            float v0 = __half2float(__low2half (h_h2[k]))
+                     + __half2float(__low2half (pl_h2[k]))
+                     + __half2float(__low2half (p0_h2[k]))
+                     + __half2float(__low2half (p1_h2[k]))
+                     + __half2float(__low2half (p2_h2[k]));
+            float v1 = __half2float(__high2half(h_h2[k]))
+                     + __half2float(__high2half(pl_h2[k]))
+                     + __half2float(__high2half(p0_h2[k]))
+                     + __half2float(__high2half(p1_h2[k]))
+                     + __half2float(__high2half(p2_h2[k]));
+            
+            sum_h2[k] = __halves2half2(__float2half(v0), __float2half(v1));
+            sum_sq += v0 * v0 + v1 * v1;
+        }
+        
+        *reinterpret_cast<float4*>(out + i) = sum4;
+    }
     
-    for (unsigned int k = 0; k < elements_per_thread; k++) {
-        unsigned int idx = tid + k * 64;
-        if (idx >= dim) break;
-        
-        float h  = __half2float(h_ptr[idx]);
-        float pl = __half2float(p_local[idx]);
-        float p0 = __half2float(p_peer0[idx]);
-        float p1 = __half2float(p_peer1[idx]);
-        float p2 = __half2float(p_peer2[idx]);
-        
-        float sum = h + pl + p0 + p1 + p2;
-        out[idx] = __float2half(sum);
-        sum_sq += sum * sum;
+    // Scalar tail
+    {
+        unsigned int vec_dim = (dim / 8) * 8;
+        for (unsigned int i = vec_dim + threadIdx.x; i < dim; i += 256) {
+            float v = __half2float(h_ptr[i])
+                    + __half2float(p_local[i])
+                    + __half2float(p_peer0[i])
+                    + __half2float(p_peer1[i])
+                    + __half2float(p_peer2[i]);
+            out[i] = __float2half(v);
+            sum_sq += v * v;
+        }
     }
     
     // Intra-wavefront reduction
@@ -284,19 +396,55 @@ __global__ void kernel_p2p_allreduce_rmsnorm_generic_v3_kernel(
     sum_sq += __shfl_xor(sum_sq, 2);
     sum_sq += __shfl_xor(sum_sq, 1);
     
-    // Broadcast from lane 0 to all lanes
-    sum_sq = __shfl(sum_sq, 0);
+    // Cross-wavefront reduction
+    __shared__ float s_wf[4];
+    if (lane == 0) s_wf[wf_id] = sum_sq;
+    __syncthreads();
     
-    float rms_inv = rsqrtf(sum_sq / (float)dim + eps);
+    if (threadIdx.x < 4) {
+        float total = s_wf[0] + s_wf[1] + s_wf[2] + s_wf[3];
+        s_wf[threadIdx.x] = total;
+    }
+    __syncthreads();
+    float total_sq = s_wf[0];
     
-    for (unsigned int k = 0; k < elements_per_thread; k++) {
-        unsigned int idx = tid + k * 64;
-        if (idx >= dim) break;
+    float rms_inv = rsqrtf(total_sq / (float)dim + eps);
+    
+    // Phase 4: Apply RMSNorm with interleaved access (stride 256)
+    for (unsigned int i = threadIdx.x * 8; i + 7 < dim; i += 256 * 8) {
+        float4 sum4 = *reinterpret_cast<const float4*>(out + i);
+        float4 w4   = *reinterpret_cast<const float4*>(weight + i);
         
-        float val = __half2float(out[idx]);
-        float w   = __half2float(weight[idx]);
+        const __half2* sum_h2 = reinterpret_cast<const __half2*>(&sum4);
+        const __half2* w_h2   = reinterpret_cast<const __half2*>(&w4);
         
-        out[idx] = __float2half(val * rms_inv * w);
+        float4 out4;
+        __half2* out_h2 = reinterpret_cast<__half2*>(&out4);
+        
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            float s0 = __half2float(__low2half (sum_h2[k]));
+            float s1 = __half2float(__high2half(sum_h2[k]));
+            float w0 = __half2float(__low2half (w_h2[k]));
+            float w1 = __half2float(__high2half(w_h2[k]));
+            
+            out_h2[k] = __halves2half2(
+                __float2half(s0 * rms_inv * w0),
+                __float2half(s1 * rms_inv * w1)
+            );
+        }
+        
+        *reinterpret_cast<float4*>(out + i) = out4;
+    }
+    
+    // Scalar tail
+    {
+        unsigned int vec_dim = (dim / 8) * 8;
+        for (unsigned int i = vec_dim + threadIdx.x; i < dim; i += 256) {
+            float val = __half2float(out[i]);
+            float w   = __half2float(weight[i]);
+            out[i] = __float2half(val * rms_inv * w);
+        }
     }
 }
 
@@ -319,7 +467,7 @@ extern "C" int kernel_p2p_allreduce_rmsnorm_tp4_v3(
 {
     (void)hipGetLastError();
     hipLaunchKernelGGL(kernel_p2p_allreduce_rmsnorm_tp4_v3_kernel,
-                       dim3(batch_size), dim3(64), 0, stream,
+                       dim3(batch_size), dim3(256), 0, stream,
                        (__half*)output,
                        (const __half*)hidden,
                        (const __half*)partial_local,
@@ -344,7 +492,7 @@ extern "C" int kernel_p2p_allreduce_rmsnorm_tp2_v3(
 {
     (void)hipGetLastError();
     hipLaunchKernelGGL(kernel_p2p_allreduce_rmsnorm_tp2_v3_kernel,
-                       dim3(batch_size), dim3(64), 0, stream,
+                       dim3(batch_size), dim3(256), 0, stream,
                        (__half*)output,
                        (const __half*)hidden,
                        (const __half*)partial_local,
@@ -369,7 +517,7 @@ extern "C" int kernel_p2p_allreduce_rmsnorm_generic_v3(
 {
     (void)hipGetLastError();
     hipLaunchKernelGGL(kernel_p2p_allreduce_rmsnorm_generic_v3_kernel,
-                       dim3(batch_size), dim3(64), 0, stream,
+                       dim3(batch_size), dim3(256), 0, stream,
                        (__half*)output,
                        (const __half*)hidden,
                        (const __half*)partial_local,
