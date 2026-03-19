@@ -133,14 +133,13 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp4_v3_kernel(
     sum_sq += __shfl_xor(sum_sq, 1);
     
     // ================================================================
-    // Phase 3: Wave leader computes total, broadcasts via __shfl
-    // No LDS needed, no __syncthreads() for cross-warp sync
+    // Phase 3: Broadcast total sum from lane 0 to all lanes
+    // After butterfly reduction, lane 0 has the correct total.
+    // All threads need this value to compute rms_inv.
     // ================================================================
-    if (lane == 0) {
-        sum_sq = __shfl(sum_sq, 0);  // lane 0 already has total
-    }
+    sum_sq = __shfl(sum_sq, 0);  // Broadcast from lane 0 to all lanes
     
-    // Compute inverse RMS
+    // Compute inverse RMS (all threads now have correct sum_sq)
     float rms_inv = rsqrtf(sum_sq / (float)dim + eps);
     
     // ================================================================
@@ -211,9 +210,8 @@ __global__ void kernel_p2p_allreduce_rmsnorm_tp2_v3_kernel(
     sum_sq += __shfl_xor(sum_sq, 2);
     sum_sq += __shfl_xor(sum_sq, 1);
     
-    if (lane == 0) {
-        sum_sq = __shfl(sum_sq, 0);
-    }
+    // Broadcast from lane 0 to all lanes
+    sum_sq = __shfl(sum_sq, 0);
     
     float rms_inv = rsqrtf(sum_sq / (float)dim + eps);
     
@@ -286,9 +284,8 @@ __global__ void kernel_p2p_allreduce_rmsnorm_generic_v3_kernel(
     sum_sq += __shfl_xor(sum_sq, 2);
     sum_sq += __shfl_xor(sum_sq, 1);
     
-    if (lane == 0) {
-        sum_sq = __shfl(sum_sq, 0);
-    }
+    // Broadcast from lane 0 to all lanes
+    sum_sq = __shfl(sum_sq, 0);
     
     float rms_inv = rsqrtf(sum_sq / (float)dim + eps);
     
