@@ -5213,17 +5213,41 @@ class TPInferenceEngine:
                   f"tp_size={self.tp_size})")
 
         # Load fused kernel P2P allreduce + RMSNorm library (if available)
+        # Try v3 first (optimized single-wavefront), then v2, then v1 (baseline)
         fused_kernel_fn_ptr = None
         use_fused_kernel_in_c = False
         fused_lib = None
         build_dir = Path(__file__).parent.parent.parent / "build" / "kernels"
-        fused_so_path = build_dir / "kernel_p2p_allreduce_rmsnorm.so"
         
-        if fused_so_path.exists():
+        # Try v3 kernel first (single-wavefront, latency-optimized)
+        fused_so_path_v3 = build_dir / "kernel_p2p_allreduce_rmsnorm_v3.so"
+        fused_so_path_v2 = build_dir / "kernel_p2p_allreduce_rmsnorm_v2.so"
+        fused_so_path_v1 = build_dir / "kernel_p2p_allreduce_rmsnorm.so"
+        
+        # Priority: v3 > v2 > v1
+        fused_so_path = None
+        kernel_version = None
+        for path, version in [(fused_so_path_v3, "v3"), (fused_so_path_v2, "v2"), (fused_so_path_v1, "v1")]:
+            if path.exists():
+                fused_so_path = path
+                kernel_version = version
+                break
+        
+        if fused_so_path and fused_so_path.exists():
             try:
                 fused_lib = ct.CDLL(str(fused_so_path))
+                
+                # Determine function name based on version
+                if kernel_version == "v3":
+                    func_name = "kernel_p2p_allreduce_rmsnorm_tp4_v3"
+                elif kernel_version == "v2":
+                    func_name = "kernel_p2p_allreduce_rmsnorm_tp4_v2"
+                else:
+                    func_name = "kernel_p2p_allreduce_rmsnorm_tp4"
+                
                 # Set function signature (includes hidden residual parameter)
-                fused_lib.kernel_p2p_allreduce_rmsnorm_tp4.argtypes = [
+                fused_func = getattr(fused_lib, func_name)
+                fused_func.argtypes = [
                     ct.c_void_p,  # output
                     ct.c_void_p,  # hidden (residual input)
                     ct.c_void_p,  # partial_local
@@ -5236,24 +5260,22 @@ class TPInferenceEngine:
                     ct.c_float,   # eps
                     ct.c_void_p,  # stream
                 ]
-                fused_lib.kernel_p2p_allreduce_rmsnorm_tp4.restype = ct.c_int
-                fused_kernel_fn_ptr = ct.cast(
-                    fused_lib.kernel_p2p_allreduce_rmsnorm_tp4,
-                    ct.c_void_p
-                ).value
+                fused_func.restype = ct.c_int
+                fused_kernel_fn_ptr = ct.cast(fused_func, ct.c_void_p).value
+                
                 # Enable fused kernel only for TP=4
                 if self.tp_size == 4:
                     use_fused_kernel_in_c = True
-                    print(f"C dispatch: fused kernel allreduce+RMSNorm enabled "
+                    print(f"C dispatch: fused kernel allreduce+RMSNorm {kernel_version} enabled "
                           f"(fn_ptr=0x{fused_kernel_fn_ptr:016x})")
                 else:
-                    print(f"C dispatch: fused kernel available but TP={self.tp_size} "
+                    print(f"C dispatch: fused kernel {kernel_version} available but TP={self.tp_size} "
                           f"(requires TP=4)")
             except Exception as e:
                 print(f"C dispatch: failed to load fused kernel library: {e}")
                 fused_lib = None
         else:
-            print(f"C dispatch: fused kernel library not found at {fused_so_path}")
+            print(f"C dispatch: fused kernel library not found (tried v3, v2, v1)")
 
         # Load fused GEMV+AR+RMSNorm kernel library (gemv_int4_p2p_allreduce_rmsnorm)
         # This kernel fuses FFN down projection (INT4 GEMV) + P2P allreduce + RMSNorm

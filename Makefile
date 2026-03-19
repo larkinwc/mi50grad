@@ -83,8 +83,9 @@ $(BUILD_DIR)/probes $(BUILD_DIR)/bench $(BUILD_DIR)/kernels:
 # ============================================================
 
 KERNEL_HIP_SRCS = $(wildcard src/kernels/kernel_*.hip) $(wildcard src/kernels/gemv_int4_p2p_allreduce_rmsnorm.hip) $(wildcard src/kernels/persistent_decode.hip)
-# Also include v2 optimized kernels
+# Also include v2 and v3 optimized kernels
 KERNEL_HIP_SRCS += $(wildcard src/kernels/*_v2.hip)
+KERNEL_HIP_SRCS += $(wildcard src/kernels/*_v3.hip)
 KERNEL_SO = $(patsubst src/kernels/%.hip,$(BUILD_DIR)/kernels/%.so,$(KERNEL_HIP_SRCS))
 
 .PHONY: hip_kernels
