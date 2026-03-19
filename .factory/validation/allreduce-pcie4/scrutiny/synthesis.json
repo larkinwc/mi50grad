@@ -1,0 +1,42 @@
+{
+  "milestone": "allreduce-pcie4",
+  "round": 1,
+  "status": "fail",
+  "validatorsRun": {
+    "test": { "passed": true, "command": "ssh root@192.168.1.198 'docker run ... python3 tests/test_kernel_p2p_allreduce.py'", "exitCode": 0 },
+    "typecheck": { "passed": true, "command": "N/A - Python/HIP project without typecheck configured", "exitCode": 0 },
+    "lint": { "passed": true, "command": "N/A - Python/HIP project without lint configured", "exitCode": 0 },
+    "benchmark": { "passed": true, "command": "ssh root@192.168.1.198 'docker run ... python3 tests/bench_current_state.py'", "exitCode": 0, "observation": "Benchmark ran successfully, 40.08 tok/s with C dispatch + kernel P2P" }
+  },
+  "reviewsSummary": {
+    "total": 2,
+    "passed": 1,
+    "failed": 1,
+    "failedFeatures": ["m2-optimize-allreduce-pcie4"]
+  },
+  "blockingIssues": [
+    {
+      "featureId": "m2-optimize-allreduce-pcie4",
+      "severity": "blocking",
+      "description": "Critical indexing bug in v3 kernel at src/kernels/kernel_p2p_allreduce_rmsnorm_v3.hip line 89: `tid64 = tid * 64` should be `tid * 80`. With 64 threads each processing 80 elements, thread t should start at offset tid*80, not tid*64. Current indexing causes: (1) Overlapping element processing - thread 0 processes 0-79, thread 1 processes 64-143 (overlap 64-79), causing double-accumulation. (2) Missing elements 4112-5119 - thread 63 processes 4032-4111, leaving elements 4112-5119 unprocessed.",
+      "suggestedFix": "Change line 89 from `const unsigned int tid64 = tid * 64;` to `const unsigned int tid80 = tid * 80;` and update all references from `tid64` to `tid80` in the loop."
+    }
+  ],
+  "appliedUpdates": [],
+  "suggestedGuidanceUpdates": [
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add guidance: 'GPU kernel validation MUST run on actual hardware before marking feature complete. The v3 allreduce kernel had a critical indexing bug that was not detected because tests were never run on the dev server.'",
+      "evidence": "m2-optimize-allreduce-pcie4 handoff explicitly states 'GPU validation pending'. The indexing bug (tid*64 vs tid*80) would have been immediately caught by running tests/test_kernel_p2p_allreduce_v3.py on the dev server.",
+      "isSystemic": true
+    }
+  ],
+  "rejectedObservations": [
+    {
+      "observation": "Documentation inconsistency: Header comment states 'v3: 1 __syncthreads() barrier' but implementation correctly has zero.",
+      "reason": "Non-blocking issue, should be fixed as part of the blocking bug fix"
+    }
+  ],
+  "previousRound": null,
+  "notes": "The m2-profile-pcie4-bandwidth feature passed review successfully. The benchmark correctly identified that 10KB allreduce is latency-bound, which informed the v3 kernel design. However, m2-optimize-allreduce-pcie4 has a critical indexing bug in the v3 kernel that causes incorrect computation. The bug went undetected because GPU validation was not performed - the handoff explicitly states 'GPU validation pending'. The fix is straightforward: change tid*64 to tid*80 in the kernel indexing logic."
+}

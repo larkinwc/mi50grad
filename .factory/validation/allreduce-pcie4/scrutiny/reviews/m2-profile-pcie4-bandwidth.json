@@ -1,0 +1,44 @@
+{
+  "featureId": "m2-profile-pcie4-bandwidth",
+  "reviewedAt": "2026-03-19T16:50:00.000Z",
+  "commitId": "3beec05",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "The implementation fully addresses the feature requirements: creating and executing a PCIe 4.0 P2P bandwidth microbenchmark suite on the dev server. The code is well-structured, comprehensive, and the key findings are clearly documented. The benchmark correctly tests all required payload sizes (1KB-1MB), access patterns (sequential, strided, random), vector widths (float, float2, float4, dwordx4), and measures kernel launch overhead. The determination that 10KB allreduce is latency-bound is well-supported by the evidence.",
+    "issues": [
+      {
+        "file": "tests/bench_pcie4_bandwidth.py",
+        "line": 467,
+        "severity": "non_blocking",
+        "description": "The benchmark creates temporary HIP kernel source files at runtime for some tests (e.g., bench_access_pattern_comparison generates kernel code dynamically). This works but could be fragile across ROCm versions. The p2p_bandwidth_kernels.hip file covers the main use cases, so this is acceptable."
+      },
+      {
+        "file": "bench/PCIe4_BANDWIDTH_REPORT.md",
+        "line": 89,
+        "severity": "non_blocking",
+        "description": "The report notes that 76+ GB/s for 1MB payload is an 'artifact' due to kernel launch overhead amortization. While this is correctly identified, the benchmark could be improved by reporting a 'true bandwidth' metric that excludes fixed overhead for all payload sizes, not just noting it for 1MB."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "knowledge",
+      "observation": "The worker discovered that vectorization (float4 vs float) and access patterns (sequential vs random) provide NO benefit for small payloads on PCIe P2P. This is a significant finding that contradicts typical GPU optimization wisdom and should be documented in AGENTS.md to prevent future workers from wasting time on these optimizations for latency-bound operations.",
+      "evidence": "Report section 'Why Doesn't Vectorization Help?' and 'Why Doesn't Access Pattern Matter?' explain the latency-bound behavior. AGENTS.md currently mentions investigating why bandwidth utilization is ~5%, but doesn't capture the finding that it's fundamentally latency-bound for 10KB payloads."
+    },
+    {
+      "area": "knowledge",
+      "observation": "The benchmark establishes clear crossover context: 10KB payload at 20.37µs is 100% fixed overhead. Future optimization work should target kernel fusion, persistent kernels, and async operations. This specific guidance could be added to AGENTS.md under 'Allreduce Current State'.",
+      "evidence": "Report section 'Implications for Allreduce Optimization' lists specific recommendations (kernel fusion, persistent kernels, async operations) with expected savings. AGENTS.md mentions investigating low bandwidth utilization but doesn't have the concrete optimization targets."
+    },
+    {
+      "area": "skills",
+      "observation": "The gpu-kernel-worker skill procedure was followed correctly: understand feature → write tests → implement → verify → benchmark. The worker created comprehensive tests and verified execution on dev server. The skill is well-matched to this task.",
+      "evidence": "Transcript skeleton shows Read feature.json → Read RESEARCH.md → Create kernel files → Create test file → Deploy script → Execute on dev server → Create report → Commit. skillFeedback.followedProcedure = true."
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS. The m2-profile-pcie4-bandwidth feature is fully implemented and tested. The benchmark suite correctly tests PCIe 4.0 P2P bandwidth with all required configurations (payload sizes 1KB-1MB, access patterns, vector widths, kernel launch overhead). The benchmark was deployed to and executed on the dev server (root@192.168.1.198) with 4x MI50 GPUs. Key finding confirmed: 10KB allreduce is latency-bound (100% fixed overhead, 0% transfer time), with 0.50 GB/s measured bandwidth (2% of theoretical). The comprehensive report in bench/PCIe4_BANDWIDTH_REPORT.md provides clear optimization guidance for future work. Minor non-blocking issues noted in the dynamic kernel generation pattern and bandwidth reporting for large payloads."
+}

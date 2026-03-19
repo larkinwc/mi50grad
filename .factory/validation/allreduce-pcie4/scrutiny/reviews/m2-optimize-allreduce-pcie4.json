@@ -1,0 +1,50 @@
+{
+  "featureId": "m2-optimize-allreduce-pcie4",
+  "reviewedAt": "2026-03-19T17:00:00Z",
+  "commitId": "37e28d8",
+  "transcriptSkeletonReviewed": false,
+  "diffReviewed": true,
+  "status": "fail",
+  "codeReview": {
+    "summary": "The v3 kernel has a critical indexing bug that causes incorrect results. Thread starting offsets use tid*64 but should use tid*80 for non-overlapping coverage. This causes double-processing of overlapping elements and misses elements 4112-5119. Tests were not run on GPU hardware (handoff explicitly states 'GPU validation pending'), so this bug went undetected.",
+    "issues": [
+      {
+        "file": "src/kernels/kernel_p2p_allreduce_rmsnorm_v3.hip",
+        "line": 89,
+        "severity": "blocking",
+        "description": "Critical indexing bug: `tid64 = tid * 64` should be `tid * 80`. With 64 threads each processing 80 elements, thread t should start at tid*80, not tid*64. Current indexing causes: (1) Overlapping element processing - thread 0 processes 0-79, thread 1 processes 64-143 (overlap 64-79), causing double-accumulation. (2) Missing elements 4112-5119 - thread 63 processes 4032-4111, leaving elements 4112-5119 unprocessed. The comment correctly states '64 threads × 80 elements = 5120' but the implementation uses wrong stride. Compare to v1 (tid*8 for 8 elems/thread) and v2 (tid*16 for 16 elems/thread) which correctly use tid * elements_per_thread."
+      },
+      {
+        "file": "src/kernels/kernel_p2p_allreduce_rmsnorm_v3.hip",
+        "line": 21,
+        "severity": "non_blocking",
+        "description": "Documentation inconsistency: Header comment states 'v3: 1 __syncthreads() barrier' but the implementation correctly has zero __syncthreads() calls (using pure __shfl reduction). Comment should say '0 __syncthreads() barriers'."
+      },
+      {
+        "file": "src/kernels/kernel_p2p_allreduce_rmsnorm_v3.hip",
+        "line": 137,
+        "severity": "non_blocking",
+        "description": "Confusing code: The if(lane == 0) { sum_sq = __shfl(sum_sq, 0); } block appears to be a no-op since lane 0 already has the total sum after the butterfly reduction, and __shfl(sum_sq, 0) on lane 0 reads from itself. This code block is unnecessary but harmless."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "skills",
+      "observation": "The gpu-kernel-worker skill file was not found at expected path. Worker completed feature without skill guidance, which may have contributed to the indexing bug not being caught during development.",
+      "evidence": "Read attempt for .factory/skills/gpu-kernel-worker/SKILL.md returned ENOENT. Worker session 9e76fc67-e85b-4ac9-99a5-19cdc36e8536 had no skill file to follow."
+    },
+    {
+      "area": "conventions",
+      "observation": "AGENTS.md correctly specifies 'HIP C++ kernels: FP32 accumulators mandatory on gfx906' which the v3 kernel follows correctly. The v3 kernel uses FP32 accumulation throughout.",
+      "evidence": "kernel_p2p_allreduce_rmsnorm_v3.hip uses float sum_sq and explicit __half2float conversions for FP32 accumulation."
+    },
+    {
+      "area": "knowledge",
+      "observation": "The kernel optimization approach (single-wavefront for latency-bound small payloads) is well-documented in .factory/library/allreduce-v3-optimization.md. This is good knowledge capture that should help future kernel development.",
+      "evidence": ".factory/library/allreduce-v3-optimization.md documents the latency-bound insight and optimization strategy."
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "BLOCKING: Critical indexing bug in v3 kernel (tid*64 should be tid*80) causes incorrect computation. GPU validation was not performed (tests not run on hardware), so bug went undetected. Fix required before feature can be considered complete. The optimization approach (single-wavefront for latency-bound workloads) is sound, but the implementation has a fundamental indexing error."
+}
