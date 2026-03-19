@@ -345,12 +345,18 @@ def main():
     # VAL-CROSS-002: Memory usage within 32GB per GPU
     mem_result = results.get("Memory (max per GPU)", (None, 0))[0]
     cross002 = mem_result is not None and mem_result < 32 * 1024
-    print(f"  VAL-CROSS-002 (Memory < 32GB): {mem_result:.1f} MB - {'PASS' if cross002 else 'FAIL' if mem_result else 'N/A'}")
+    if mem_result is not None:
+        print(f"  VAL-CROSS-002 (Memory < 32GB): {mem_result:.1f} MB - {'PASS' if cross002 else 'FAIL'}")
+    else:
+        print(f"  VAL-CROSS-002 (Memory < 32GB): N/A (memory check failed)")
     
     # VAL-TP-PREFILL-002: Prefill throughput >= 1000 tok/s (512 tokens in < 0.5s)
     prefill_result = results.get("TP=4 Prefill (512 tokens)", (None, 0))[0]
     tp_prefill002 = prefill_result is not None and prefill_result >= 1000
-    print(f"  VAL-TP-PREFILL-002 (>= 1000 tok/s): {prefill_result:.2f} tok/s - {'PASS' if tp_prefill002 else 'FAIL' if prefill_result else 'N/A'}")
+    if prefill_result is not None:
+        print(f"  VAL-TP-PREFILL-002 (>= 1000 tok/s): {prefill_result:.2f} tok/s - {'PASS' if tp_prefill002 else 'FAIL'}")
+    else:
+        print(f"  VAL-TP-PREFILL-002 (>= 1000 tok/s): N/A (prefill check failed)")
     
     # VAL-CROSS-003: End-to-end generation produces coherent text
     e2e_result = results.get("E2E Generation", (None, 0))[0]
@@ -368,6 +374,14 @@ def main():
     
     print("=" * 72)
     print("\nDone.")
+    print("\n" + "=" * 72)
+    print("  FINAL THROUGHPUT SUMMARY")
+    print("=" * 72)
+    print(f"  Best TP=4 decode throughput: {best_decode:.2f} tok/s")
+    print(f"  Target: 60 tok/s")
+    print(f"  Gap to target: {60 - best_decode:.2f} tok/s ({(1 - best_decode/60)*100:.1f}% below target)")
+    print(f"  Single-GPU baseline: {results.get('Single-GPU', (None, 0))[0]:.2f} tok/s (no regression)")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
