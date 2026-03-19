@@ -1,0 +1,44 @@
+{
+  "flowId": "speculative-decode",
+  "milestone": "speculative-validation",
+  "assertionIds": ["VAL-SPEC-001", "VAL-SPEC-002", "VAL-SPEC-003"],
+  "timestamp": "2026-03-18T23:51:40Z",
+  "status": "fail",
+  "results": {
+    "VAL-SPEC-001": {
+      "status": "fail",
+      "measured": 0.4141,
+      "target": 0.50,
+      "details": "N-gram acceptance measured at 41.41% overall. By category: code 52.44%, json 17.77%, conversational 24.90%, repetitive 70.51%. Test methodology uses train/test split (correct). Acceptance rate below 50% target.",
+      "methodology": "Built n-gram cache from 60% of each prompt, measured acceptance on remaining 40%. Prevents training-on-test inflation."
+    },
+    "VAL-SPEC-002": {
+      "status": "fail",
+      "measured": null,
+      "target": 0.60,
+      "details": "Test code bug: EAGLETestWrapper class missing 'engine' attribute. The eagle_speculative_decode function calls generator.engine.decode_step() but wrapper doesn't expose engine.",
+      "methodology": "Attempted to run actual GPU speculative decode but test wrapper implementation incomplete.",
+      "error": "'EAGLETestWrapper' object has no attribute 'engine'"
+    },
+    "VAL-SPEC-003": {
+      "status": "fail",
+      "measured": null,
+      "target": 1.30,
+      "details": "Test code bug: TPInferenceEngine has prefill_step() not prefill(). Test code calls tp_engine.prefill() which doesn't exist.",
+      "methodology": "Attempted wall-clock timing comparison but test code incompatible with TP engine API.",
+      "error": "'TPInferenceEngine' object has no attribute 'prefill'"
+    }
+  },
+  "toolsUsed": ["ssh", "docker", "python3"],
+  "frictions": [
+    "Test wrapper classes (EAGLETestWrapper, SpeculativeTestWrapper) don't properly implement the interface expected by speculative decode functions",
+    "Test code assumes TPInferenceEngine.prefill() exists, but actual API is prefill_step()"
+  ],
+  "blockers": [],
+  "notes": [
+    "VAL-SPEC-001 ran successfully with correct methodology (train/test split)",
+    "N-gram acceptance varies significantly by prompt type (code: 52%, repetitive: 70%, json: 18%)",
+    "EAGLE infrastructure exists (EagleDraftHead, EagleSpeculativeGenerator classes) but test needs fixing",
+    "Speculative decode infrastructure is present but integration test code needs API fixes"
+  ]
+}

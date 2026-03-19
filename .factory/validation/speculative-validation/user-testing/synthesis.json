@@ -1,0 +1,48 @@
+{
+  "milestone": "speculative-validation",
+  "round": 1,
+  "status": "fail",
+  "assertionsSummary": {
+    "total": 3,
+    "passed": 0,
+    "failed": 3,
+    "blocked": 0
+  },
+  "passedAssertions": [],
+  "failedAssertions": [
+    {
+      "id": "VAL-SPEC-001",
+      "reason": "N-gram acceptance rate measured at 41.41%, below 50% target. Acceptance varies by prompt type: code 52%, json 18%, conversational 25%, repetitive 71%. Methodology uses train/test split correctly."
+    },
+    {
+      "id": "VAL-SPEC-002",
+      "reason": "Test code bug: EAGLETestWrapper class missing 'engine' attribute. The eagle_speculative_decode function expects generator.engine.decode_step() but wrapper doesn't expose engine. Infrastructure exists but test needs fixing."
+    },
+    {
+      "id": "VAL-SPEC-003",
+      "reason": "Test code bug: TPInferenceEngine API mismatch. Test calls tp_engine.prefill() but actual method is prefill_step(). Test code needs to be fixed to use correct API."
+    }
+  ],
+  "blockedAssertions": [],
+  "appliedUpdates": [],
+  "previousRound": null,
+  "testingDetails": {
+    "environment": "GPU server root@192.168.1.198, Docker container mixa3607/rocm-gfx906:7.1.0-complete, 4x MI50 GPUs",
+    "model": "/opt/models/Qwen3.5-27B-GPTQ-Int4",
+    "testCommand": "docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models -w /opt/mi50grad mixa3607/rocm-gfx906:7.1.0-complete python3 tests/val_m6_speculative.py",
+    "metrics": {
+      "VAL-SPEC-001_overall": 0.4141,
+      "VAL-SPEC-001_by_category": {
+        "code": 0.5244,
+        "json": 0.1777,
+        "conversational": 0.2490,
+        "repetitive": 0.7051
+      }
+    }
+  },
+  "recommendations": [
+    "VAL-SPEC-001: Acceptance rate of 41% is below target but demonstrates that n-gram speculative decode works. Consider lowering target or accepting as partial success.",
+    "VAL-SPEC-002: Fix EAGLETestWrapper to expose tp_engine as .engine attribute, or use actual EagleSpeculativeGenerator class which has proper integration.",
+    "VAL-SPEC-003: Fix test to use tp_engine.prefill_step() instead of tp_engine.prefill(), and use tp_engine.decode_step() with proper embedding lookup."
+  ]
+}
