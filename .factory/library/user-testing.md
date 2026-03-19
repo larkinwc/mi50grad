@@ -18,19 +18,18 @@ Testing surface, resource cost classification, and validation approach.
 ### Key Test Scripts
 
 - `tests/bench_current_state.py` - Main benchmark (all modes)
-- `tests/bench_tp4_sprint4.py` - TP=4 benchmark (working alternative)
-- `tests/val_m*.py` - Milestone-specific validation tests
-- `tests/test_*.py` - Feature-specific correctness tests
+- `tests/bench_allreduce_micro.py` - Allreduce microbenchmark
+- `tests/test_fused_gemv_isolate.py` - Fused GEMV correctness
+- `tests/bench_tp4_sprint4.py` - TP=4 benchmark (alternative)
 
 ## Validation Concurrency
 
 **Max concurrent validators: 1**
 
-Rationale: Only one Docker container can hold all 4 GPUs at a time. vLLM must be stopped to free VRAM. Tests require exclusive access to all 4 MI50 GPUs. Sequential validation only.
+Rationale: Only one Docker container can hold all 4 GPUs at a time. Sequential validation only.
 
 ## Known Constraints
 
-- vLLM container (vllm-mobydick) uses ~93% VRAM on all 4 GPUs - must be stopped before any GPU test
-- Docker image `mi50grad` defaults to 3 GPUs in Dockerfile - must override with `HIP_VISIBLE_DEVICES=0,1,2,3`
-- bench_current_state.py crashes with segfault when deferred AR is enabled (to be fixed in M3)
-- PCIe 3.0 x16 links between GPUs (no XGMI/Infinity Fabric) - limits peer read bandwidth to ~12.8 GB/s
+- vLLM container uses ~93% VRAM on all 4 GPUs - must be stopped
+- Docker defaults to 3 GPUs - must override with HIP_VISIBLE_DEVICES=0,1,2,3
+- PCIe 4.0 x16, 2-hop via switch, ~25.6 GB/s theoretical
