@@ -29,17 +29,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.runtime.hip_dispatch import GPUDevice, HIPRuntime, HIPError
 
 
-def alloc_fill_gpu(dev: GPUDevice, data: np.ndarray) -> int:
+def alloc_fill_gpu(hip: HIPRuntime, device_id: int, data: np.ndarray) -> int:
     """Allocate GPU buffer and upload numpy array. Returns device pointer."""
-    ptr = dev.malloc(data.nbytes)
-    dev.upload(ptr, data.tobytes())
+    hip.set_device(device_id)
+    ptr = hip.malloc(data.nbytes)
+    hip.memcpy_h2d(ptr, data.tobytes(), data.nbytes)
     return ptr
 
 
-def download_fp16(dev: GPUDevice, ptr: int, num_elems: int) -> np.ndarray:
+def download_fp16(hip: HIPRuntime, device_id: int, ptr: int, num_elems: int) -> np.ndarray:
     """Download FP16 buffer from GPU."""
-    raw = dev.download(ptr, num_elems * 2)
-    return np.frombuffer(raw, dtype=np.float16).copy()
+    hip.set_device(device_id)
+    buf = ctypes.create_string_buffer(num_elems * 2)
+    hip.memcpy_d2h(buf, ptr, num_elems * 2)
+    return np.frombuffer(buf, dtype=np.float16).copy()
 
 
 def reference_allreduce_rmsnorm(
@@ -72,15 +75,31 @@ def reference_allreduce_rmsnorm(
 
 
 class MicrobenchmarkState:
-    """Manages GPU resources for microbenchmark."""
+    """Manages GPU resources for microbenchmark.
+    
+    Uses a single HIPRuntime instance for all GPUs to ensure proper P2P coordination.
+    """
     
     def __init__(self, tp_size: int = 4, hidden_size: int = 5120, use_v2: bool = False):
         self.tp_size = tp_size
         self.hidden_size = hidden_size
         self.use_v2 = use_v2
-        self.devices = [GPUDevice(i) for i in range(tp_size)]
-        self.hip = self.devices[0].hip
         self.device_ids = list(range(tp_size))
+        
+        # Single HIP runtime for all GPUs (critical for P2P access)
+        self.hip = HIPRuntime()
+        self.hip.init()
+        
+        # Enable P2P access between all GPU pairs
+        for i in range(tp_size):
+            self.hip.set_device(i)
+            for j in range(tp_size):
+                if i != j:
+                    if self.hip.device_can_access_peer(i, j):
+                        try:
+                            self.hip.device_enable_peer_access(j)
+                        except Exception:
+                            pass  # Already enabled
         
         # Create streams
         self.streams = []
@@ -133,8 +152,6 @@ class MicrobenchmarkState:
         for i in range(self.tp_size):
             self.hip.set_device(self.device_ids[i])
             self.hip.stream_destroy(self.streams[i])
-        for d in self.devices:
-            d.cleanup()
 
 
 def run_microbenchmark(
@@ -311,7 +328,7 @@ def test_correctness(
     # Download results from all GPUs
     results = []
     for i in range(state.tp_size):
-        results.append(download_fp16(state.devices[i], output_ptrs[i], dim))
+        results.append(download_fp16(hip, state.device_ids[i], output_ptrs[i], dim))
     
     # Compute reference
     ref_result = reference_allreduce_rmsnorm(partials_np, hidden_np, weight_np, eps)
@@ -374,10 +391,11 @@ def benchmark_kernel(use_v2: bool) -> Tuple[float, float, float]:
     weight_ptrs = []
     
     for i in range(4):
-        partial_ptrs.append(alloc_fill_gpu(state.devices[i], partials_np[i]))
-        hidden_ptrs.append(alloc_fill_gpu(state.devices[i], hidden_np))
-        output_ptrs.append(state.devices[i].malloc(5120 * 2))
-        weight_ptrs.append(alloc_fill_gpu(state.devices[i], weight_np))
+        partial_ptrs.append(alloc_fill_gpu(state.hip, i, partials_np[i]))
+        hidden_ptrs.append(alloc_fill_gpu(state.hip, i, hidden_np))
+        state.hip.set_device(i)
+        output_ptrs.append(state.hip.malloc(5120 * 2))
+        weight_ptrs.append(alloc_fill_gpu(state.hip, i, weight_np))
     
     # Correctness test
     max_err, passed = test_correctness(

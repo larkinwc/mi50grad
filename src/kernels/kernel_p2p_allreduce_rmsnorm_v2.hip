@@ -5,12 +5,14 @@
  *   1. Increased elements per thread: 16 FP16 elements/thread (vs 8 in v1)
  *      - Reduces thread count from 256 to 128 for hidden_size=5120
  *      - Fewer warps = fewer synchronization points
- *   2. Reduced __syncthreads() from 2 to 1
- *      - Single barrier after warp reduction using warp-level primitive
- *   3. Optimized memory access: explicit dwordx4 (128-bit) loads with alignment
+ *   2. Optimized memory access: explicit dwordx4 (128-bit) loads with alignment
  *      - Ensures coalesced 128-byte reads from peer BAR1 memory
- *   4. Minimized LDS usage: only 16 bytes (4 floats for warp sums)
- *   5. Improved instruction-level parallelism in accumulation loop
+ *   3. Minimized LDS usage: only 8 bytes (2 floats for warp sums, vs 16 in v1)
+ *      - Reduced from 4 warps to 2 warps
+ *   4. Improved instruction-level parallelism in accumulation loop
+ *
+ * Note: This version maintains 2 __syncthreads() barriers (same as v1) but
+ *       reduces overall synchronization overhead via fewer warps (2 vs 4).
  *
  * Target: gfx906 (MI50/MI60)
  * Compilation: hipcc -O3 --offload-arch=gfx906 -std=c++17 -shared -fPIC
@@ -32,8 +34,11 @@
  * Optimizations:
  *   - 128 threads (2 warps) instead of 256 (4 warps)
  *   - Each thread processes 16 FP16 elements (2x more than v1)
- *   - Single __syncthreads() barrier (vs 2 in v1)
  *   - dwordx4 vectorized loads for coalesced 128-byte memory access
+ *   - Reduced LDS usage: 8 bytes (2 floats) vs 16 bytes (4 floats) in v1
+ *
+ * Note: Uses 2 __syncthreads() barriers (same as v1) but with reduced
+ *       warp count for lower synchronization overhead.
  *
  * Grid: (batch_size, 1, 1), Block: (128, 1, 1)
  * For hidden_size=5120: each thread processes 40 iterations

@@ -24,17 +24,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.runtime.hip_dispatch import GPUDevice, HIPRuntime, HIPError
 
 
-def alloc_fill_gpu(dev: GPUDevice, data: np.ndarray) -> int:
+def alloc_fill_gpu(hip: HIPRuntime, device_id: int, data: np.ndarray) -> int:
     """Allocate GPU buffer and upload numpy array."""
-    ptr = dev.malloc(data.nbytes)
-    dev.upload(ptr, data.tobytes())
+    hip.set_device(device_id)
+    ptr = hip.malloc(data.nbytes)
+    hip.memcpy_h2d(ptr, data.tobytes(), data.nbytes)
     return ptr
 
 
-def download_fp16(dev: GPUDevice, ptr: int, num_elems: int) -> np.ndarray:
+def download_fp16(hip: HIPRuntime, device_id: int, ptr: int, num_elems: int) -> np.ndarray:
     """Download FP16 buffer from GPU."""
-    raw = dev.download(ptr, num_elems * 2)
-    return np.frombuffer(raw, dtype=np.float16).copy()
+    hip.set_device(device_id)
+    buf = ctypes.create_string_buffer(num_elems * 2)
+    hip.memcpy_d2h(buf, ptr, num_elems * 2)
+    return np.frombuffer(buf, dtype=np.float16).copy()
 
 
 def reference_allreduce_rmsnorm(
@@ -84,8 +87,17 @@ def test_v2_correctness():
     ]
     lib.kernel_p2p_allreduce_rmsnorm_tp4_v2.restype = ctypes.c_int
     
-    # Setup devices
-    devices = [GPUDevice(i) for i in range(4)]
+    # Enable P2P access between all GPU pairs (critical for kernel to access peer memory)
+    for i in range(4):
+        hip.set_device(i)
+        for j in range(4):
+            if i != j:
+                if hip.device_can_access_peer(i, j):
+                    try:
+                        hip.device_enable_peer_access(j)
+                    except Exception:
+                        pass  # Already enabled
+    
     streams = []
     for i in range(4):
         hip.set_device(i)
@@ -98,10 +110,10 @@ def test_v2_correctness():
     weight_np = rng.random(5120).astype(np.float16) + 0.5
     
     # Allocate
-    partial_ptrs = [alloc_fill_gpu(devices[i], partials_np[i]) for i in range(4)]
-    hidden_ptrs = [alloc_fill_gpu(devices[i], hidden_np) for i in range(4)]
-    output_ptrs = [devices[i].malloc(5120 * 2) for i in range(4)]
-    weight_ptrs = [alloc_fill_gpu(devices[i], weight_np) for i in range(4)]
+    partial_ptrs = [alloc_fill_gpu(hip, i, partials_np[i]) for i in range(4)]
+    hidden_ptrs = [alloc_fill_gpu(hip, i, hidden_np) for i in range(4)]
+    output_ptrs = [hip.malloc(5120 * 2) for i in range(4)]
+    weight_ptrs = [alloc_fill_gpu(hip, i, weight_np) for i in range(4)]
     
     # Run kernel
     for i in range(4):
@@ -130,7 +142,7 @@ def test_v2_correctness():
         hip.stream_synchronize(streams[i])
     
     # Download results
-    results = [download_fp16(devices[i], output_ptrs[i], 5120) for i in range(4)]
+    results = [download_fp16(hip, i, output_ptrs[i], 5120) for i in range(4)]
     
     # Reference
     ref = reference_allreduce_rmsnorm(partials_np, hidden_np, weight_np, 1e-6)
@@ -165,8 +177,6 @@ def test_v2_correctness():
         hip.free(output_ptrs[i])
         hip.free(weight_ptrs[i])
         hip.stream_destroy(streams[i])
-    for d in devices:
-        d.cleanup()
     
     print("\n  All correctness tests PASSED")
     return True
@@ -217,13 +227,21 @@ def test_v1_v2_equivalence():
     ]
     lib_v2.kernel_p2p_allreduce_rmsnorm_tp4_v2.restype = ctypes.c_int
     
-    # Setup
-    devices = [GPUDevice(i) for i in range(4)]
-    streams = [hip.stream_create() for i in range(4) for hip in [devices[i].hip]][::4]
-    
+    # Enable P2P access
     for i in range(4):
         hip.set_device(i)
-        streams[i] = hip.stream_create()
+        for j in range(4):
+            if i != j:
+                if hip.device_can_access_peer(i, j):
+                    try:
+                        hip.device_enable_peer_access(j)
+                    except Exception:
+                        pass
+    
+    streams = []
+    for i in range(4):
+        hip.set_device(i)
+        streams.append(hip.stream_create())
     
     # Test data
     rng = np.random.default_rng(42)
@@ -232,11 +250,11 @@ def test_v1_v2_equivalence():
     weight_np = rng.random(5120).astype(np.float16) + 0.5
     
     # Allocate (run v1 and v2 on same data)
-    partial_ptrs = [alloc_fill_gpu(devices[i], partials_np[i]) for i in range(4)]
-    hidden_ptrs = [alloc_fill_gpu(devices[i], hidden_np) for i in range(4)]
-    output_v1_ptrs = [devices[i].malloc(5120 * 2) for i in range(4)]
-    output_v2_ptrs = [devices[i].malloc(5120 * 2) for i in range(4)]
-    weight_ptrs = [alloc_fill_gpu(devices[i], weight_np) for i in range(4)]
+    partial_ptrs = [alloc_fill_gpu(hip, i, partials_np[i]) for i in range(4)]
+    hidden_ptrs = [alloc_fill_gpu(hip, i, hidden_np) for i in range(4)]
+    output_v1_ptrs = [hip.malloc(5120 * 2) for i in range(4)]
+    output_v2_ptrs = [hip.malloc(5120 * 2) for i in range(4)]
+    weight_ptrs = [alloc_fill_gpu(hip, i, weight_np) for i in range(4)]
     
     # Run v1
     for i in range(4):
@@ -258,7 +276,8 @@ def test_v1_v2_equivalence():
     
     # Reset hidden_ptrs for v2 (need to re-upload since v1 modified them)
     for i in range(4):
-        devices[i].upload(hidden_ptrs[i], hidden_np.tobytes())
+        hip.set_device(i)
+        hip.memcpy_h2d(hidden_ptrs[i], hidden_np.tobytes(), hidden_np.nbytes)
     
     # Run v2
     for i in range(4):
@@ -279,8 +298,8 @@ def test_v1_v2_equivalence():
         hip.stream_synchronize(streams[i])
     
     # Download and compare
-    results_v1 = [download_fp16(devices[i], output_v1_ptrs[i], 5120) for i in range(4)]
-    results_v2 = [download_fp16(devices[i], output_v2_ptrs[i], 5120) for i in range(4)]
+    results_v1 = [download_fp16(hip, i, output_v1_ptrs[i], 5120) for i in range(4)]
+    results_v2 = [download_fp16(hip, i, output_v2_ptrs[i], 5120) for i in range(4)]
     
     max_diff = max(float(np.max(np.abs(results_v1[i].astype(np.float32) - results_v2[i].astype(np.float32))))
                    for i in range(4))
@@ -301,8 +320,6 @@ def test_v1_v2_equivalence():
         hip.free(output_v2_ptrs[i])
         hip.free(weight_ptrs[i])
         hip.stream_destroy(streams[i])
-    for d in devices:
-        d.cleanup()
     
     print("\n  v1/v2 equivalence test PASSED")
     return True

@@ -38,20 +38,13 @@ Created `kernel_p2p_allreduce_rmsnorm_v2.hip` with the following optimizations:
   - Less register pressure per CU
   - Better occupancy for memory-bound kernels
 
-### 3. Reduced Synchronization Points (2 → 1 `__syncthreads()`)
-- **Before**: 
-  ```cpp
-  __syncthreads();  // After warp leaders write to LDS
-  if (threadIdx.x < 4) { ... compute total ... }
-  __syncthreads();  // Before reading total
-  ```
-- **After**:
-  ```cpp
-  __syncthreads();  // After warp leaders write to LDS
-  if (tid == 0) { ... compute total ... }
-  // Implicit: only thread 0 needs to see its own write
-  ```
-- **Benefit**: Eliminates one synchronization barrier (~20-50 cycles on gfx906)
+### 3. Reduced Synchronization Overhead (fewer warps)
+- **Before**: 4 warps with 2 `__syncthreads()` barriers
+- **After**: 2 warps with 2 `__syncthreads()` barriers
+- **Benefit**: While the number of barriers remains the same, having fewer warps (2 vs 4)
+  reduces the synchronization overhead as there are fewer warps to schedule and coordinate.
+  The second barrier is necessary to ensure thread 0's computed total is visible to all
+  threads before Phase 4.
 
 ### 4. Optimized Memory Access Pattern
 - Explicit dwordx4 (128-bit) loads with better alignment
@@ -64,30 +57,46 @@ Created `kernel_p2p_allreduce_rmsnorm_v2.hip` with the following optimizations:
 - **After**: `__shared__ float s_warp[2]` (2 warps × 4 bytes)
 - **Benefit**: Reduced LDS footprint, less contention
 
-## Expected Performance Improvement
-
-Based on the optimizations:
+## Actual Performance Results (Measured on 4x MI50)
 
 | Metric | v1 (Baseline) | v2 (Optimized) | Improvement |
 |--------|---------------|----------------|-------------|
 | Threads/block | 256 | 128 | -50% |
 | Warps/block | 4 | 2 | -50% |
-| `__syncthreads()` | 2 | 1 | -50% |
+| `__syncthreads()` | 2 | 2 | 0% |
 | LDS usage | 16 bytes | 8 bytes | -50% |
 | Elements/iteration | 8 | 16 | +100% |
-| **Expected latency** | ~79 us | **~45-50 us** | **~37-43%** |
+| **Measured latency** | **~74 us** | **~75 us** | **~-1% (no improvement)** |
+| **Target latency** | N/A | <= 50 us | **NOT MET** |
 
-### Performance Model
+### Performance Analysis
 
-For memory-bound kernels on gfx906:
-- PCIe BAR1 read latency dominates for small payloads (10KB)
-- Kernel launch overhead: ~5-10us
-- Memory access: ~10KB / 12 GB/s = ~0.8us (theoretical minimum)
-- Synchronization overhead: ~20-50 cycles per `__syncthreads()` = ~0.02-0.05us
-- Reduction computation: ~10-20us
+The v2 optimizations did NOT achieve the target performance improvement. Analysis:
 
-**v1 estimate**: 10 (launch) + 40 (memory) + 0.1 (sync) + 20 (compute) = ~70us
-**v2 estimate**: 10 (launch) + 25 (memory, better coalescing) + 0.05 (sync) + 15 (compute) = ~50us
+1. **Memory-bound workload**: For 10KB payloads on PCIe (no XGMI), the kernel is memory-bound
+   - BAR1 P2P read latency dominates (~12 GB/s effective bandwidth)
+   - Both v1 and v2 are limited by peer memory access latency
+   
+2. **Thread count reduction**: Reducing from 256 to 128 threads doesn't help because:
+   - The workload is already large enough to saturate the GPU
+   - Memory latency, not compute, is the bottleneck
+   
+3. **Vectorized loads**: While v2 uses more aggressive vectorization (16 elements vs 8),
+   - This doesn't overcome the fundamental BAR1 latency limitation
+   - Both kernels achieve similar effective memory bandwidth
+
+4. **Why the model was wrong**: The performance model underestimated:
+   - BAR1 P2P access latency for random peer memory reads
+   - The impact of having 3 remote peer accesses per thread
+   - PCIe topology overhead (2-hop between non-adjacent GPUs)
+
+### Conclusion
+
+The v2 kernel provides **numerical equivalence** with v1 (max diff = 0) but **no performance improvement**.
+The target of <= 50us was not achieved. Alternative optimization strategies should be explored:
+- Assembly-level optimization of memory access patterns
+- Warp-specialized execution (dedicated warps for load/compute/store)
+- Alternative algorithms that reduce peer memory accesses
 
 ## Files Created/Modified
 
