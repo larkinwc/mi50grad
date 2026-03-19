@@ -74,6 +74,8 @@ def main():
             ct.c_void_p,        # partial_peer1
             ct.c_void_p,        # partial_peer2
             ct.c_void_p,        # weight (RMSNorm)
+            ct.c_void_p,        # wg_partial_sum_sq (cross-WG coordination)
+            ct.c_void_p,        # wg_completion_counter (atomic counter)
             ct.c_uint,          # K (input dim)
             ct.c_uint,          # N (output dim)
             ct.c_uint,          # dim (for RMSNorm)
@@ -84,7 +86,7 @@ def main():
             ct.c_void_p,        # stream
         ]
         lib.gemv_int4_p2p_allreduce_rmsnorm_tp4.restype = ct.c_int
-        print("Function signature verified for TP4")
+        print("Function signature verified for TP4 (with atomic counter params)")
     except Exception as e:
         print(f"FAIL: Could not set function signature: {e}")
         return 1

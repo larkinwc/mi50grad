@@ -28,6 +28,15 @@
  *   - 256/16 = 16 columns per workgroup
  *   - Cooperative reduction via DPP + LDS
  *
+ * CROSS-WG COORDINATION (M1 fix):
+ *   - GEMV uses multiple workgroups (16 columns per WG)
+ *   - RMSNorm needs global sum-of-squares across ALL columns
+ *   - Solution: Atomic completion counter + global memory partial sum array
+ *   - Each WG writes its partial sum-of-squares to global memory
+ *   - Each WG atomically increments completion counter
+ *   - Last WG (counter == num_wgs-1) sums all partials and broadcasts rms_inv
+ *   - All WGs apply RMSNorm using broadcast value via LDS
+ *
  * Target: gfx906 (MI50/MI60), compiled as SHARED LIBRARY with:
  *   hipcc -O3 --offload-arch=gfx906 -std=c++17 -shared -fPIC
  *
@@ -36,6 +45,22 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+
+/* ===================================================================
+ * Global memory arrays for cross-WG coordination (M1 atomic counter fix)
+ * One set per TP rank (GPU)
+ * =================================================================== */
+
+// Host must allocate and pass these as kernel parameters:
+// - wg_partial_sum_sq[tp_rank]: array of [num_wgs] floats
+// - wg_completion_counter[tp_rank]: single uint (zeroed before each kernel launch)
+//
+// Host-side allocation example (Python):
+//   num_wgs_max = 128  // ceil(max_K/8/16) for largest layer
+//   wg_partial_sum_sq = [hipMalloc(num_wgs_max * 4) for _ in range(4)]
+//   wg_completion_counter = [hipMalloc(4) for _ in range(4)]
+//
+// Before each token: hipMemset(wg_completion_counter[tp_rank], 0, 4)
 
 /* ===================================================================
  * Device helper functions
@@ -122,14 +147,16 @@ __device__ __forceinline__ float dequant_fdot2(
  * @param partial_peer0 First peer GPU's partial buffer [N] (P2P BAR1 pointer)
  * @param partial_peer1 Second peer GPU's partial buffer [N] (P2P BAR1 pointer)
  * @param partial_peer2 Third peer GPU's partial buffer [N] (P2P BAR1 pointer)
- * @param weight        RMSNorm weight buffer [N] (full size, replicated)
- * @param K             Input dimension (activation size)
- * @param N             Total output dimension (all GPUs combined)
- * @param dim           Hidden dimension for RMSNorm (typically = N)
- * @param group_size    Quantization group size (e.g., 128)
- * @param eps           RMSNorm epsilon (default: 1e-6)
- * @param tp_rank       This GPU's rank in TP group (0-3)
- * @param tp_size       Tensor parallel size (4)
+ * @param weight              RMSNorm weight buffer [N] (full size, replicated)
+ * @param wg_partial_sum_sq   Global memory array [num_wgs] for cross-WG sum-of-squares
+ * @param wg_completion_counter Global memory atomic counter [1] (zeroed before launch)
+ * @param K                   Input dimension (activation size)
+ * @param N                   Total output dimension (all GPUs combined)
+ * @param dim                 Hidden dimension for RMSNorm (typically = N)
+ * @param group_size          Quantization group size (e.g., 128)
+ * @param eps                 RMSNorm epsilon (default: 1e-6)
+ * @param tp_rank             This GPU's rank in TP group (0-3)
+ * @param tp_size             Tensor parallel size (4)
  */
 __attribute__((amdgpu_flat_work_group_size(256, 256)))
 __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
@@ -143,6 +170,8 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
     const __half* __restrict__ partial_peer1,
     const __half* __restrict__ partial_peer2,
     const __half* __restrict__ weight,
+    float* __restrict__ wg_partial_sum_sq,      // [num_wgs] cross-WG coordination
+    unsigned int* __restrict__ wg_completion_counter,  // [1] atomic counter
     unsigned int K,
     unsigned int N,
     unsigned int dim,
@@ -258,110 +287,79 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
     total += __half2float(partial_peer2[col]);
 
     // =================================================================
-    // Phase 3: RMSNorm - Compute sum-of-squares across ALL N columns
-    // Reference: kernel_p2p_allreduce_rmsnorm.hip pattern
+    // Phase 3: RMSNorm with Cross-WG Coordination (M1 atomic counter fix)
     //
-    // CHALLENGE: This kernel uses multiple workgroups (80 for N=5120, TP=4),
+    // PROBLEM: This kernel uses multiple workgroups (16 columns per WG),
     // but RMSNorm requires sum-of-squares across ALL N columns.
+    // Workgroups cannot access each other's LDS directly.
     //
-    // SOLUTION: Use LDS to store all 16 columns' allreduce results for this workgroup,
-    // then have all threads participate in computing sum-of-squares for our columns.
-    // For peer columns, read peer partials directly (they contain peer GEMV results).
-    //
-    // NOTE: This implementation assumes peer partials contain the GEMV results
-    // from peer GPUs for their respective partitions. The allreduce sum for
-    // a column in a peer partition is: peer0[col] + peer1[col] + peer2[col].
+    // SOLUTION: Atomic completion counter with global memory partial array:
+    //   1. Each WG computes local sum-of-squares for its 16 columns
+    //   2. Each WG writes partial sum to global memory array
+    //   3. Each WG atomically increments completion counter
+    //   4. Last WG (counter == num_wgs-1) sums all partials
+    //   5. Last WG broadcasts rms_inv via LDS
+    //   6. All WGs apply RMSNorm using broadcast value
     // =================================================================
     
-    // Store allreduce results for our 16 columns in LDS
-    __shared__ float s_col_results[16];
+    unsigned int wg_id = blockIdx.x;
+    unsigned int num_wgs = gridDim.x;
+    
+    // Shared memory for broadcast
+    __shared__ float s_rms_inv_broadcast;
+    
+    // Phase 3a: Compute LOCAL sum-of-squares for our 16 columns
+    float local_sum_sq = 0.0f;
     if (k_split_id == 0) {
+        // Store allreduce results for our 16 columns in LDS first
+        __shared__ float s_col_results[16];
         s_col_results[col_in_wg] = total;
-    }
-    __syncthreads();
-    
-    // Compute sum-of-squares across ALL N columns
-    float sum_sq = 0.0f;
-    
-    // Vectorized strided loop: thread t processes {t*8, t*8+2048, ...}
-    for (unsigned int i = threadIdx.x * 8; i + 7 < dim; i += 256 * 8) {
+        __syncthreads();
+        
+        // Sum squares for our 16 columns
         #pragma unroll
-        for (int k = 0; k < 8; k++) {
-            unsigned int col_i = i + k;
-            float allreduce_result;
-            
-            // Check if this column is in our workgroup's range
-            unsigned int wg_col_start = blockIdx.x * COLS_PER_WG;
-            unsigned int wg_col_end = wg_col_start + COLS_PER_WG;
-            
-            if (col_i >= wg_col_start && col_i < wg_col_end) {
-                // Column in our workgroup - read from LDS
-                allreduce_result = s_col_results[col_i - wg_col_start];
-            } else if (col_i >= col_start && col_i < col_start + cols_per_gpu) {
-                // Column in our GPU's partition but different workgroup
-                // Read peer partials (our GEMV contribution is in our workgroup's LDS)
-                // For now, approximate as peer sum (IMPERFECT - needs cross-WG LDS)
-                allreduce_result = __half2float(partial_peer0[col_i])
-                                 + __half2float(partial_peer1[col_i])
-                                 + __half2float(partial_peer2[col_i]);
-            } else {
-                // Column in peer partition
-                allreduce_result = __half2float(partial_peer0[col_i])
-                                 + __half2float(partial_peer1[col_i])
-                                 + __half2float(partial_peer2[col_i]);
-            }
-            
-            sum_sq += allreduce_result * allreduce_result;
+        for (int c = 0; c < 16; c++) {
+            float val = s_col_results[c];
+            local_sum_sq += val * val;
         }
+        
+        // Write to global memory array for cross-WG coordination
+        wg_partial_sum_sq[wg_id] = local_sum_sq;
     }
     
-    // Scalar tail: elements in [(dim/8)*8, dim-1]
-    {
-        unsigned int vec_dim = (dim / 8) * 8;
-        for (unsigned int i = vec_dim + threadIdx.x; i < dim; i += 256) {
-            float allreduce_result;
-            unsigned int wg_col_start = blockIdx.x * COLS_PER_WG;
-            unsigned int wg_col_end = wg_col_start + COLS_PER_WG;
-            
-            if (i >= wg_col_start && i < wg_col_end) {
-                allreduce_result = s_col_results[i - wg_col_start];
-            } else if (i >= col_start && i < col_start + cols_per_gpu) {
-                allreduce_result = __half2float(partial_peer0[i])
-                                 + __half2float(partial_peer1[i])
-                                 + __half2float(partial_peer2[i]);
-            } else {
-                allreduce_result = __half2float(partial_peer0[i])
-                                 + __half2float(partial_peer1[i])
-                                 + __half2float(partial_peer2[i]);
-            }
-            
-            sum_sq += allreduce_result * allreduce_result;
+    // Phase 3b: Atomic completion counter with memory fence
+    // Ensure global memory write is visible before incrementing counter
+    __threadfence();
+    
+    unsigned int my_id = atomicAdd(wg_completion_counter, 1U);
+    
+    // Phase 3c: Last WG performs global reduction and broadcast
+    float rms_inv = 1.0f;  // Default value for non-last WGs (will be overwritten)
+    
+    if (my_id == num_wgs - 1U) {
+        // We are the LAST workgroup to arrive
+        // Sum all partial sum-of-squares from global memory
+        float total_sum_sq = 0.0f;
+        for (unsigned int w = 0; w < num_wgs; w++) {
+            total_sum_sq += wg_partial_sum_sq[w];
         }
+        
+        // Compute inverse RMS
+        rms_inv = rsqrtf(total_sum_sq / (float)dim + eps);
+        
+        // Store in LDS for broadcast to all WGs
+        s_rms_inv_broadcast = rms_inv;
+        
+        // Reset counter for next token
+        // (MUST happen after all WGs have read their values)
+        *wg_completion_counter = 0;
     }
-
-    // Phase 3b: Intra-wavefront DPP reduction (6-step butterfly for wave64)
-    sum_sq += __shfl_xor(sum_sq, 32);
-    sum_sq += __shfl_xor(sum_sq, 16);
-    sum_sq += __shfl_xor(sum_sq, 8);
-    sum_sq += __shfl_xor(sum_sq, 4);
-    sum_sq += __shfl_xor(sum_sq, 2);
-    sum_sq += __shfl_xor(sum_sq, 1);
-
-    // Phase 3c: Cross-warp reduction via LDS (4 warps x 64 lanes)
-    __shared__ float s_warp[4];
-    if (lane == 0) s_warp[wf_id] = sum_sq;
-    __syncthreads();
-
-    if (threadIdx.x < 4) {
-        float warp_sum = s_warp[0] + s_warp[1] + s_warp[2] + s_warp[3];
-        s_warp[threadIdx.x] = warp_sum;
-    }
+    
+    // Phase 3d: Synchronize and broadcast
     __syncthreads();
     
-    float total_sq = s_warp[0];
-
-    // Compute inverse RMS
-    float rms_inv = rsqrtf(total_sq / (float)dim + eps);
+    // All WGs read the broadcast rms_inv value
+    rms_inv = s_rms_inv_broadcast;
 
     // =================================================================
     // Phase 4: Apply RMSNorm + weight, write final result
@@ -584,24 +582,26 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp2_kernel(
  * Launch the TP=4 fused GEMV + P2P allreduce + RMSNorm kernel.
  *
  * Args:
- *   output:        Output buffer (fused result) [N/4] for this GPU's partition
- *   A:             FP16 activation buffer [K]
- *   B_q4:          INT4 weights [K/8, N/4] (partitioned)
- *   scales:        Per-group scales [K/group_size, N/4] (partitioned)
- *   zeros:         Per-group zeros [K/group_size, N/4] (partitioned)
- *   partial_local: This GPU's partial buffer [N] (or NULL)
- *   partial_peer0: First peer's partial buffer [N] (P2P pointer)
- *   partial_peer1: Second peer's partial buffer [N] (P2P pointer)
- *   partial_peer2: Third peer's partial buffer [N] (P2P pointer)
- *   weight:        RMSNorm weight buffer [N] (full size)
- *   K:             Input dimension
- *   N:             Total output dimension (all GPUs combined)
- *   dim:           Hidden dimension for RMSNorm
- *   group_size:    Quantization group size
- *   eps:           RMSNorm epsilon
- *   tp_rank:       This GPU's rank (0-3)
- *   tp_size:       Tensor parallel size (4)
- *   stream:        HIP stream
+ *   output:                  Output buffer (fused result) [N/4] for this GPU's partition
+ *   A:                       FP16 activation buffer [K]
+ *   B_q4:                    INT4 weights [K/8, N/4] (partitioned)
+ *   scales:                  Per-group scales [K/group_size, N/4] (partitioned)
+ *   zeros:                   Per-group zeros [K/group_size, N/4] (partitioned)
+ *   partial_local:           This GPU's partial buffer [N] (or NULL)
+ *   partial_peer0:           First peer's partial buffer [N] (P2P pointer)
+ *   partial_peer1:           Second peer's partial buffer [N] (P2P pointer)
+ *   partial_peer2:           Third peer's partial buffer [N] (P2P pointer)
+ *   weight:                  RMSNorm weight buffer [N] (full size)
+ *   wg_partial_sum_sq:       Global memory array [num_wgs] for cross-WG coordination
+ *   wg_completion_counter:   Global memory atomic counter [1] (zeroed before launch)
+ *   K:                       Input dimension
+ *   N:                       Total output dimension (all GPUs combined)
+ *   dim:                     Hidden dimension for RMSNorm
+ *   group_size:              Quantization group size
+ *   eps:                     RMSNorm epsilon
+ *   tp_rank:                 This GPU's rank (0-3)
+ *   tp_size:                 Tensor parallel size (4)
+ *   stream:                  HIP stream
  */
 extern "C" int gemv_int4_p2p_allreduce_rmsnorm_tp4(
     void* output,
@@ -614,6 +614,8 @@ extern "C" int gemv_int4_p2p_allreduce_rmsnorm_tp4(
     const void* partial_peer1,
     const void* partial_peer2,
     const void* weight,
+    void* wg_partial_sum_sq,        // NEW: [num_wgs] float array
+    void* wg_completion_counter,    // NEW: [1] uint counter
     unsigned int K,
     unsigned int N,
     unsigned int dim,
@@ -639,6 +641,8 @@ extern "C" int gemv_int4_p2p_allreduce_rmsnorm_tp4(
                        (const __half*)partial_peer1,
                        (const __half*)partial_peer2,
                        (const __half*)weight,
+                       (float*)wg_partial_sum_sq,
+                       (unsigned int*)wg_completion_counter,
                        K, N, dim, group_size, eps,
                        tp_rank, tp_size);
     
