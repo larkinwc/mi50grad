@@ -1,19 +1,13 @@
-# MI50Grad Services Manifest
-
 commands:
-  install: make all
-  build: make all
-  test: python3 -m pytest tests/ -v
-  kernels: make kernels
-  hip_kernels: make hip_kernels  # Build HIP kernel shared libraries (.so) for ctypes loading
-  c_extensions: make c_extensions
-  clean: make clean
+  install: "echo 'No package install needed - HIP/ROCm on dev server'"
+  build_kernel: "ssh root@192.168.1.198 'docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /opt/mi50grad:/opt/mi50grad mi50grad bash -c \"cd /opt/mi50grad && make kernels\"'"
+  test: "ssh root@192.168.1.198 'docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c \"cd /opt/mi50grad && python3 tests/bench_current_state.py\"'"
+  deploy: "rsync -avz --delete --exclude='.git' --exclude='build/' --exclude='__pycache__' --exclude='notes/' --exclude='plans/' --exclude='.factory' /Users/larkinwc/personal/ml/mi50grad/ root@192.168.1.198:/opt/mi50grad/"
 
-services: {}
-
-# Notes:
-# - All execution happens inside Docker container on dev server
-# - No persistent services needed - kernels run on-demand
-# - Dev server: root@192.168.1.198
-# - Docker image: mixa3607/rocm-gfx906:7.1.0-complete
-# - Models: /opt/models/Qwen3.5-27B-GPTQ-Int4, /opt/models/Qwen3.5-27B-AWQ
+services:
+  vllm:
+    start: "ssh root@192.168.1.198 'docker start vllm-mobydick'"
+    stop: "ssh root@192.168.1.198 'docker stop vllm-mobydick'"
+    healthcheck: "ssh root@192.168.1.198 'docker ps | grep vllm-mobydick'"
+    port: 8000
+    depends_on: []

@@ -1,16 +1,24 @@
 #!/bin/bash
-# Environment setup for TP=4 optimization mission
+# init.sh - Environment setup for TP=4 throughput push mission
 # Idempotent - safe to run multiple times
 
-set -euo pipefail
+set -e
 
-# Verify SSH connectivity to dev server
-if ! ssh -o ConnectTimeout=5 -o BatchMode=yes root@192.168.1.198 "echo ok" &>/dev/null; then
-    echo "WARNING: Cannot connect to dev server root@192.168.1.198"
-    echo "SSH key auth must be configured for this mission to work"
-fi
+echo "Checking SSH connectivity to dev server..."
+ssh -o ConnectTimeout=5 root@192.168.1.198 "echo 'Dev server reachable'" 2>/dev/null || {
+    echo "WARNING: Cannot reach dev server at 192.168.1.198"
+    echo "GPU tests will not work without dev server access"
+}
 
-# Ensure deploy directory exists on remote
-ssh -o ConnectTimeout=5 root@192.168.1.198 "mkdir -p /opt/mi50grad/build/kernels" 2>/dev/null || true
+echo "Checking local project structure..."
+for f in src/kernels/gemv_int4_p2p_allreduce_rmsnorm.hip \
+         src/kernels/kernel_p2p_allreduce_rmsnorm.hip \
+         src/runtime/c_dispatch.c \
+         src/inference/tp_engine.py \
+         tests/bench_current_state.py; do
+    if [ ! -f "$f" ]; then
+        echo "WARNING: Expected file missing: $f"
+    fi
+done
 
-echo "Init complete"
+echo "Init complete."
