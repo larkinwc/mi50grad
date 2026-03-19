@@ -14,6 +14,18 @@ High-throughput inference optimization for **Qwen 3.5 27B** (GPTQ-Int4) on **AMD
 
 Full benchmark report: [`bench/tp4_sprint4_report.md`](bench/tp4_sprint4_report.md)
 
+## Research & Optimization History
+
+Comprehensive research, optimization attempts, and benchmark results are documented in [`RESEARCH.md`](RESEARCH.md). This includes detailed analysis of all optimizations, failed attempts, and bottleneck analysis.
+
+**Current Performance:** 51.72 tok/s on 4× MI50 for Qwen3.5-27B-GPTQ-Int4 (3.38× improvement over baseline).
+
+Key optimizations include:
+- Kernel P2P Allreduce (M1): 1.50× allreduce speedup
+- Pipeline Overlap (M2): 1.085× speedup in isolation
+- Deferred Attention Allreduce (M3): 35% improvement by halving allreduce count
+- Kernel micro-optimizations: GEMV v6, FlashAttention-256 v3, INT4 GEMM v2
+
 ## Hardware Requirements
 
 - 4x AMD Instinct MI50 32GB (gfx906, Vega 20)
