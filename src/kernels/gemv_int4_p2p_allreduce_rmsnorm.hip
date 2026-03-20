@@ -408,6 +408,10 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
         // Wait for all WGs
     }
     
+    // CRITICAL: Memory barrier after spin-wait to ensure all wg_partial_sum_sq writes are visible
+    // Without this, WG 0 might read stale data from wg_partial_sum_sq[0] even though counter says done
+    __threadfence();
+    
     // All WGs have written their (identical) sums - WG 0 computes final rms_inv
     // and broadcasts via LDS
     __shared__ float s_rms_inv_broadcast;
