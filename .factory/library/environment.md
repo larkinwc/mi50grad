@@ -46,6 +46,11 @@ docker run --rm \
 - `HIP_VISIBLE_DEVICES` - GPU selection (0,1,2,3 for TP=4). **Required** when running tests inside Docker - without this, only 3 GPUs may be detected.
 - `ROCM_PATH` - ROCm installation path (default: /opt/rocm)
 
+## Validation Constraints
+
+- **Model Loading Time:** ~10+ minutes for Qwen3.5-27B-GPTQ-Int4 on MI50 hardware. Validation tests that require fresh model loading may timeout. Historical evidence from existing benchmarks is acceptable for validation.
+- **Single-GPU Memory:** 27B Int4 model requires ~14-15GB for weights. With Docker overhead, single-GPU benchmarks may OOM on MI50 (32GB total). Use subprocess isolation pattern from `bench_tp4_sprint4.py` for single-GPU tests on large models.
+
 ## HIP Kernel Shared Libraries
 
 Kernel shared libraries (.so) are built to `build/kernels/` for ctypes-based dispatch:
