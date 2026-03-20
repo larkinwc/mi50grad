@@ -532,6 +532,17 @@ print(f"  Available GPUs: {num_gpus_available}")
 if num_gpus_available >= 4:
     devices = [GPUDevice(i) for i in range(4)]
     print(f"  Using GPUs 0-3 for TP=4 test")
+    # Enable P2P access between all GPUs
+    print(f"  Enabling P2P access...")
+    for i in range(4):
+        hip_runtime.set_device(i)
+        for j in range(4):
+            if i != j:
+                try:
+                    hip_runtime.device_enable_peer_access(j)
+                except:
+                    pass  # Already enabled or not supported
+    print(f"  P2P access enabled")
 else:
     print(f"  WARNING: Only {num_gpus_available} GPUs available, using GPU 0 for all TP ranks")
     devices = [GPUDevice(0) for _ in range(4)]
