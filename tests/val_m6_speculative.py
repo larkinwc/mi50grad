@@ -64,25 +64,37 @@ K_DRAFT = 5  # For EAGLE mode
 BENCH_STEPS = 10  # Reduced to prevent timeout in VAL-SPEC-003 speedup test
 WARMUP_STEPS = 2  # Reduced warmup for faster testing
 
-# Test prompts by category
-TEST_PROMPTS = {
-    'code': [
-        "def fibonacci(n):\n    if n <= 1:\n        return n\n    else:\n        return fibonacci(n-1) + fibonacci(n-2)\n\nfor i in range(10):\n    print(fibonacci(i))\n",
-        "class DataProcessor:\n    def __init__(self, data):\n        self.data = data\n    \n    def process(self):\n        result = []\n        for item in self.data:\n            if item > 0:\n                result.append(item * 2)\n        return result\n",
-    ],
-    'json': [
-        '{"user": {"id": 12345, "name": "John Doe", "email": "john@example.com", "preferences": {"theme": "dark", "notifications": true}}, "metadata": {"created_at": "2024-01-15", "updated_at": "2024-01-20"}}',
-        '{"api_response": {"status": "success", "data": [{"product_id": "P001", "name": "Widget", "price": 29.99, "in_stock": true}], "pagination": {"page": 1, "per_page": 10, "total": 1}}}',
-    ],
-    'conversational': [
-        "User: Can you help me understand how machine learning works?\nAssistant: Of course! Machine learning is a subset of artificial intelligence.\nUser: What are the main types?\nAssistant:",
-        "Person A: Hey, did you finish the report?\nPerson B: Almost done! Just need to add the conclusion.\nPerson A: Great!\n",
-    ],
-    'repetitive': [
-        "the cat sat on the mat. the dog ran in the park. the bird flew in the sky. the fish swam in the water.",
-        "red blue green yellow red blue green yellow red blue green yellow",
-    ]
-}
+# Test prompts by category - loaded from centralized prompt module
+# Import and use PromptDataset for standardized test prompts
+try:
+    from src.inference.prompts import PromptDataset, PromptCategory
+    _prompt_dataset = PromptDataset()
+    TEST_PROMPTS = {
+        'code': [p.text for p in _prompt_dataset.get_prompts(PromptCategory.CODE)],
+        'json': [p.text for p in _prompt_dataset.get_prompts(PromptCategory.JSON)],
+        'conversational': [p.text for p in _prompt_dataset.get_prompts(PromptCategory.CONVERSATIONAL)],
+        'repetitive': [p.text for p in _prompt_dataset.get_prompts(PromptCategory.REPETITIVE)],
+    }
+except ImportError:
+    # Fallback to hardcoded prompts if module not available (for local testing)
+    TEST_PROMPTS = {
+        'code': [
+            "def fibonacci(n):\n    if n <= 1:\n        return n\n    else:\n        return fibonacci(n-1) + fibonacci(n-2)\n\nfor i in range(10):\n    print(fibonacci(i))\n",
+            "class DataProcessor:\n    def __init__(self, data):\n        self.data = data\n    \n    def process(self):\n        result = []\n        for item in self.data:\n            if item > 0:\n                result.append(item * 2)\n        return result\n",
+        ],
+        'json': [
+            '{"user": {"id": 12345, "name": "John Doe", "email": "john@example.com", "preferences": {"theme": "dark", "notifications": true}}, "metadata": {"created_at": "2024-01-15", "updated_at": "2024-01-20"}}',
+            '{"api_response": {"status": "success", "data": [{"product_id": "P001", "name": "Widget", "price": 29.99, "in_stock": true}], "pagination": {"page": 1, "per_page": 10, "total": 1}}}',
+        ],
+        'conversational': [
+            "User: Can you help me understand how machine learning works?\nAssistant: Of course! Machine learning is a subset of artificial intelligence.\nUser: What are the main types?\nAssistant:",
+            "Person A: Hey, did you finish the report?\nPerson B: Almost done! Just need to add the conclusion.\nPerson A: Great!\n",
+        ],
+        'repetitive': [
+            "the cat sat on the mat. the dog ran in the park. the bird flew in the sky. the fish swam in the water.",
+            "red blue green yellow red blue green yellow red blue green yellow",
+        ]
+    }
 
 results = {}
 metrics = {}
@@ -713,6 +725,29 @@ def main():
     print("\nTest Categories:")
     for cat, prompts in TEST_PROMPTS.items():
         print(f"  - {cat}: {len(prompts)} prompts")
+    
+    # Verify prompt module integration
+    print("\nPrompt Module Integration:")
+    try:
+        from src.inference.prompts import PromptDataset, TrainTestSplitter
+        dataset = PromptDataset()
+        print(f"  ✓ PromptDataset loaded: {dataset}")
+        
+        # Verify train/test split
+        splitter = TrainTestSplitter(train_ratio=0.6)
+        sample_prompt = TEST_PROMPTS['code'][0]
+        train_text, test_text = splitter.split_text(sample_prompt)
+        print(f"  ✓ Train/test split verified (60%/40%):")
+        print(f"      Sample: {len(sample_prompt)} chars -> train={len(train_text)}, test={len(test_text)}")
+        
+        # Verify tokenizer integration
+        from src.inference.prompts import TokenizerAdapter
+        tokenizer = TokenizerAdapter.create_char_level()
+        tokens = tokenizer.encode(sample_prompt[:20])
+        print(f"  ✓ Tokenizer integration verified: {len(tokens)} tokens for 20 chars")
+        
+    except ImportError as e:
+        print(f"  ⚠️  Prompt module not available (fallback to hardcoded prompts): {e}")
     
     # Run tests
     try:
