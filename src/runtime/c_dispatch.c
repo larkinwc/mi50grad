@@ -97,7 +97,8 @@ typedef int (*kernel_p2p_fused_tp4_fn_t)(
 
 /* gemv_int4_p2p_allreduce_rmsnorm_tp4(output, A, B_q4, scales, zeros,
  *                                        partial_local, peer0, peer1, peer2,
- *                                        weight, K, N, dim, group_size, eps,
+ *                                        weight, wg_partial_sum_sq, wg_write_counter, wg_done_counter,
+ *                                        K, N, dim, group_size, eps,
  *                                        tp_rank, tp_size, stream)
  * Host-callable C wrapper from gemv_int4_p2p_allreduce_rmsnorm.so.
  * Fused INT4 GEMV + P2P allreduce + RMSNorm kernel for FFN down projection.
@@ -114,6 +115,9 @@ typedef int (*gemv_int4_fused_tp4_fn_t)(
     const void* partial_peer1,
     const void* partial_peer2,
     const void* weight,               /* RMSNorm weight (next layer's attn_norm) */
+    void* wg_partial_sum_sq,          /* [num_wgs] WG partial sum array */
+    void* wg_write_counter,           /* [1] write barrier counter */
+    void* wg_done_counter,            /* [1] completion counter */
     unsigned int K,                   /* Input dim (intermediate size) */
     unsigned int N,                   /* Output dim (hidden size) */
     unsigned int dim,                 /* Hidden dim for RMSNorm */
@@ -261,8 +265,12 @@ typedef struct {
     uint64_t ffn_down_zeros_ptrs[4];   /* FFN down proj zeros per GPU */
     uint32_t ffn_K;                    /* FFN intermediate size (input to down proj) */
     uint32_t ffn_group_size;           /* Quantization group size */
-    /* Padding for 8-byte alignment: total adds 4+8+32+32+32+32+4+4 = 148 bytes */
-    /* Total struct size with previous 48: 48 + 148 = 196 bytes (aligned to 8: 200) */
+    /* Fused GEMV kernel cross-WG coordination counters */
+    uint64_t gemv_fused_wg_partial_sum_sq[4];  /* [4] WG partial sum arrays */
+    uint64_t gemv_fused_wg_write_counter[4];   /* [4] write barrier counters */
+    uint64_t gemv_fused_wg_done_counter[4];    /* [4] completion counters */
+    /* Padding for 8-byte alignment: total adds 4+8+32+32+32+32+4+4+32*3 = 292 bytes */
+    /* Total struct size: previous fields + 292 bytes */
 } CAllreduceSpec;
 
 /*
@@ -706,6 +714,9 @@ static int do_allreduce_gemv_fused(CAllreduceSpec *ar, CDispatchPlan *plan)
             (const void *)(uintptr_t)ar->partial_ptrs[p1],
             (const void *)(uintptr_t)ar->partial_ptrs[p2],
             (const void *)(uintptr_t)ar->rmsnorm_weight_ptrs[i],
+            (void *)(uintptr_t)ar->gemv_fused_wg_partial_sum_sq[i],  /* wg_partial_sum_sq */
+            (void *)(uintptr_t)ar->gemv_fused_wg_write_counter[i],   /* wg_write_counter */
+            (void *)(uintptr_t)ar->gemv_fused_wg_done_counter[i],    /* wg_done_counter */
             K,                                            /* Input dim (intermediate) */
             n,                                            /* Output dim (hidden) */
             n,                                            /* Hidden dim for RMSNorm */

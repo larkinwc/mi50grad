@@ -5063,6 +5063,10 @@ class TPInferenceEngine:
                 ('ffn_down_zeros_ptrs', ct.c_uint64 * 4),   # FFN down proj zeros per GPU
                 ('ffn_K',           ct.c_uint32),  # FFN intermediate size (input to down proj)
                 ('ffn_group_size',  ct.c_uint32),  # Quantization group size
+                # Fused GEMV kernel cross-WG coordination counters
+                ('gemv_fused_wg_partial_sum_sq', ct.c_uint64 * 4),  # [4] WG partial sum arrays
+                ('gemv_fused_wg_write_counter', ct.c_uint64 * 4),  # [4] write barrier counters
+                ('gemv_fused_wg_done_counter', ct.c_uint64 * 4),  # [4] completion counters
                 # Padding for alignment (total struct size should be 448 bytes)
             ]
 
@@ -5287,7 +5291,7 @@ class TPInferenceEngine:
         if gemv_fused_so_path.exists():
             try:
                 gemv_fused_lib = ct.CDLL(str(gemv_fused_so_path))
-                # Set function signature (wg_done_counter removed - all WGs compute rms_inv independently)
+                # Set function signature with all 21 parameters including counters
                 gemv_fused_lib.gemv_int4_p2p_allreduce_rmsnorm_tp4.argtypes = [
                     ct.c_void_p,        # output
                     ct.c_void_p,        # A (input activation)
@@ -5299,8 +5303,9 @@ class TPInferenceEngine:
                     ct.c_void_p,        # partial_peer1
                     ct.c_void_p,        # partial_peer2
                     ct.c_void_p,        # weight (RMSNorm)
-                    ct.c_void_p,        # wg_partial_sum_sq (debug/verification)
+                    ct.c_void_p,        # wg_partial_sum_sq (WG partial sums)
                     ct.c_void_p,        # wg_write_counter (write barrier)
+                    ct.c_void_p,        # wg_done_counter (completion barrier)
                     ct.c_uint,          # K (input dim)
                     ct.c_uint,          # N (output dim)
                     ct.c_uint,          # dim (for RMSNorm)
@@ -5315,16 +5320,48 @@ class TPInferenceEngine:
                     gemv_fused_lib.gemv_int4_p2p_allreduce_rmsnorm_tp4,
                     ct.c_void_p
                 ).value
-                # Fused GEMV+AR+RMSNorm kernel - enabled after fixing RMSNorm sum-of-squares bug
-                # FIX: Each WG now independently computes global sum-of-squares by iterating
-                # over ALL N columns with stride 256 (matches kernel_p2p_allreduce_rmsnorm_v3 pattern).
-                # All WGs get the same rms_inv value, no broadcast needed.
-                if True:  # Enabled after RMSNorm fix
-                    use_gemv_fused_in_c = True
-                    print(f"C dispatch: fused GEMV+AR+RMSNorm kernel ENABLED for FFN down-proj "
-                          f"(fn_ptr=0x{gemv_fused_fn_ptr:016x})")
-                else:
-                    print(f"C dispatch: fused GEMV+AR+RMSNorm kernel available but DISABLED")
+                
+                # Allocate counter memory for cross-WG coordination
+                # These are allocated once and reused across tokens
+                # Counters are zeroed by the kernel itself after each use
+                max_num_wgs = 128  # ceil(17408/8/16) for largest FFN layer
+                hip = self._hip
+                wg_partial_sum_sq_ptrs = []
+                wg_write_counter_ptrs = []
+                wg_done_counter_ptrs = []
+                
+                for gpu_idx in range(4):
+                    hip.set_device(self.device_ids[gpu_idx])
+                    # Allocate wg_partial_sum_sq array
+                    wg_sum_sq = ct.c_void_p(0)
+                    hip._lib.hipMalloc(ct.byref(wg_sum_sq), max_num_wgs * 4)  # 4 bytes per float
+                    wg_partial_sum_sq_ptrs.append(wg_sum_sq.value)
+                    
+                    # Allocate wg_write_counter (single uint)
+                    wg_write_ct = ct.c_void_p(0)
+                    hip._lib.hipMalloc(ct.byref(wg_write_ct), 4)
+                    wg_write_counter_ptrs.append(wg_write_ct.value)
+                    
+                    # Allocate wg_done_counter (single uint)
+                    wg_done_ct = ct.c_void_p(0)
+                    hip._lib.hipMalloc(ct.byref(wg_done_ct), 4)
+                    wg_done_counter_ptrs.append(wg_done_ct.value)
+                    
+                    # Zero-initialize counters
+                    hip._lib.hipMemset(wg_write_ct, 0, 4)
+                    hip._lib.hipMemset(wg_done_ct, 0, 4)
+                
+                # Store counter pointers for later use in C dispatch
+                gemv_fused_counters = {
+                    'wg_partial_sum_sq': wg_partial_sum_sq_ptrs,
+                    'wg_write_counter': wg_write_counter_ptrs,
+                    'wg_done_counter': wg_done_counter_ptrs,
+                }
+                
+                # FUSED GEMV+AR+RMSNorm kernel - ENABLED with proper counter initialization
+                use_gemv_fused_in_c = True
+                print(f"C dispatch: fused GEMV+AR+RMSNorm kernel ENABLED for FFN down-proj "
+                      f"(fn_ptr=0x{gemv_fused_fn_ptr:016x}, counters allocated)")
             except Exception as e:
                 print(f"C dispatch: failed to load fused GEMV kernel library: {e}")
                 gemv_fused_lib = None
@@ -5407,6 +5444,11 @@ class TPInferenceEngine:
                     c_ar.ffn_down_zeros_ptrs[i] = lw.down_zeros
                 c_ar.ffn_K = self.local_intermediate_size
                 c_ar.ffn_group_size = self.config.group_size
+                # Set counter pointers for cross-WG coordination
+                for i in range(4):
+                    c_ar.gemv_fused_wg_partial_sum_sq[i] = gemv_fused_counters['wg_partial_sum_sq'][i]
+                    c_ar.gemv_fused_wg_write_counter[i] = gemv_fused_counters['wg_write_counter'][i]
+                    c_ar.gemv_fused_wg_done_counter[i] = gemv_fused_counters['wg_done_counter'][i]
             else:
                 c_ar.use_gemv_fused = 0
                 c_ar.gemv_fused_tp4_fn = 0
@@ -5520,6 +5562,10 @@ class TPInferenceEngine:
         # Keep fused kernel library alive (prevent GC)
         if fused_lib is not None:
             self._c_dispatch_objects['fused_kernel_lib'] = fused_lib
+        # Keep fused GEMV kernel library and counters alive
+        if gemv_fused_lib is not None:
+            self._c_dispatch_objects['gemv_fused_lib'] = gemv_fused_lib
+            self._c_dispatch_objects['gemv_fused_counters'] = gemv_fused_counters
 
         print(f"C dispatch plan built: {num_layers} layers × {num_engines} engines")
         return plan
