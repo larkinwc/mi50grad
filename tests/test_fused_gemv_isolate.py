@@ -206,29 +206,22 @@ def run_gemv_v6(A_h16, B_q4, scales, zeros, N, K, group_size, threads_per_col=16
 
 def run_fused_gemv_isolated(A_h16, B_q4, scales, zeros, N, K, group_size, tp_rank=0, tp_size=4, gemv_results_all=None, stream=None):
     """
-    Run the fused kernel with proper setup to isolate GEMV correctness.
+    Run the fused kernel with proper setup for TP=4.
     
-    To properly test the GEMV portion:
-    1. Run gemv_int4_v6 to get reference GEMV output for all columns
-    2. Partition the GEMV output for each TP rank
-    3. Set partial_local = GEMV result for this GPU's partition (padded to full N)
-    4. Set partial_peer* = GEMV results from other partitions
-    5. Set B_q4, scales, zeros = zeros (so GEMV computes 0)
-    6. The fused kernel output = rmsnorm(0 + partials) = rmsnorm(gemv_results)
+    The fused kernel computes GEMV inline and uses peer partials for RMSNorm sum-of-squares.
     
-    This tests whether the fused kernel correctly handles the allreduce input
-    and applies RMSNorm correctly, isolating the GEMV computation validation.
+    Args:
+        gemv_results_all: Optional [N] array of pre-computed GEMV results.
+                         If provided, sets up peer partials for RMSNorm.
+                         If None, peer partials are zeroed (RMSNorm will be incorrect).
     
-    Alternative: Run the actual GEMV in the fused kernel but compare the
-    pre-RMSNorm accumulation values (requires kernel modification).
-    
-    For this test, we'll:
-    1. Run fused kernel with real GEMV computation
-    2. Compare gemv_acc accumulation values by inspecting intermediate state
-       (requires adding debug output to kernel)
-    
-    Simplest approach for now: Compare full fused output against
-    reference (gemv_int4_v6 + allreduce + RMSNorm).
+    For testing:
+    1. Pre-compute GEMV for all 4 partitions using gemv_int4_v6
+    2. Concatenate into gemv_results_all
+    3. For each TP rank, run fused kernel with:
+       - Real partitioned weights (for inline GEMV)
+       - gemv_results_all set (for peer partials in RMSNorm)
+    4. Compare fused output against reference (gemv_int4_v6 + RMSNorm)
     """
     hip = dev.hip
     
@@ -259,37 +252,29 @@ def run_fused_gemv_isolated(A_h16, B_q4, scales, zeros, N, K, group_size, tp_ran
     dev.upload(d_scales, scales.tobytes())
     dev.upload(d_zeros,  zeros.tobytes())
     
-    # If gemv_results_all is provided, set partial buffers to GEMV results
-    # This bypasses the GEMV computation and tests allreduce+RMSNorm only
+    # Set up partial_local and peer partials
+    # partial_local will be overwritten by kernel with inline GEMV results
+    # Peer partials are used for RMSNorm sum-of-squares computation
     if gemv_results_all is not None:
-        # gemv_results_all is [N] - full GEMV output
-        # We need to set up partial buffers to simulate all 4 GPUs.
-        #
-        # The kernel expects:
-        # - partial_local[col]: this GPU's GEMV result at GLOBAL column col
-        # - partial_peerX[col_in_peer]: peer GPU's GEMV result at LOCAL column col_in_peer (0 to cols_per_gpu-1)
-        #
-        # So partial_local is full-size [N] with values at global indices,
-        # but peer buffers are packed [cols_per_gpu] with values at local indices.
+        # Set up peer partials with pre-computed GEMV results for RMSNorm
+        # The kernel will overwrite partial_local with its own GEMV results
         
-        # Create partial_local with this GPU's results at GLOBAL indices
+        # partial_local initialized to zeros (will be overwritten by kernel)
         partial_local_h = np.zeros(N, dtype=np.float16)
-        local_start = tp_rank * cols_per_gpu
-        local_end = local_start + cols_per_gpu
-        partial_local_h[local_start:local_end] = gemv_results_all[local_start:local_end]
+        dev.upload(d_partial_local, partial_local_h.tobytes())
         
         # Create packed peer buffers (local indices only)
+        # Peer buffers contain other GPUs' GEMV results for RMSNorm
         other_gpus = [g for g in range(4) if g != tp_rank]
         partial_peer0_h = gemv_results_all[other_gpus[0]*cols_per_gpu:(other_gpus[0]+1)*cols_per_gpu].copy()
         partial_peer1_h = gemv_results_all[other_gpus[1]*cols_per_gpu:(other_gpus[1]+1)*cols_per_gpu].copy()
         partial_peer2_h = gemv_results_all[other_gpus[2]*cols_per_gpu:(other_gpus[2]+1)*cols_per_gpu].copy()
         
-        dev.upload(d_partial_local, partial_local_h.tobytes())
         dev.upload(d_partial_peer0, partial_peer0_h.tobytes())
         dev.upload(d_partial_peer1, partial_peer1_h.tobytes())
         dev.upload(d_partial_peer2, partial_peer2_h.tobytes())
     else:
-        # Normal mode: zero partials, GEMV computes the result
+        # No peer partials - RMSNorm will only use this GPU's columns (incorrect!)
         dev.upload(d_partial_local, np.zeros(N, dtype=np.float16).tobytes())
         dev.upload(d_partial_peer0, np.zeros(N, dtype=np.float16).tobytes())
         dev.upload(d_partial_peer1, np.zeros(N, dtype=np.float16).tobytes())
@@ -508,35 +493,23 @@ for tp_rank in range(4):
 gemv_full = np.concatenate(gemv_partitions)
 print(f"  Full GEMV result shape: {gemv_full.shape}, range: [{float(gemv_full.min()):.4f}, {float(gemv_full.max()):.4f}]")
 
-# Now run fused kernel for each TP rank with proper peer partial setup
-# We set B_q4/scales/zeros to zeros (so GEMV computes 0), and set peer partials to GEMV results
-print(f"  Running fused kernel with peer partials...")
-
-# Create zero weights for disabling GEMV computation
-B_q4_zeros = np.zeros_like(B_q4_parts[0])
-scales_ones = np.ones_like(scales_parts[0])  # scales=1 to avoid NaN
-zeros_zeros = np.zeros_like(zeros_parts[0])
+# Now run fused kernel for each TP rank with REAL weights
+# This tests the actual fused GEMV + RMSNorm path (no allreduce sum for TP)
+print(f"  Running fused kernel with real partitioned weights...")
 
 results_fused = []
 for tp_rank in range(4):
-    # Create peer partial buffers for this TP rank
-    # partial_local = zeros (GEMV disabled)
-    # partial_peer0/1/2 = GEMV results from other partitions
-    
-    # For TP rank 0: peer0=GPU1, peer1=GPU2, peer2=GPU3
-    # For TP rank 1: peer0=GPU0, peer1=GPU2, peer2=GPU3
-    # etc.
-    
-    # Actually, for this test, let's just pass the full GEMV result to all peer buffers
-    # This tests whether the kernel correctly reads from peer buffers for global RMSNorm
+    # Run fused kernel with real partitioned weights
+    # The kernel computes GEMV inline and uses peer partials only for RMSNorm sum-of-squares
+    # We pass gemv_full so peer partials are set up correctly for RMSNorm
     result_partition = run_fused_gemv_isolated(
         A_h16,
-        B_q4_zeros,  # Zero weights - GEMV will compute ~0
-        scales_ones,
-        zeros_zeros,
+        B_q4_parts[tp_rank],  # Real partitioned weights
+        scales_parts[tp_rank],
+        zeros_parts[tp_rank],
         N, K, group_size,
         tp_rank=tp_rank, tp_size=4,
-        gemv_results_all=gemv_full  # Pass full GEMV result for peer partials
+        gemv_results_all=gemv_full  # Pass for peer partials (RMSNorm sum-of-squares)
     )
     results_fused.append(result_partition)
     print(f"  GPU {tp_rank} output shape: {result_partition.shape} (cols {tp_rank*cols_per_gpu} to {(tp_rank+1)*cols_per_gpu})")

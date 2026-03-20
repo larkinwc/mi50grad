@@ -274,22 +274,18 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
     __syncthreads();
 
     // =================================================================
-    // Phase 2: P2P Allreduce - Read peer partials and reduce
-    // Each GPU reads all 4 partials (local + 3 peers) via P2P BAR1
-    // Access uses global column index (col) for P2P buffers
-    //
-    // NOTE: partial_result already contains the inline GEMV output from Phase 1.
-    // We only add peer partials here, NOT partial_local (which would double-count).
-    // The fused kernel computes GEMV inline, so partial_local is not needed.
+    // Phase 2: Store GEMV result for RMSNorm
+    // For TP, each GPU outputs its own GEMV result (no allreduce sum).
+    // Peer partials are used in Phase 3 for global sum-of-squares computation.
     // =================================================================
     float total = partial_result;
     
-    // Add peer partials via P2P BAR1 pointers
-    // Peer buffers are full-size [N], accessed at global col
-    // Do NOT add partial_local - it would double-count the GEMV result
-    total += __half2float(partial_peer0[col]);
-    total += __half2float(partial_peer1[col]);
-    total += __half2float(partial_peer2[col]);
+    // Write GEMV result to partial_local for this GPU's columns
+    // This will be read in Phase 3 for global sum-of-squares computation
+    if (k_split_id == 0) {
+        partial_local[col] = __float2half(total);
+    }
+    __syncthreads();
 
     // =================================================================
     // Phase 3: RMSNorm with Cross-WG Coordination (M1 atomic counter fix)
