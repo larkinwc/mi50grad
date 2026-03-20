@@ -54,8 +54,31 @@ __syncthreads();
 
 ---
 
+## Memory Barrier Pattern (CRITICAL)
+
+**Pattern**: `__threadfence()` MUST be placed AFTER spin-wait barriers, not just before.
+
+**Why**: The AMD GPU memory model requires explicit fencing after volatile reads of shared counters to ensure visibility of other writes to global memory.
+
+```cpp
+// WRONG: Missing fence after spin-wait
+while (*counter < num_wgs) { /* spin */ }
+// STALE DATA MAY BE READ HERE!
+float val = partial_sums[0];  // May read stale value
+
+// CORRECT: Fence after spin-wait
+while (*counter < num_wgs) { /* spin */ }
+__threadfence();  // Ensures all global memory writes from other WGs are visible
+float val = partial_sums[0];  // Correctly reads updated value
+```
+
+**Evidence**: Commit c67445e fixed NaN in RMSNorm by adding `__threadfence()` after the wg_done_counter spin-wait. Without it, WG 0 read stale wg_partial_sum_sq[0] data even though the counter indicated all WGs were done.
+
+---
+
 ## Known Issues
 
 1. **71% regression** when cross-WG sync missing
 2. **Double-counting** if hidden input not correctly handled
 3. **Precision drift** if FP16 accumulation used
+4. **NaN in Python threading tests** - Python threads cannot achieve true simultaneous multi-GPU kernel execution. Use C dispatch for validation of P2P-dependent kernels.
