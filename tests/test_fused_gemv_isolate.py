@@ -101,7 +101,8 @@ fused_lib.gemv_int4_p2p_allreduce_rmsnorm_tp4.argtypes = [
     ctypes.c_void_p,       # partial_peer2
     ctypes.c_void_p,       # weight (RMSNorm)
     ctypes.c_void_p,       # wg_partial_sum_sq (cross-WG coordination)
-    ctypes.c_void_p,       # wg_completion_counter (atomic counter)
+    ctypes.c_void_p,       # wg_write_counter (write barrier counter)
+    ctypes.c_void_p,       # wg_done_counter (completion counter)
     ctypes.c_uint32,       # K
     ctypes.c_uint32,       # N
     ctypes.c_uint32,       # dim
@@ -280,10 +281,14 @@ def run_fused_gemv_isolated(A_h16, B_q4, scales, zeros, N, K, group_size, tp_ran
     
     # Allocate cross-WG coordination buffers
     # wg_partial_sum_sq: array of floats, size = num_wgs (ceil(cols_per_gpu / 16))
+    # wg_write_counter: single uint for write barrier
+    # wg_done_counter: single uint for completion tracking
     num_wgs = (cols_per_gpu + 16 - 1) // 16
     d_wg_partial_sum_sq = dev.malloc(num_wgs * 4)  # 4 bytes per float
-    d_wg_completion_counter = dev.malloc(4)  # 4 bytes for uint counter
-    dev.upload(d_wg_completion_counter, np.array([0], dtype=np.uint32).tobytes())
+    d_wg_write_counter = dev.malloc(4)  # 4 bytes for uint counter
+    d_wg_done_counter = dev.malloc(4)  # 4 bytes for uint counter
+    dev.upload(d_wg_write_counter, np.array([0], dtype=np.uint32).tobytes())
+    dev.upload(d_wg_done_counter, np.array([0], dtype=np.uint32).tobytes())
 
     err = fused_lib.gemv_int4_p2p_allreduce_rmsnorm_tp4(
         ctypes.c_void_p(d_output),
@@ -297,7 +302,8 @@ def run_fused_gemv_isolated(A_h16, B_q4, scales, zeros, N, K, group_size, tp_ran
         ctypes.c_void_p(d_partial_peer2),
         ctypes.c_void_p(d_weight),
         ctypes.c_void_p(d_wg_partial_sum_sq),
-        ctypes.c_void_p(d_wg_completion_counter),
+        ctypes.c_void_p(d_wg_write_counter),
+        ctypes.c_void_p(d_wg_done_counter),
         K, N, N, group_size, 1e-6, tp_rank, tp_size, stream_ptr
     )
     
@@ -318,7 +324,8 @@ def run_fused_gemv_isolated(A_h16, B_q4, scales, zeros, N, K, group_size, tp_ran
     dev.free(d_partial_peer2)
     dev.free(d_weight)
     dev.free(d_wg_partial_sum_sq)
-    dev.free(d_wg_completion_counter)
+    dev.free(d_wg_write_counter)
+    dev.free(d_wg_done_counter)
     dev.free(d_output)
 
     return result
