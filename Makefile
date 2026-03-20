@@ -82,7 +82,7 @@ $(BUILD_DIR)/probes $(BUILD_DIR)/bench $(BUILD_DIR)/kernels:
 # HIP Kernel Libraries (shared libraries for ctypes loading)
 # ============================================================
 
-KERNEL_HIP_SRCS = $(wildcard src/kernels/kernel_*.hip) $(wildcard src/kernels/gemv_int4_p2p_allreduce_rmsnorm.hip) $(wildcard src/kernels/persistent_decode.hip)
+KERNEL_HIP_SRCS = $(wildcard src/kernels/kernel_*.hip) $(wildcard src/kernels/gemv_int4_p2p_allreduce_rmsnorm.hip) $(wildcard src/kernels/gemv_int4_p2p_allreduce_rmsnorm_compressed.hip) $(wildcard src/kernels/persistent_decode.hip)
 # Also include v2 and v3 optimized kernels
 KERNEL_HIP_SRCS += $(wildcard src/kernels/*_v2.hip)
 KERNEL_HIP_SRCS += $(wildcard src/kernels/*_v3.hip)

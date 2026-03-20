@@ -18,46 +18,58 @@ GPU kernel implementation and optimization features:
 
 ## Work Procedure
 
-### 1. TDD - Write Tests First (RED)
+### 1. Read Feature Description and Library Files
+Before anything else:
+- Read the feature description carefully
+- Read `.factory/library/compressed-allreduce.md` (for compressed AR features)
+- Read `.factory/library/batch-decode.md` (for batch decode features)
+- Read `.factory/library/architecture.md` for existing kernel patterns
+- Read `.factory/library/fused-gemv-patterns.md` for fused kernel design
+
+### 2. TDD - Write Tests First (RED)
 Before implementing:
 - Identify existing test files for similar kernels
 - Write/update test file with failing test cases covering:
-  - Numerical correctness (cosine_sim, max_abs_error)
+  - Numerical correctness (cosine_sim >= 0.99, max_abs_error)
   - Edge cases (different dimensions, batch sizes)
   - Performance targets (latency, throughput)
 - Run tests to confirm they FAIL (red phase)
 
-### 2. Implement Kernel Changes
+### 3. Implement Kernel Changes
 - Edit HIP kernel files in `src/kernels/`
 - For cross-WG coordination: use `atomicAdd()` on global memory counters
 - Maintain FP32 accumulation for numerical precision
 - Add detailed comments explaining synchronization mechanism
+- For compressed allreduce: see `.factory/library/compressed-allreduce.md` for INT8 quantization design
+- For batch decode: see `.factory/library/batch-decode.md` for GEMV/GEMM switching design
+- **CRITICAL: Create NEW kernel files for A/B testing, do NOT modify existing working kernels**
 
-### 3. Build on Dev Server
+### 4. Build on Dev Server
 ```bash
 # Deploy code
-rsync -avz --delete --exclude='.git' --exclude='build/' ./ root@192.168.1.198:/opt/mi50grad/
+rsync -avz --delete --exclude='.git' --exclude='build/' --exclude='__pycache__' --exclude='notes/' --exclude='plans/' --exclude='.factory' /Users/larkinwc/personal/ml/mi50grad/ root@192.168.1.198:/opt/mi50grad/
 
-# Build kernel
-ssh root@192.168.1.198 'docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /opt/mi50grad:/opt/mi50grad mi50grad bash -c "cd /opt/mi50grad && make hip_kernels"'
+# Build kernels AND C extensions
+ssh root@192.168.1.198 'docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -v /opt/mi50grad:/opt/mi50grad mi50grad bash -c "cd /opt/mi50grad && make hip_kernels c_extensions"'
 ```
 
-### 4. Run Tests to Verify (GREEN)
+### 5. Run Tests to Verify (GREEN)
 ```bash
 # Run kernel-specific tests
-ssh root@192.168.1.198 'docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad mi50grad bash -c "cd /opt/mi50grad && python3 tests/test_<kernel>.py"'
+ssh root@192.168.1.198 'docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c "cd /opt/mi50grad && python3 tests/test_<kernel>.py"'
 ```
 
-### 5. Benchmark and Profile
+### 6. Benchmark and Profile
 ```bash
 # Full throughput benchmark
 ssh root@192.168.1.198 'docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c "cd /opt/mi50grad && python3 tests/bench_current_state.py"'
 ```
 
-### 6. Integration Verification
+### 7. Integration Verification
 - Update `src/inference/tp_engine.py` if kernel interface changes
 - Update `src/runtime/c_dispatch.c` if C dispatch integration changes
 - Verify end-to-end decode produces correct output
+- **Always verify no regression in batch=1 mode (>= 53.0 tok/s) and single-GPU (>= 21.0 tok/s)**
 
 ## Example Handoff
 
