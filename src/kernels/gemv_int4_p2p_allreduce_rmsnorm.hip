@@ -146,7 +146,7 @@ __device__ __forceinline__ float dequant_fdot2(
  * @param B_q4          INT4 weights in GPTQ format [K/8, N/TP] (partitioned)
  * @param scales        Per-group scales [K/group_size, N/TP] (partitioned)
  * @param zeros         Per-group zeros [K/group_size, N/TP] (partitioned)
- * @param partial_local This GPU's partial buffer [N] (full size, P2P accessible, used for cross-WG communication)
+ * @param partial_local This GPU's partial buffer [N] (full size, P2P accessible, used for cross-WG communication, read-write)
  * @param partial_peer0 First peer GPU's partial buffer [N] (P2P BAR1 pointer)
  * @param partial_peer1 Second peer GPU's partial buffer [N] (P2P BAR1 pointer)
  * @param partial_peer2 Third peer GPU's partial buffer [N] (P2P BAR1 pointer)
@@ -169,7 +169,7 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
     const unsigned int* __restrict__ B_q4,
     const __half* __restrict__ scales,
     const __half* __restrict__ zeros,
-    const __half* __restrict__ partial_local,
+    __half* __restrict__ partial_local,
     const __half* __restrict__ partial_peer0,
     const __half* __restrict__ partial_peer1,
     const __half* __restrict__ partial_peer2,
@@ -359,10 +359,23 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
                 allreduce_result = __half2float(partial_local[col_i]);
             } else {
                 // This column belongs to a peer GPU - read from peer partial buffers via P2P
+                // The peer buffer index depends on tp_rank:
+                // - GPU 0: peer0->GPU1, peer1->GPU2, peer2->GPU3
+                // - GPU 1: peer0->GPU0, peer1->GPU2, peer2->GPU3
+                // - GPU 2: peer0->GPU0, peer1->GPU1, peer2->GPU3
+                // - GPU 3: peer0->GPU0, peer1->GPU1, peer2->GPU2
+                // Map col_gpu to peer buffer index
                 unsigned int col_in_peer = col_i % cols_per_gpu;
-                if (col_gpu == 0) {
+                unsigned int peer_idx;
+                if (col_gpu < tp_rank) {
+                    peer_idx = col_gpu;  // GPUs before this one are at peer[col_gpu]
+                } else {
+                    peer_idx = col_gpu - 1;  // GPUs after this one are shifted by 1
+                }
+                
+                if (peer_idx == 0) {
                     allreduce_result = __half2float(partial_peer0[col_in_peer]);
-                } else if (col_gpu == 1) {
+                } else if (peer_idx == 1) {
                     allreduce_result = __half2float(partial_peer1[col_in_peer]);
                 } else {
                     allreduce_result = __half2float(partial_peer2[col_in_peer]);
@@ -385,10 +398,18 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
                 allreduce_result = __half2float(partial_local[i]);
             } else {
                 // This column belongs to a peer GPU - read from peer partial buffers
+                // Map col_gpu to peer buffer index (same logic as vectorized loop)
                 unsigned int col_in_peer = i % cols_per_gpu;
-                if (col_gpu == 0) {
+                unsigned int peer_idx;
+                if (col_gpu < tp_rank) {
+                    peer_idx = col_gpu;
+                } else {
+                    peer_idx = col_gpu - 1;
+                }
+                
+                if (peer_idx == 0) {
                     allreduce_result = __half2float(partial_peer0[col_in_peer]);
-                } else if (col_gpu == 1) {
+                } else if (peer_idx == 1) {
                     allreduce_result = __half2float(partial_peer1[col_in_peer]);
                 } else {
                     allreduce_result = __half2float(partial_peer2[col_in_peer]);
@@ -705,7 +726,7 @@ extern "C" int gemv_int4_p2p_allreduce_rmsnorm_tp4(
     const unsigned int* B_q4,
     const void* scales,
     const void* zeros,
-    const void* partial_local,
+    void* partial_local,
     const void* partial_peer0,
     const void* partial_peer1,
     const void* partial_peer2,
@@ -733,7 +754,7 @@ extern "C" int gemv_int4_p2p_allreduce_rmsnorm_tp4(
                        (const unsigned int*)B_q4,
                        (const __half*)scales,
                        (const __half*)zeros,
-                       (const __half*)partial_local,
+                       (__half*)partial_local,
                        (const __half*)partial_peer0,
                        (const __half*)partial_peer1,
                        (const __half*)partial_peer2,

@@ -156,14 +156,14 @@ def validate_kernel_source():
     source_text = kernel_source.read_text()
     
     checks = {
-        "Atomic counter parameter": "wg_completion_counter" in source_text,
+        "Atomic counter parameter": "wg_write_counter" in source_text and "wg_done_counter" in source_text,
         "Sum-of-squares array": "wg_partial_sum_sq" in source_text,
-        "atomicAdd for counter": "atomicAdd(wg_completion_counter, 1U)" in source_text,
+        "atomicAdd for counter": "atomicAdd(wg_write_counter" in source_text or "atomicAdd(wg_done_counter" in source_text,
         "__threadfence() memory barrier": "__threadfence();" in source_text,
-        "Last WG reduction": "my_id == num_wgs - 1" in source_text or "my_id == num_wgs - 1U" in source_text,
+        "Last WG reduction": "my_done_id == num_wgs - 1" in source_text or "my_done_id == num_wgs - 1U" in source_text,
         "Global reduction loop": "for (unsigned int w = 0; w < num_wgs; w++)" in source_text,
         "LDS broadcast": "s_rms_inv_broadcast" in source_text,
-        "Counter reset": "*wg_completion_counter = 0" in source_text,
+        "Counter reset": "*wg_write_counter = 0" in source_text or "*wg_done_counter = 0" in source_text,
         "FP32 accumulation (gemv_acc)": "float gemv_acc = 0.0f" in source_text,
         "FDOT2 instructions": "__builtin_amdgcn_fdot2" in source_text,
     }

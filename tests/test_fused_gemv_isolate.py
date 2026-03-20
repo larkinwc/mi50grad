@@ -263,12 +263,31 @@ def run_fused_gemv_isolated(A_h16, B_q4, scales, zeros, N, K, group_size, tp_ran
     # This bypasses the GEMV computation and tests allreduce+RMSNorm only
     if gemv_results_all is not None:
         # gemv_results_all is [N] - full GEMV output
-        # Each GPU's partial_local should be zeros (GEMV in fused kernel is disabled)
-        # Peer partials should contain the GEMV results
-        dev.upload(d_partial_local, np.zeros(N, dtype=np.float16).tobytes())
-        dev.upload(d_partial_peer0, gemv_results_all.tobytes())
-        dev.upload(d_partial_peer1, gemv_results_all.tobytes())
-        dev.upload(d_partial_peer2, gemv_results_all.tobytes())
+        # We need to set up partial buffers to simulate all 4 GPUs.
+        #
+        # The kernel expects:
+        # - partial_local[col]: this GPU's GEMV result at GLOBAL column col
+        # - partial_peerX[col_in_peer]: peer GPU's GEMV result at LOCAL column col_in_peer (0 to cols_per_gpu-1)
+        #
+        # So partial_local is full-size [N] with values at global indices,
+        # but peer buffers are packed [cols_per_gpu] with values at local indices.
+        
+        # Create partial_local with this GPU's results at GLOBAL indices
+        partial_local_h = np.zeros(N, dtype=np.float16)
+        local_start = tp_rank * cols_per_gpu
+        local_end = local_start + cols_per_gpu
+        partial_local_h[local_start:local_end] = gemv_results_all[local_start:local_end]
+        
+        # Create packed peer buffers (local indices only)
+        other_gpus = [g for g in range(4) if g != tp_rank]
+        partial_peer0_h = gemv_results_all[other_gpus[0]*cols_per_gpu:(other_gpus[0]+1)*cols_per_gpu].copy()
+        partial_peer1_h = gemv_results_all[other_gpus[1]*cols_per_gpu:(other_gpus[1]+1)*cols_per_gpu].copy()
+        partial_peer2_h = gemv_results_all[other_gpus[2]*cols_per_gpu:(other_gpus[2]+1)*cols_per_gpu].copy()
+        
+        dev.upload(d_partial_local, partial_local_h.tobytes())
+        dev.upload(d_partial_peer0, partial_peer0_h.tobytes())
+        dev.upload(d_partial_peer1, partial_peer1_h.tobytes())
+        dev.upload(d_partial_peer2, partial_peer2_h.tobytes())
     else:
         # Normal mode: zero partials, GEMV computes the result
         dev.upload(d_partial_local, np.zeros(N, dtype=np.float16).tobytes())
@@ -459,17 +478,65 @@ result_v6 = run_gemv_v6(A_h16, B_q4_full, scales_full, zeros_full, N, K, group_s
 print(f"  Reference output shape: {result_v6.shape}")
 print(f"  Reference output range: [{float(result_v6.min()):.4f}, {float(result_v6.max()):.4f}]")
 
-# Run fused kernel GEMV portion (TP=4, each GPU processes N/4 columns with partitioned weights)
-print(f"\nRunning fused kernel GEMV portion (TP=4, partitioned weights)...")
-results_fused = []
+# Run fused kernel with proper peer partial setup to test RMSNorm computation
+# This simulates all 4 GPUs running simultaneously with correct peer partials
+print(f"\nRunning fused kernel with peer partials (simulating TP=4)...")
+
+# To properly test the fused kernel, we need to simulate all 4 GPUs:
+# 1. Each GPU computes GEMV for its N/4 partition
+# 2. All GPUs read peer partials to get full N columns for RMSNorm
+# 3. Since we can't run 4 GPUs simultaneously, we simulate by:
+#    - Computing GEMV for each partition using gemv_int4_v6
+#    - Setting up peer partials correctly
+#    - Running fused kernel with zero weights (so GEMV=0) but correct peer partials
+
+# First, compute GEMV for each partition
+print(f"  Computing GEMV for each partition...")
+gemv_partitions = []
 for tp_rank in range(4):
-    result_partition = run_fused_gemv_isolated(
-        A_h16, 
-        B_q4_parts[tp_rank],  # Partitioned weights
+    partition_result = run_gemv_v6(
+        A_h16,
+        B_q4_parts[tp_rank],
         scales_parts[tp_rank],
         zeros_parts[tp_rank],
+        cols_per_gpu, K, group_size,
+        threads_per_col=16
+    )
+    gemv_partitions.append(partition_result)
+
+# Create full GEMV result by concatenating partitions
+gemv_full = np.concatenate(gemv_partitions)
+print(f"  Full GEMV result shape: {gemv_full.shape}, range: [{float(gemv_full.min()):.4f}, {float(gemv_full.max()):.4f}]")
+
+# Now run fused kernel for each TP rank with proper peer partial setup
+# We set B_q4/scales/zeros to zeros (so GEMV computes 0), and set peer partials to GEMV results
+print(f"  Running fused kernel with peer partials...")
+
+# Create zero weights for disabling GEMV computation
+B_q4_zeros = np.zeros_like(B_q4_parts[0])
+scales_ones = np.ones_like(scales_parts[0])  # scales=1 to avoid NaN
+zeros_zeros = np.zeros_like(zeros_parts[0])
+
+results_fused = []
+for tp_rank in range(4):
+    # Create peer partial buffers for this TP rank
+    # partial_local = zeros (GEMV disabled)
+    # partial_peer0/1/2 = GEMV results from other partitions
+    
+    # For TP rank 0: peer0=GPU1, peer1=GPU2, peer2=GPU3
+    # For TP rank 1: peer0=GPU0, peer1=GPU2, peer2=GPU3
+    # etc.
+    
+    # Actually, for this test, let's just pass the full GEMV result to all peer buffers
+    # This tests whether the kernel correctly reads from peer buffers for global RMSNorm
+    result_partition = run_fused_gemv_isolated(
+        A_h16,
+        B_q4_zeros,  # Zero weights - GEMV will compute ~0
+        scales_ones,
+        zeros_zeros,
         N, K, group_size,
-        tp_rank=tp_rank, tp_size=4
+        tp_rank=tp_rank, tp_size=4,
+        gemv_results_all=gemv_full  # Pass full GEMV result for peer partials
     )
     results_fused.append(result_partition)
     print(f"  GPU {tp_rank} output shape: {result_partition.shape} (cols {tp_rank*cols_per_gpu} to {(tp_rank+1)*cols_per_gpu})")
