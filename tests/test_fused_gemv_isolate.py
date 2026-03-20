@@ -263,12 +263,28 @@ def run_fused_gemv_isolated(A_h16, B_q4, scales, zeros, N, K, group_size, tp_ran
         partial_local_h = np.zeros(N, dtype=np.float16)
         dev.upload(d_partial_local, partial_local_h.tobytes())
         
-        # Create packed peer buffers (local indices only)
-        # Peer buffers contain other GPUs' GEMV results for RMSNorm
+        # Create FULL SIZE peer buffers with GEMV results at GLOBAL column indices
+        # Peer buffers are [N] size, with peer GPU's results at their partition's indices
+        # For example, GPU 0's partial_peer0 contains GPU 1's results at indices [1280, 2560)
         other_gpus = [g for g in range(4) if g != tp_rank]
-        partial_peer0_h = gemv_results_all[other_gpus[0]*cols_per_gpu:(other_gpus[0]+1)*cols_per_gpu].copy()
-        partial_peer1_h = gemv_results_all[other_gpus[1]*cols_per_gpu:(other_gpus[1]+1)*cols_per_gpu].copy()
-        partial_peer2_h = gemv_results_all[other_gpus[2]*cols_per_gpu:(other_gpus[2]+1)*cols_per_gpu].copy()
+        
+        # Initialize peer buffers to zeros, then copy peer GEMV results to correct indices
+        partial_peer0_h = np.zeros(N, dtype=np.float16)
+        partial_peer1_h = np.zeros(N, dtype=np.float16)
+        partial_peer2_h = np.zeros(N, dtype=np.float16)
+        
+        # Copy GPU X's GEMV results to indices [X*cols_per_gpu, (X+1)*cols_per_gpu)
+        start0 = other_gpus[0] * cols_per_gpu
+        end0 = start0 + cols_per_gpu
+        partial_peer0_h[start0:end0] = gemv_results_all[start0:end0]
+        
+        start1 = other_gpus[1] * cols_per_gpu
+        end1 = start1 + cols_per_gpu
+        partial_peer1_h[start1:end1] = gemv_results_all[start1:end1]
+        
+        start2 = other_gpus[2] * cols_per_gpu
+        end2 = start2 + cols_per_gpu
+        partial_peer2_h[start2:end2] = gemv_results_all[start2:end2]
         
         dev.upload(d_partial_peer0, partial_peer0_h.tobytes())
         dev.upload(d_partial_peer1, partial_peer1_h.tobytes())

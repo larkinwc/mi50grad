@@ -324,20 +324,21 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
         // Busy-wait until all WGs finish writing their columns
     }
     
-    // Phase 3b: Compute GLOBAL sum-of-squares across ALL N columns
+    // Phase 3b: Each WG computes sum-of-squares for ALL N columns.
     // 
-    // CRITICAL FIX: Each WG must independently compute the SAME global sum.
-    // All 256 threads in EACH WG iterate over ALL N columns with stride 256.
-    // This ensures every WG computes the identical sum-of-squares value.
+    // To ensure all WGs compute the SAME value, each WG iterates over ALL N columns
+    // with stride (num_wgs * COLS_PER_WG) = (80 * 16) = 1280 per iteration.
+    // Within this WG, all 256 threads cooperate with stride 256.
     //
-    // Memory access pattern (matches kernel_p2p_allreduce_rmsnorm_v3):
-    //   Thread t accesses elements at: t, t+256, t+512, ... (stride 256)
-    //   For dim=5120: each thread processes 5120/256 = 20 elements
+    // For N=5120, 256 threads, stride 256:
+    //   Each thread processes: 5120/256 = 20 elements
+    //
+    // This approach is redundant (all WGs compute the same thing) but ensures
+    // correctness without complex cross-WG reduction.
     
     float sum_sq = 0.0f;
     
-    // Simple strided loop: each of 256 threads processes elements with stride 256
-    // This is the same pattern as the working v3 kernel
+    // Each of 256 threads processes elements with stride 256 across ALL N columns
     for (unsigned int i = threadIdx.x; i < dim; i += 256) {
         float allreduce_result;
         
@@ -349,7 +350,7 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
             allreduce_result = __half2float(partial_local[i]);
         } else {
             // This column belongs to a peer GPU - read from peer partial buffers via P2P
-            unsigned int col_in_peer = i % cols_per_gpu;
+            // Peer buffers are FULL SIZE [N], indexed by global column index
             unsigned int peer_idx;
             if (col_gpu < tp_rank) {
                 peer_idx = col_gpu;  // GPUs before this one are at peer[col_gpu]
@@ -357,12 +358,13 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
                 peer_idx = col_gpu - 1;  // GPUs after this one are shifted by 1
             }
             
+            // Use GLOBAL index 'i' directly
             if (peer_idx == 0) {
-                allreduce_result = __half2float(partial_peer0[col_in_peer]);
+                allreduce_result = __half2float(partial_peer0[i]);
             } else if (peer_idx == 1) {
-                allreduce_result = __half2float(partial_peer1[col_in_peer]);
+                allreduce_result = __half2float(partial_peer1[i]);
             } else {
-                allreduce_result = __half2float(partial_peer2[col_in_peer]);
+                allreduce_result = __half2float(partial_peer2[i]);
             }
         }
         
@@ -390,8 +392,7 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
     }
     __syncthreads();
     
-    // Each WG computed a sum - store in global memory for reduction
-    // Use atomic counter to track completion, then have WG 0 compute final rms_inv
+    // Each WG computed the SAME global sum - store in global memory
     wg_partial_sum_sq[wg_id] = s_wf[0];
     
     // Ensure write is visible before incrementing counter
@@ -404,16 +405,13 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
         // Wait for all WGs
     }
     
-    // All WGs have written their partial sums - now WG 0 computes final rms_inv
+    // All WGs have written their (identical) sums - WG 0 computes final rms_inv
     // and broadcasts via LDS
     __shared__ float s_rms_inv_broadcast;
     
     if (wg_id == 0 && threadIdx.x == 0) {
-        // WG 0, thread 0 sums all WG partials
-        float global_sum_sq = 0.0f;
-        for (unsigned int i = 0; i < num_wgs; i++) {
-            global_sum_sq += wg_partial_sum_sq[i];
-        }
+        // All WGs computed the same value, just use wg_partial_sum_sq[0]
+        float global_sum_sq = wg_partial_sum_sq[0];
         s_rms_inv_broadcast = rsqrtf(global_sum_sq / (float)dim + eps);
         // Reset counters for next token
         *wg_write_counter = 0;
