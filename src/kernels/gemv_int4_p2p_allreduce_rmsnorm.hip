@@ -217,8 +217,8 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
     unsigned int col_in_partition = local_col;
 
     // =================================================================
-    // Phase 1: INT4 GEMV with register-cached scale/zero + weight prefetch
-    // Computes partial GEMV result for this column
+    // Phase 1: INT4 GEMV (register-cached scale/zero + weight prefetch)
+    // Matches gemv_int4_v6 implementation for correctness
     // =================================================================
     float gemv_acc = 0.0f;
     
@@ -226,14 +226,14 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
     float cur_scale = 0.0f, cur_zero = 0.0f;
     unsigned int current_group = 0xFFFFFFFF;
     
-    // Weight prefetch with 2-register double buffering
+    // Weight prefetch - load first weight before loop
     unsigned int packed = 0;
     if (kg_start < kg_end) {
         packed = B_q4[kg_start * cols_per_gpu + col_in_partition];
     }
     
     for (unsigned int kg = kg_start; kg < kg_end; kg++) {
-        // Check if we're crossing a quantization group boundary
+        // Compute quantization group index and reload scale/zero if needed
         unsigned int next_group = kg >> gps_log2;
         if (next_group != current_group) {
             cur_scale = __half2float(scales[next_group * cols_per_gpu + col_in_partition]);
@@ -281,9 +281,10 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
     float total = partial_result;
     
     // Write GEMV result to partial_local for this GPU's columns
+    // Use LOCAL index (local_col) since partial_local is per-GPU buffer
     // This will be read in Phase 3 for global sum-of-squares computation
     if (k_split_id == 0) {
-        partial_local[col] = __float2half(total);
+        partial_local[local_col] = __float2half(total);
     }
     __syncthreads();
 
@@ -326,6 +327,8 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
     
     // Phase 3a: Wait for all workgroups to finish writing to partial_local
     // Use atomic counter as a barrier
+    // Ensure global memory writes are visible to other workgroups before incrementing counter
+    __threadfence();
     unsigned int my_write_id = atomicAdd(wg_write_counter, 1U);
     
     // Spin-wait until all workgroups have written
@@ -335,12 +338,19 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
         // Busy-wait
     }
     
-    // Phase 3b: Compute sum-of-squares across ALL N columns
-    // Each WG iterates over all columns, reading from partial_local or peer partials
+    // Phase 3b: Compute sum-of-squares for this WG's 16 columns ONLY
+    // Each WG is responsible for summing squares of its own columns.
+    // Last WG will sum all WG partials to get global sum.
+    //
+    // IMPORTANT: We must read ALL N columns for the sum-of-squares,
+    // but we only store the PARTIAL sum for this WG's columns.
+    // Actually, for correct RMSNorm, we need the GLOBAL sum across ALL columns.
+    // So each WG computes the global sum independently, but we DON'T sum them again.
+    
     float sum_sq = 0.0f;
     
-    // Vectorized strided loop - matches kernel_p2p_allreduce_rmsnorm_v3.hip pattern
-    // Each thread processes 8 elements at a time with stride 256*8=2048
+    // Vectorized strided loop - each WG iterates over ALL N columns
+    // This is correct because RMSNorm requires global sum across ALL columns
     for (unsigned int i = threadIdx.x * 8; i + 7 < dim; i += 256 * 8) {
         #pragma unroll
         for (int k = 0; k < 8; k++) {
@@ -351,16 +361,11 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
             unsigned int col_gpu = col_i / cols_per_gpu;
             
             if (col_gpu == tp_rank) {
-                // This column belongs to this GPU - read from partial_local
-                allreduce_result = __half2float(partial_local[col_i]);
+                // This column belongs to this GPU - read from partial_local using LOCAL index
+                unsigned int local_idx = col_i % cols_per_gpu;
+                allreduce_result = __half2float(partial_local[local_idx]);
             } else {
                 // This column belongs to a peer GPU - read from peer partial buffers via P2P
-                // The peer buffer index depends on tp_rank:
-                // - GPU 0: peer0->GPU1, peer1->GPU2, peer2->GPU3
-                // - GPU 1: peer0->GPU0, peer1->GPU2, peer2->GPU3
-                // - GPU 2: peer0->GPU0, peer1->GPU1, peer2->GPU3
-                // - GPU 3: peer0->GPU0, peer1->GPU1, peer2->GPU2
-                // Map col_gpu to peer buffer index
                 unsigned int col_in_peer = col_i % cols_per_gpu;
                 unsigned int peer_idx;
                 if (col_gpu < tp_rank) {
@@ -390,11 +395,10 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
             unsigned int col_gpu = i / cols_per_gpu;
             
             if (col_gpu == tp_rank) {
-                // This column belongs to this GPU - read from partial_local
-                allreduce_result = __half2float(partial_local[i]);
+                // Use LOCAL index for partial_local
+                unsigned int local_idx = i % cols_per_gpu;
+                allreduce_result = __half2float(partial_local[local_idx]);
             } else {
-                // This column belongs to a peer GPU - read from peer partial buffers
-                // Map col_gpu to peer buffer index (same logic as vectorized loop)
                 unsigned int col_in_peer = i % cols_per_gpu;
                 unsigned int peer_idx;
                 if (col_gpu < tp_rank) {
@@ -437,11 +441,13 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
     }
     __syncthreads();
     
+    // All WGs now have the GLOBAL sum-of-squares (all computed the same value)
+    // We DON'T need to sum them again - just use one WG's result
     float total_sum_sq = s_wf[0];
     float rms_inv = rsqrtf(total_sum_sq / (float)dim + eps);
     
-    // Phase 3e: Cross-WG coordination - collect sum-of-squares from all WGs
-    // Store partial sum in global memory for last WG to collect
+    // Phase 3e: Cross-WG coordination
+    // Store computed rms_inv in global memory for verification (optional)
     wg_partial_sum_sq[wg_id] = total_sum_sq;
     
     // Ensure global memory write is visible before incrementing counter
@@ -449,16 +455,8 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
     
     unsigned int my_done_id = atomicAdd(wg_done_counter, 1U);
     
-    // Last WG recomputes final rms_inv to ensure consistency
+    // Last WG broadcasts rms_inv via LDS and resets counters
     if (my_done_id == num_wgs - 1U) {
-        // Sum all partial sum-of-squares from all WGs
-        float global_sum_sq = 0.0f;
-        for (unsigned int w = 0; w < num_wgs; w++) {
-            global_sum_sq += wg_partial_sum_sq[w];
-        }
-        
-        rms_inv = rsqrtf(global_sum_sq / (float)dim + eps);
-        
         // Store in LDS for broadcast
         s_rms_inv_broadcast = rms_inv;
         

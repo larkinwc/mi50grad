@@ -317,6 +317,12 @@ def run_fused_gemv_isolated(A_h16, B_q4, scales, zeros, N, K, group_size, tp_ran
     hip.stream_synchronize(stream_ptr.value) if stream_ptr.value else hip.synchronize()
 
     result = np.frombuffer(dev.download(d_output, cols_per_gpu * 2), dtype=np.float16).copy()
+    
+    # Also download partial_local to get GEMV results before RMSNorm
+    gemv_before_rmsnorm = np.frombuffer(dev.download(d_partial_local, N * 2), dtype=np.float16).copy()
+    
+    # Also download wg_partial_sum_sq to see what each WG computed
+    wg_partial_sum_sq = np.frombuffer(dev.download(d_wg_partial_sum_sq, num_wgs * 4), dtype=np.float32).copy()
 
     dev.free(d_A)
     dev.free(d_B_q4)
@@ -332,7 +338,7 @@ def run_fused_gemv_isolated(A_h16, B_q4, scales, zeros, N, K, group_size, tp_ran
     dev.free(d_wg_done_counter)
     dev.free(d_output)
 
-    return result
+    return result, gemv_before_rmsnorm, wg_partial_sum_sq
 
 
 def apply_rmsnorm_weight(x, weight, eps=1e-6):
@@ -498,11 +504,12 @@ print(f"  Full GEMV result shape: {gemv_full.shape}, range: [{float(gemv_full.mi
 print(f"  Running fused kernel with real partitioned weights...")
 
 results_fused = []
+gemv_partitions_fused = []
 for tp_rank in range(4):
     # Run fused kernel with real partitioned weights
     # The kernel computes GEMV inline and uses peer partials only for RMSNorm sum-of-squares
     # We pass gemv_full so peer partials are set up correctly for RMSNorm
-    result_partition = run_fused_gemv_isolated(
+    result_partition, partial_local_full, wg_sum_sq = run_fused_gemv_isolated(
         A_h16,
         B_q4_parts[tp_rank],  # Real partitioned weights
         scales_parts[tp_rank],
@@ -512,10 +519,42 @@ for tp_rank in range(4):
         gemv_results_all=gemv_full  # Pass for peer partials (RMSNorm sum-of-squares)
     )
     results_fused.append(result_partition)
+    # Extract only this GPU's partition from partial_local
+    col_start = tp_rank * cols_per_gpu
+    col_end = col_start + cols_per_gpu
+    gemv_partition = partial_local_full[col_start:col_end].copy()
+    gemv_partitions_fused.append(gemv_partition)
     print(f"  GPU {tp_rank} output shape: {result_partition.shape} (cols {tp_rank*cols_per_gpu} to {(tp_rank+1)*cols_per_gpu})")
+    print(f"    WG sum_sq values (first 5): {wg_sum_sq[:5]}")
+    print(f"    WG sum_sq mean: {np.mean(wg_sum_sq):.4f}, std: {np.std(wg_sum_sq):.4f}")
 
 # Concatenate fused kernel results (all 4 GPU partitions)
 result_fused_full = np.concatenate(results_fused)
+gemv_fused_full = np.concatenate(gemv_partitions_fused)
+
+# Compare GEMV results (before RMSNorm) against reference
+print(f"\n  Comparing GEMV results (before RMSNorm)...")
+gemv_full_fp32 = gemv_full.astype(np.float32)
+gemv_fused_fp32 = gemv_fused_full.astype(np.float32)
+gemv_diff = np.abs(gemv_full_fp32 - gemv_fused_fp32)
+gemv_max_err = float(np.max(gemv_diff))
+print(f"  GEMV max abs error: {gemv_max_err:.6f}")
+if gemv_max_err < 1e-5:
+    print(f"  GEMV: PASS (inline GEMV matches reference)")
+else:
+    print(f"  GEMV: FAIL (inline GEMV does NOT match reference)")
+    # Show top errors
+    top_indices = np.argsort(gemv_diff)[-5:][::-1]
+    print(f"  Top GEMV errors:")
+    for idx in top_indices:
+        print(f"    idx={idx:5d}: ref={gemv_full[idx]:10.4f}, fused={gemv_fused_full[idx]:10.4f}, err={gemv_diff[idx]:.6f}")
+
+# Compute expected sum-of-squares from reference GEMV
+expected_sum_sq = float(np.sum(gemv_full_fp32 ** 2))
+expected_rms_inv = 1.0 / np.sqrt(expected_sum_sq / N + 1e-6)
+print(f"\n  Expected sum-of-squares (reference): {expected_sum_sq:.4f}")
+print(f"  Expected rms_inv: {expected_rms_inv:.6f}")
+print(f"  Expected output range after RMSNorm: [{float(np.min(gemv_full_fp32 * expected_rms_inv)):.4f}, {float(np.max(gemv_full_fp32 * expected_rms_inv)):.4f}]")
 print(f"\nFused kernel full output shape: {result_fused_full.shape}")
 print(f"Fused kernel output range: [{float(result_fused_full.min()):.4f}, {float(result_fused_full.max()):.4f}]")
 
