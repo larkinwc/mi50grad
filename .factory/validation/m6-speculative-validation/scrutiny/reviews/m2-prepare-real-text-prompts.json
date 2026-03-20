@@ -1,0 +1,39 @@
+{
+  "featureId": "m2-prepare-real-text-prompts",
+  "reviewedAt": "2026-03-20T08:30:00.000Z",
+  "commitId": "8b1a9bb",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "The implementation correctly provides test prompts across all 4 required domains (code, JSON, conversational, repetitive) with 5 prompts per category (20 total). The TrainTestSplitter implements the 60%/40% split methodology correctly. Tokenizer integration is provided via the TokenizerAdapter class with character-level fallback. The code is well-structured with dataclasses, enums, and type hints. Documentation is thorough with clear usage examples.",
+    "issues": [
+      {
+        "file": "src/inference/prompts.py",
+        "line": 414,
+        "severity": "non_blocking",
+        "description": "TrainTestSplitter.split_text() splits on character boundaries, not token boundaries. For n-gram cache building at the token level, token-aware splitting would be more accurate. However, the split() method supports token-level splitting when a tokenizer is provided, so this is acceptable."
+      },
+      {
+        "file": "tests/verify_prompts.py",
+        "line": 84,
+        "severity": "non_blocking",
+        "description": "Complex inline import statement for PromptCategory (getattr(__import__(...))). Works correctly but could be simplified by importing at the top of the function."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "skills",
+      "observation": "The speculative-validation-worker skill says 'Use existing test prompts from tests/val_m6_speculative.py' but the worker created a new dedicated prompt module. This is an improvement over the hardcoded prompts, but the skill file could be updated to reference the new module.",
+      "evidence": "Skill file at .factory/skills/speculative-validation-worker/SKILL.md line 17 says 'Use existing test prompts from tests/val_m6_speculative.py'. The worker created src/inference/prompts.py and updated val_m6_speculative.py to import from it."
+    },
+    {
+      "area": "knowledge",
+      "observation": "The PROMPTS_README.md documents expected n-gram acceptance rates by category (Code: 50-60%, JSON: 45-55%, Conversational: 40-50%, Repetitive: 70-80%). This is useful context for validation that could be added to the mission's AGENTS.md or the speculative-decode.md library file.",
+      "evidence": "data/PROMPTS_README.md includes a 'Performance Expectations' section with estimated acceptance rates by domain."
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "Feature m2-prepare-real-text-prompts is complete and functional. The prompt module provides 20 test prompts across 4 domains with proper train/test split methodology (60%/40%). All verification checks pass. Minor non-blocking issues noted around character vs token-level splitting. Integration with val_m6_speculative.py is clean with fallback to hardcoded prompts for robustness."
+}
