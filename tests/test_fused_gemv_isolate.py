@@ -81,7 +81,8 @@ except Exception as e:
 # ============================================================================
 # Load kernels
 # ============================================================================
-print("\nLoading kernels on GPU 0...")
+print("\nLoading kernels...")
+# Use GPU 0 for reference kernel, but need all 4 GPUs for fused kernel test
 dev = GPUDevice(0)
 
 module_v6 = dev.load_hsaco(hsaco_v6)
@@ -204,13 +205,14 @@ def run_gemv_v6(A_h16, B_q4, scales, zeros, N, K, group_size, threads_per_col=16
     return result
 
 
-def run_fused_gemv_isolated(A_h16, B_q4, scales, zeros, N, K, group_size, tp_rank=0, tp_size=4, gemv_results_all=None, stream=None):
+def run_fused_gemv_isolated(dev, A_h16, B_q4, scales, zeros, N, K, group_size, tp_rank=0, tp_size=4, gemv_results_all=None, stream=None):
     """
     Run the fused kernel with proper setup for TP=4.
     
     The fused kernel computes GEMV inline and uses peer partials for RMSNorm sum-of-squares.
     
     Args:
+        dev: GPUDevice to use for this tp_rank
         gemv_results_all: Optional [N] array of pre-computed GEMV results.
                          If provided, sets up peer partials for RMSNorm.
                          If None, peer partials are zeroed (RMSNorm will be incorrect).
@@ -519,13 +521,30 @@ print(f"  Full GEMV result shape: {gemv_full.shape}, range: [{float(gemv_full.mi
 # This tests the actual fused GEMV + RMSNorm path (no allreduce sum for TP)
 print(f"  Running fused kernel with real partitioned weights...")
 
+# Create GPU devices for all 4 TP ranks
+# Each tp_rank should run on a different physical GPU for proper P2P access
+from src.runtime.hip_dispatch import HIPRuntime
+hip_runtime = HIPRuntime()
+hip_runtime.init()
+num_gpus_available = hip_runtime.device_count()
+print(f"  Available GPUs: {num_gpus_available}")
+
+if num_gpus_available >= 4:
+    devices = [GPUDevice(i) for i in range(4)]
+    print(f"  Using GPUs 0-3 for TP=4 test")
+else:
+    print(f"  WARNING: Only {num_gpus_available} GPUs available, using GPU 0 for all TP ranks")
+    devices = [GPUDevice(0) for _ in range(4)]
+
 results_fused = []
 gemv_partitions_fused = []
 for tp_rank in range(4):
     # Run fused kernel with real partitioned weights
     # The kernel computes GEMV inline and uses peer partials only for RMSNorm sum-of-squares
     # We pass gemv_full so peer partials are set up correctly for RMSNorm
+    dev_for_rank = devices[tp_rank]
     result_partition, partial_local_full, wg_sum_sq = run_fused_gemv_isolated(
+        dev_for_rank,
         A_h16,
         B_q4_parts[tp_rank],  # Real partitioned weights
         scales_parts[tp_rank],
@@ -540,7 +559,7 @@ for tp_rank in range(4):
     col_end = col_start + cols_per_gpu
     gemv_partition = partial_local_full[col_start:col_end].copy()
     gemv_partitions_fused.append(gemv_partition)
-    print(f"  GPU {tp_rank} output shape: {result_partition.shape} (cols {tp_rank*cols_per_gpu} to {(tp_rank+1)*cols_per_gpu})")
+    print(f"  GPU {tp_rank} (device {tp_rank if num_gpus_available >= 4 else 0}) output shape: {result_partition.shape} (cols {tp_rank*cols_per_gpu} to {(tp_rank+1)*cols_per_gpu})")
     print(f"    WG sum_sq values (first 5): {wg_sum_sq[:5]}")
     print(f"    WG sum_sq mean: {np.mean(wg_sum_sq):.4f}, std: {np.std(wg_sum_sq):.4f}")
 
