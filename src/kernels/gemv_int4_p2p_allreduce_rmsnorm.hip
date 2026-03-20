@@ -324,6 +324,9 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
         // Busy-wait until all WGs finish writing their columns
     }
     
+    // Ensure all writes to partial_local are visible before reading
+    __threadfence();
+    
     // Phase 3b: Each WG computes sum-of-squares for ALL N columns.
     // 
     // To ensure all WGs compute the SAME value, each WG iterates over ALL N columns
