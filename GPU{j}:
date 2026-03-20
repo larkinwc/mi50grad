@@ -1,0 +1,4 @@
+  File "<string>", line 5
+    print(Enabling P2P access...)
+          ^^^^^^^^^^^^
+SyntaxError: invalid syntax. Perhaps you forgot a comma?

@@ -7,24 +7,24 @@ High-throughput inference optimization for **Qwen 3.5 27B** (GPTQ-Int4) on **AMD
 | Mode | Throughput | Speedup |
 |---|---|---|
 | Star topology baseline (TP=4) | 15.3 tok/s | 1.00x |
-| C dispatch + kernel P2P allreduce | **38.3 tok/s** | **2.50x** |
-| Global graph capture | 36.5 tok/s | 2.39x |
-| AWQ kernel mode | 44.7 tok/s | 2.92x |
+| C dispatch + kernel P2P + deferred AR | 51.75 tok/s | 3.38x |
+| **Fused GEMV+AR+RMSNorm + deferred AR** | **53.74 tok/s** | **3.51x** |
 | Single-GPU | 22.0 tok/s | -- |
 
-Full benchmark report: [`bench/tp4_sprint4_report.md`](bench/tp4_sprint4_report.md)
+**Gap closure:** 81.5% toward 60 tok/s target. Kernel launches reduced from 192 to 64 per token.
 
 ## Research & Optimization History
 
-Comprehensive research, optimization attempts, and benchmark results are documented in [`RESEARCH.md`](RESEARCH.md). This includes detailed analysis of all optimizations, failed attempts, and bottleneck analysis.
+See [`RESEARCH.md`](RESEARCH.md) for full optimization history, failed attempts, and bottleneck analysis.
 
-**Current Performance:** 51.72 tok/s on 4× MI50 for Qwen3.5-27B-GPTQ-Int4 (3.38× improvement over baseline).
+**Current Performance:** 53.74 tok/s on 4× MI50 (3.51× over baseline).
 
-Key optimizations include:
-- Kernel P2P Allreduce (M1): 1.50× allreduce speedup
-- Pipeline Overlap (M2): 1.085× speedup in isolation
-- Deferred Attention Allreduce (M3): 35% improvement by halving allreduce count
-- Kernel micro-optimizations: GEMV v6, FlashAttention-256 v3, INT4 GEMM v2
+Key optimizations:
+- **Fused GEMV+AR+RMSNorm:** Cross-WG atomic barrier, 66% fewer kernel launches (+3.8%)
+- **Deferred Attention Allreduce (M3):** Halves allreduce count 128→64 (+35%)
+- **Kernel P2P Allreduce (M1):** BAR1 direct reads, 119→79µs per call (1.50×)
+- **Kernel micro-opts:** GEMV v6, FlashAttention-256 v3, INT4 GEMM v2 (2.07×)
+- **Speculative decode:** N-gram 54% acceptance, EAGLE infrastructure validated
 
 ## Hardware Requirements
 
@@ -144,26 +144,27 @@ python3 tests/test_c_dispatch.py            # C dispatch infrastructure
 
 ## Key Optimizations
 
-### Kernel P2P Allreduce (2.50x speedup)
-Replaces host-orchestrated star topology allreduce with on-device kernel that reads all 4 partial buffers directly via BAR1-mapped P2P. Eliminates `hipSetDevice`, `hipMemcpyPeerAsync`, and `hipStreamSynchronize` host round-trips. Latency: ~79us vs ~119us star topology per call (128 calls/token).
+### Fused GEMV+Allreduce+RMSNorm (+3.8%)
+Fuses INT4 GEMV, P2P allreduce, and RMSNorm into a single kernel launch per FFN down-projection. Uses cross-WG atomic barrier with two counters (write + done) and `__threadfence()` for global RMSNorm sum-of-squares across all N columns via P2P reads. Reduces kernel launches from 192 to 64 per token.
+
+### Deferred Attention Allreduce (+35%)
+Defers attention output allreduce, operating FFN on partial activations. Halves allreduce count from 128 to 64 per token (dominant optimization).
+
+### Kernel P2P Allreduce (1.50x allreduce speedup)
+On-device kernel reads all 4 partial buffers directly via BAR1-mapped P2P. Eliminates host round-trips. Latency: ~79us vs ~119us star topology per call.
 
 ### C Dispatch
-Moves the per-layer kernel dispatch loop from Python into a compiled C shared library. Eliminates Python interpreter overhead (~1ms/token) from the critical decode path.
+Moves per-layer kernel dispatch from Python into compiled C. Eliminates Python interpreter overhead from decode path.
 
-### Global Graph Capture
-Captures full-layer HIP graphs (4 GPUs x 64 layers x 2 segments) with a C-level replay plan. Provides infrastructure for future optimizations where graph overhead can be amortized.
-
-### GEMV v5 (DPP Reduction)
-INT4 dequantization GEMV with hybrid DPP (Data Parallel Primitives) intra-wavefront reduction + minimal LDS cross-wavefront reduction. The kernel is memory-bandwidth bound (~130-160 GB/s of 857 GB/s peak), so the reduction optimization has minimal E2E impact.
-
-### AWQ Support
-Zero-point-free GEMV kernel variant for AWQ quantization format. 1.17-1.27x faster than GPTQ GEMV in isolation (skips zero-point subtraction arithmetic).
+### Speculative Decoding
+N-gram (n=3) and EAGLE draft-token generation. N-gram acceptance: 54% overall (59% code, 87% repetitive, 39% JSON, 33% conversational). No throughput regression. Gains limited by allreduce bottleneck.
 
 ## Architecture Notes
 
 - **No MFMA**: MI50 (gfx906) lacks matrix fused multiply-add instructions (available on gfx908+). All matrix operations use scalar VALU instructions.
 - **P2P via PCIe BAR1**: No XGMI interconnect. Inter-GPU communication at ~12 GB/s per link.
-- **Allreduce is the bottleneck**: 128 allreduce calls/token x ~79us = ~10.1ms of ~26ms total decode time (39%).
+- **Allreduce is the bottleneck**: 64 allreduce calls/token (with deferred AR) x ~79us = ~5.1ms of ~18.6ms total decode time (27%).
+- **GPU compute is the ceiling**: ~11ms/token (59%) fixed by MI50 hardware — no MFMA means scalar VALU only.
 - **Dispatch modes**: Progressive fallback chain: global_graph -> c_dispatch -> cached+stream. All modes maintain cosine similarity >= 0.99.
 
 ## Model
