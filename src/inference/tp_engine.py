@@ -5287,7 +5287,7 @@ class TPInferenceEngine:
         if gemv_fused_so_path.exists():
             try:
                 gemv_fused_lib = ct.CDLL(str(gemv_fused_so_path))
-                # Set function signature
+                # Set function signature (wg_done_counter removed - all WGs compute rms_inv independently)
                 gemv_fused_lib.gemv_int4_p2p_allreduce_rmsnorm_tp4.argtypes = [
                     ct.c_void_p,        # output
                     ct.c_void_p,        # A (input activation)
@@ -5299,6 +5299,8 @@ class TPInferenceEngine:
                     ct.c_void_p,        # partial_peer1
                     ct.c_void_p,        # partial_peer2
                     ct.c_void_p,        # weight (RMSNorm)
+                    ct.c_void_p,        # wg_partial_sum_sq (debug/verification)
+                    ct.c_void_p,        # wg_write_counter (write barrier)
                     ct.c_uint,          # K (input dim)
                     ct.c_uint,          # N (output dim)
                     ct.c_uint,          # dim (for RMSNorm)
@@ -5313,16 +5315,16 @@ class TPInferenceEngine:
                     gemv_fused_lib.gemv_int4_p2p_allreduce_rmsnorm_tp4,
                     ct.c_void_p
                 ).value
-                # Fused GEMV+AR+RMSNorm kernel - enabled after fixing double-counting bug
-                # DEFERRED: Fused GEMV+AR+RMSNorm kernel has fundamental architectural
-                # conflict: GEMV needs multi-WG parallelism but RMSNorm needs global
-                # reduction. Double-counting bug was fixed but RMSNorm is still broken.
-                if False:  # Disabled - architectural redesign needed
+                # Fused GEMV+AR+RMSNorm kernel - enabled after fixing RMSNorm sum-of-squares bug
+                # FIX: Each WG now independently computes global sum-of-squares by iterating
+                # over ALL N columns with stride 256 (matches kernel_p2p_allreduce_rmsnorm_v3 pattern).
+                # All WGs get the same rms_inv value, no broadcast needed.
+                if True:  # Enabled after RMSNorm fix
                     use_gemv_fused_in_c = True
                     print(f"C dispatch: fused GEMV+AR+RMSNorm kernel ENABLED for FFN down-proj "
                           f"(fn_ptr=0x{gemv_fused_fn_ptr:016x})")
                 else:
-                    print(f"C dispatch: fused GEMV+AR+RMSNorm kernel available but DISABLED (needs investigation)")
+                    print(f"C dispatch: fused GEMV+AR+RMSNorm kernel available but DISABLED")
             except Exception as e:
                 print(f"C dispatch: failed to load fused GEMV kernel library: {e}")
                 gemv_fused_lib = None

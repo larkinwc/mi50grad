@@ -96,8 +96,8 @@ def setup_kernels():
             ctypes.c_void_p,       # partial_peer1
             ctypes.c_void_p,       # partial_peer2
             ctypes.c_void_p,       # weight (RMSNorm)
-            ctypes.c_void_p,       # wg_partial_sum_sq (cross-WG coordination)
-            ctypes.c_void_p,       # wg_completion_counter (atomic counter)
+            ctypes.c_void_p,       # wg_partial_sum_sq (cross-WG coordination, debug)
+            ctypes.c_void_p,       # wg_write_counter (write barrier)
             ctypes.c_uint32,       # K
             ctypes.c_uint32,       # N
             ctypes.c_uint32,       # dim

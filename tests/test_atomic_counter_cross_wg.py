@@ -117,7 +117,7 @@ else:
             sys.exit(1)
         print("  Function gemv_int4_p2p_allreduce_rmsnorm_tp4 found")
         
-        # Set signature with new atomic counter parameters
+        # Set signature (wg_done_counter removed - all WGs compute rms_inv independently)
         lib.gemv_int4_p2p_allreduce_rmsnorm_tp4.argtypes = [
             ctypes.c_void_p,        # output
             ctypes.c_void_p,        # A
@@ -129,8 +129,8 @@ else:
             ctypes.c_void_p,        # partial_peer1
             ctypes.c_void_p,        # partial_peer2
             ctypes.c_void_p,        # weight
-            ctypes.c_void_p,        # wg_partial_sum_sq (NEW)
-            ctypes.c_void_p,        # wg_completion_counter (NEW)
+            ctypes.c_void_p,        # wg_partial_sum_sq (debug)
+            ctypes.c_void_p,        # wg_write_counter (write barrier)
             ctypes.c_uint32,        # K
             ctypes.c_uint32,        # N
             ctypes.c_uint32,        # dim
@@ -141,7 +141,7 @@ else:
             ctypes.c_void_p,        # stream
         ]
         lib.gemv_int4_p2p_allreduce_rmsnorm_tp4.restype = ctypes.c_int
-        print("  Function signature set successfully with atomic counter parameters")
+        print("  Function signature set successfully")
         print("[TEST 3] PASS")
     except Exception as e:
         print(f"  Error: {e}")
@@ -150,12 +150,12 @@ else:
 
 # Test 4: Verify host wrapper passes new parameters
 print("\n[TEST 4] Verifying host wrapper function...")
-wrapper_check = "wg_partial_sum_sq" in source_text and "wg_completion_counter" in source_text
+wrapper_check = "wg_partial_sum_sq" in source_text and "wg_write_counter" in source_text
 if wrapper_check:
-    print("  Host wrapper includes atomic counter parameters")
+    print("  Host wrapper includes coordination parameters")
     print("[TEST 4] PASS")
 else:
-    print("  FAIL: Host wrapper missing atomic counter parameters")
+    print("  FAIL: Host wrapper missing coordination parameters")
     print("[TEST 4] FAIL")
     sys.exit(1)
 
