@@ -1,0 +1,72 @@
+{
+  "milestone": "m1-fused-gemv-v2",
+  "round": 1,
+  "status": "fail",
+  "validatorsRun": {
+    "kernel_build": {
+      "passed": true,
+      "command": "make hip_kernels",
+      "exitCode": 0,
+      "observation": "Kernel compilation successful for gfx906 target"
+    },
+    "test": {
+      "passed": false,
+      "command": "python3 tests/test_fused_gemv_isolate.py",
+      "exitCode": 1,
+      "observation": "Numerical correctness test failed with NaN values in RMSNorm output. GEMV component passes (max_abs_error=0) but RMSNorm phase produces NaN results. Expected sum_sq=8855.26, got NaN. Output range: [nan, nan]"
+    },
+    "p2p_verification": {
+      "passed": true,
+      "command": "python3 tests/test_p2p_fused_kernel_multigpu.py",
+      "exitCode": 0,
+      "observation": "P2P access matrix passes (all 4 GPUs can access peers). P2P bandwidth 2.89 GB/s. Multi-GPU kernel launch passes. Peer buffer content validation passes. VAL-M1-007 satisfied."
+    },
+    "typecheck": {
+      "passed": true,
+      "command": "N/A",
+      "exitCode": 0,
+      "observation": "No Python typecheck configured in project"
+    },
+    "lint": {
+      "passed": true,
+      "command": "N/A",
+      "exitCode": 0,
+      "observation": "No Python lint configured in project"
+    }
+  },
+  "reviewsSummary": {
+    "total": 0,
+    "passed": 0,
+    "failed": 0,
+    "failedFeatures": [],
+    "note": "Reviews not spawned due to validator failure"
+  },
+  "blockingIssues": [
+    {
+      "featureId": "m1-fix-rmsnorm-sumsq-bug",
+      "severity": "blocking",
+      "description": "Numerical correctness test fails with NaN values. The fused kernel RMSNorm phase produces NaN output. Test shows: GEMV max_abs_error=0 (pass), sum_sq values computed by WGs vary (GPU 0 mean=8280, GPU 3 mean=8855), but final output is NaN. Expected sum_sq=8855.26 from reference, got NaN. This indicates a bug in the cross-WG coordination or RMSNorm computation in gemv_int4_p2p_allreduce_rmsnorm.hip.",
+      "assertionId": "VAL-M1-002",
+      "evidence": "test_fused_gemv_isolate.py output: 'Fused kernel output range: [nan, nan]', 'Max abs error: nan', 'VAL-GEMV-ISO-001 FAIL: max_abs_error=nan >= 5e-3'"
+    },
+    {
+      "featureId": "m1-fix-rmsnorm-sumsq-bug",
+      "severity": "blocking",
+      "description": "Cross-WG RMSNorm coordination incomplete. While WG sum_sq values are computed (varying from 8280 to 8855 across GPUs), the final rms_inv broadcast appears to produce NaN. The atomic counter mechanism works (WG 3 shows consistent sum_sq=8855), but the RMSNorm result propagation fails.",
+      "assertionId": "VAL-M1-003",
+      "evidence": "GPU 3 WG sum_sq mean=8855.2646, std=0.0010 (correct and consistent). Other GPUs show varying values. Output is still NaN."
+    }
+  ],
+  "partialPasses": [
+    {
+      "featureId": "m1-verify-p2p-access",
+      "assertionId": "VAL-M1-007",
+      "description": "P2P access verification passes. All 4 GPUs can access peer memory via BAR1. Bandwidth 2.89 GB/s (expected for 2-hop PCIe). Multi-GPU kernel launch succeeds without errors. Peer buffer content validation passes with max_error=0.",
+      "evidence": "test_p2p_fused_kernel_multigpu.py: '[VAL-M1-007] ALL TESTS PASSED'"
+    }
+  ],
+  "appliedUpdates": [],
+  "suggestedGuidanceUpdates": [],
+  "rejectedObservations": [],
+  "previousRound": null
+}
