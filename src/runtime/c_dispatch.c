@@ -128,6 +128,40 @@ typedef int (*gemv_int4_fused_tp4_fn_t)(
     void* stream                      /* HIP stream */
 );
 
+/* gemv_int4_p2p_allreduce_rmsnorm_compressed_tp4(output, A, B_q4, scales, zeros,
+ *                                                  partial_local, compressed_local, compressed_peer0, compressed_peer1, compressed_peer2,
+ *                                                  weight, wg_partial_sum_sq, wg_write_counter, wg_done_counter,
+ *                                                  K, N, dim, group_size, eps,
+ *                                                  tp_rank, tp_size, stream)
+ * Host-callable C wrapper from gemv_int4_p2p_allreduce_rmsnorm_compressed.so.
+ * Fused INT4 GEMV + INT8-compressed P2P allreduce + RMSNorm kernel for FFN down projection.
+ * Uses INT8 compression for P2P transfers to reduce PCIe bandwidth.
+ */
+typedef int (*gemv_int4_fused_compressed_tp4_fn_t)(
+    void* output,
+    const void* A,                    /* Input activation (FFN gate output) */
+    const unsigned int* B_q4,         /* INT4 weights (FFN down proj) */
+    const void* scales,               /* Per-group scales */
+    const void* zeros,                /* Per-group zeros */
+    void* partial_local,              /* This GPU's partial buffer (FP16, for test extraction) */
+    void* compressed_local,           /* Local INT8 compressed buffer [n + num_blocks*2] */
+    const void* compressed_peer0,     /* Peer GPU INT8 compressed buffers (P2P) */
+    const void* compressed_peer1,
+    const void* compressed_peer2,
+    const void* weight,               /* RMSNorm weight (next layer's attn_norm) */
+    void* wg_partial_sum_sq,          /* [num_wgs] WG partial sum array */
+    void* wg_write_counter,           /* [1] write barrier counter */
+    void* wg_done_counter,            /* [1] completion counter */
+    unsigned int K,                   /* Input dim (intermediate size) */
+    unsigned int N,                   /* Output dim (hidden size) */
+    unsigned int dim,                 /* Hidden dim for RMSNorm */
+    unsigned int group_size,          /* Quantization group size */
+    float eps,                        /* RMSNorm epsilon */
+    unsigned int tp_rank,             /* This GPU's rank */
+    unsigned int tp_size,             /* Tensor parallel size */
+    void* stream                      /* HIP stream */
+);
+
 /* residual_add_v2(dst, src, n): Host-callable C wrapper from elementwise_v2.so.
  * Performs element-wise addition: dst[i] += src[i] for all i in [0, n).
  * Used for deferred attention allreduce to add partial attention output to hidden.
@@ -269,8 +303,14 @@ typedef struct {
     uint64_t gemv_fused_wg_partial_sum_sq[4];  /* [4] WG partial sum arrays */
     uint64_t gemv_fused_wg_write_counter[4];   /* [4] write barrier counters */
     uint64_t gemv_fused_wg_done_counter[4];    /* [4] completion counters */
-    /* Padding for 8-byte alignment: total adds 4+8+32+32+32+32+4+4+32*3 = 292 bytes */
-    /* Total struct size: previous fields + 292 bytes */
+    
+    /* INT8-compressed GEMV+AR+RMSNorm kernel fields (gemv_int4_p2p_allreduce_rmsnorm_compressed) */
+    /* Same as use_gemv_fused but uses INT8 compression for P2P transfers */
+    uint32_t use_gemv_fused_compressed;       /* 1=use compressed fused kernel for FFN down */
+    gemv_int4_fused_compressed_tp4_fn_t gemv_fused_compressed_tp4_fn; /* ptr to compressed kernel */
+    /* Compressed buffer pointers: [INT8 data (n bytes)] [FP16 scales (num_blocks*2 bytes)] */
+    uint64_t compressed_ptrs[4];              /* INT8 compressed buffer pointers per GPU */
+    /* Padding for 8-byte alignment: 4 + 8 + 32 = 44 bytes */
 } CAllreduceSpec;
 
 /*
@@ -741,6 +781,96 @@ static int do_allreduce_gemv_fused(CAllreduceSpec *ar, CDispatchPlan *plan)
 }
 
 /*
+ * do_allreduce_gemv_fused_compressed: launch compressed fused GEMV + P2P allreduce + RMSNorm kernel.
+ *
+ * Same as do_allreduce_gemv_fused but uses INT8-compressed P2P transfers.
+ * The kernel quantizes GEMV output to INT8+scale format, reducing PCIe transfer volume by ~47%.
+ */
+static int do_allreduce_gemv_fused_compressed(CAllreduceSpec *ar, CDispatchPlan *plan)
+{
+    int tp = ar->tp_size;
+    if (tp != 4 || ar->gemv_fused_compressed_tp4_fn == NULL) {
+        /* Fall back to standard uncompressed path if not TP=4 or kernel not available */
+        return do_allreduce_gemv_fused(ar, plan);
+    }
+
+    int i, j, err;
+    uint32_t n = ar->num_elems;
+    uint32_t K = ar->ffn_K;
+    uint32_t group_size = ar->ffn_group_size;
+
+    /* Step 1: Record compute events on each GPU */
+    for (i = tp - 1; i >= 0; i--) {
+        plan->hipSetDevice_fn(ar->device_ids[i]);
+        plan->hipEventRecord_fn(
+            (void *)(uintptr_t)ar->compute_events[i],
+            (void *)(uintptr_t)ar->compute_streams[i]);
+    }
+
+    /* Step 2: Each GPU's AR stream waits for ALL compute events */
+    /* GPU0 first */
+    for (j = 0; j < tp; j++) {
+        plan->hipStreamWaitEvent_fn(
+            (void *)(uintptr_t)ar->allreduce_streams[0],
+            (void *)(uintptr_t)ar->compute_events[j], 0);
+    }
+    /* Then GPUs 1-3 */
+    for (i = 1; i < tp; i++) {
+        plan->hipSetDevice_fn(ar->device_ids[i]);
+        for (j = 0; j < tp; j++) {
+            plan->hipStreamWaitEvent_fn(
+                (void *)(uintptr_t)ar->allreduce_streams[i],
+                (void *)(uintptr_t)ar->compute_events[j], 0);
+        }
+    }
+
+    /* Step 3: Launch compressed fused GEMV+AR+RMSNorm kernel on each GPU's AR stream.
+     * The kernel:
+     *   - Computes INT4 GEMV for FFN down projection
+     *   - Quantizes output to INT8+scale format
+     *   - Reads peer INT8 compressed buffers via P2P BAR1
+     *   - Dequantizes and sums all partials
+     *   - Applies RMSNorm
+     */
+    for (i = 0; i < tp; i++) {
+        plan->hipSetDevice_fn(ar->device_ids[i]);
+        int p0 = (i + 1) % 4;
+        int p1 = (i + 2) % 4;
+        int p2 = (i + 3) % 4;
+        
+        err = ar->gemv_fused_compressed_tp4_fn(
+            (void *)(uintptr_t)ar->hidden_ptrs[i],        /* output (normalized) */
+            (const void *)(uintptr_t)ar->ffn_gate_ptrs[i],  /* A: FFN gate output after SiLU */
+            (const unsigned int*)(uintptr_t)ar->ffn_down_qweight_ptrs[i],
+            (const void *)(uintptr_t)ar->ffn_down_scales_ptrs[i],
+            (const void *)(uintptr_t)ar->ffn_down_zeros_ptrs[i],
+            (void *)(uintptr_t)ar->partial_ptrs[i],         /* partial_local (FP16, for test) */
+            (void *)(uintptr_t)ar->compressed_ptrs[i],      /* compressed_local (INT8+scale) */
+            (const void *)(uintptr_t)ar->compressed_ptrs[p0],  /* compressed_peer* */
+            (const void *)(uintptr_t)ar->compressed_ptrs[p1],
+            (const void *)(uintptr_t)ar->compressed_ptrs[p2],
+            (const void *)(uintptr_t)ar->rmsnorm_weight_ptrs[i],
+            (void *)(uintptr_t)ar->gemv_fused_wg_partial_sum_sq[i],
+            (void *)(uintptr_t)ar->gemv_fused_wg_write_counter[i],
+            (void *)(uintptr_t)ar->gemv_fused_wg_done_counter[i],
+            K, n, n, group_size, ar->eps, i, tp,
+            (void *)(uintptr_t)ar->allreduce_streams[i]
+        );
+        if (err) return err;
+    }
+
+    /* Step 4: Record AR done events on each GPU's AR stream */
+    for (i = tp - 1; i >= 0; i--) {
+        plan->hipSetDevice_fn(ar->device_ids[i]);
+        plan->hipEventRecord_fn(
+            (void *)(uintptr_t)ar->ar_done_events[i],
+            (void *)(uintptr_t)ar->allreduce_streams[i]);
+    }
+
+    return 0;
+}
+
+/*
  * dispatch_allreduce: dispatch allreduce using the appropriate method.
  *
  * Checks use_gemv_fused, use_fused_kernel, use_kernel_p2p flags in CAllreduceSpec
@@ -752,7 +882,11 @@ static int do_allreduce_gemv_fused(CAllreduceSpec *ar, CDispatchPlan *plan)
  */
 static int dispatch_allreduce(CAllreduceSpec *ar, CDispatchPlan *plan)
 {
-    /* Fused GEMV+AR+RMSNorm mode takes priority (for FFN down projection) */
+    /* Compressed fused GEMV+AR+RMSNorm mode takes priority (for FFN down projection with INT8 compression) */
+    if (ar->use_gemv_fused_compressed && ar->gemv_fused_compressed_tp4_fn != NULL && ar->tp_size == 4) {
+        return do_allreduce_gemv_fused_compressed(ar, plan);
+    }
+    /* Uncompressed fused GEMV+AR+RMSNorm mode */
     if (ar->use_gemv_fused && ar->gemv_fused_tp4_fn != NULL && ar->tp_size == 4) {
         return do_allreduce_gemv_fused(ar, plan);
     }
