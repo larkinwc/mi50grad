@@ -722,6 +722,18 @@ class InferenceEngine:
         # v6 is shape-dependent: v6_t16 is best at N=4096,K=4096 (1.13x speedup),
         # but may regress at N=17408,K=5120. Use shape-based selection in _launch_gemv_int4().
         # Falls back to v5 if v6 is unavailable.
+        # Try v7 first (FP32-only accumulation + 2x register blocking)
+        self._gemv_int4_v7 = False
+        try:
+            hip_path = HIP_DIR / "gemv_int4_v7.hip"
+            if hip_path.exists() and self._gemv_int4_v2:
+                self.kernels.get_hip("gemv_int4_v7_t16", "gemv_int4_v7")
+                self.kernels.get_hip("gemv_int4_v7_t8", "gemv_int4_v7")
+                self.kernels.get_hip("gemv_int4_v7_t4", "gemv_int4_v7")
+                self._gemv_int4_v7 = True
+                print("GEMV INT4 v7 (FP32 accum + 2x register blocking) loaded as default")
+        except Exception as e:
+            print(f"GEMV INT4 v7 failed (falling back to v6): {e}")
         try:
             hip_path = HIP_DIR / "gemv_int4_v6.hip"
             if hip_path.exists() and self._gemv_int4_v2:
@@ -729,7 +741,10 @@ class InferenceEngine:
                 self.kernels.get_hip("gemv_int4_v6_t8", "gemv_int4_v6")
                 self.kernels.get_hip("gemv_int4_v6_t4", "gemv_int4_v6")
                 self._gemv_int4_v6 = True
-                print("GEMV INT4 v6 (register-cached scale/zero + prefetch) loaded as default for N<=4096")
+                if self._gemv_int4_v7:
+                    print("GEMV INT4 v6 (register-cached scale/zero + prefetch) loaded as fallback")
+                else:
+                    print("GEMV INT4 v6 (register-cached scale/zero + prefetch) loaded as default for N<=4096")
         except Exception as e:
             print(f"GEMV INT4 v6 failed (falling back to v5): {e}")
         # Try to load v5 hybrid DPP+LDS reduction kernel (fallback for v6, or for N>4096).
@@ -2451,10 +2466,12 @@ class InferenceEngine:
             #   - v5_t16 for N > 4096 (v6 may regress at N=17408,K=5120)
             # v5_t16 or v3_t16 as fallback if v6 unavailable.
             # v2_fused remains for residual GEMV (down_proj).
-            if not residual and (self._gemv_int4_v6 or self._gemv_int4_v5 or self._gemv_int4_v3):
-                # Shape-based kernel selection
-                use_v6 = self._gemv_int4_v6 and (N <= 4096)
-                if use_v6:
+            if not residual and (self._gemv_int4_v7 or self._gemv_int4_v6 or self._gemv_int4_v5 or self._gemv_int4_v3):
+                # Shape-based kernel selection: v7 > v6 > v5 > v3
+                if self._gemv_int4_v7:
+                    func = self.kernels.get_hip("gemv_int4_v7_t16", "gemv_int4_v7")
+                    kernel_name = "v7_t16"
+                elif self._gemv_int4_v6 and (N <= 4096):
                     func = self.kernels.get_hip("gemv_int4_v6_t16", "gemv_int4_v6")
                     kernel_name = "v6_t16"
                 elif self._gemv_int4_v5:
