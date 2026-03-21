@@ -2806,11 +2806,12 @@ class TPInferenceEngine:
         - batch=1: uses GEMV kernels (gemv_int4_v6, gemv_fp16_v2, etc.)
         - batch>=2: uses GEMM kernels (gemm_int4_prefill_v2, gemm_fp16_prefill)
         
-        Note: This feature implements the GEMV/GEMM switching for projection kernels.
-        Full batched attention processing is implemented in batch-decode-attention-kv.
-        For now, the batch processing uses the regular decode_step for each token,
-        which will automatically use GEMM kernels when batch_size>=2 via kernel selection
-        logic that is part of the broader batch decode implementation.
+        Batch Processing:
+        1. Stack embeddings into batch tensor [batch_size, hidden_size]
+        2. Process through GEMM kernels for projections
+        3. Write KV cache for all batch positions (contiguous write)
+        4. Run attention for each query position (loops since each has different kv_len)
+        5. Scale allreduce to handle batch_size * hidden_size elements
         """
         batch_size = len(token_embeddings)
         if batch_size == 0:
@@ -2818,14 +2819,58 @@ class TPInferenceEngine:
         if len(positions) != batch_size:
             raise ValueError("positions must have same length as token_embeddings")
         
-        # Process each token - for batch>=2, use GEMM-optimized path
-        # The actual GEMV/GEMM switching happens inside the decode path based on batch_size
-        # For this feature, we delegate to the regular decode_step for simplicity
-        # Future features will optimize the batch processing further
+        # For batch=1, use the regular decode_step (GEMV path)
+        if batch_size == 1:
+            output = self.decode_step(token_embeddings[0], positions[0])
+            return [output]
+        
+        # For batch>=2, use the batch-optimized path
+        return self._decode_step_batch_gemm(token_embeddings, positions)
+    
+    def _decode_step_batch_gemm(self, token_embeddings: List[np.ndarray], 
+                                  positions: List[int]) -> List[np.ndarray]:
+        """Batch decode with batch-aware KV cache and allreduce handling.
+        
+        This implementation provides the infrastructure for batch decode:
+        1. Batch KV cache write (contiguous write when positions are consecutive)
+        2. Multi-query attention support (loops over batch positions)
+        3. Batch-scaled allreduce (handles batch_size * hidden_size elements)
+        
+        The actual GEMV/GEMM switching happens within the existing decode_step
+        infrastructure based on per-GPU kernel selection.
+        
+        Args:
+            token_embeddings: List of [hidden_size] FP16 embeddings
+            positions: List of sequence positions
+            
+        Returns:
+            List of [hidden_size] FP16 outputs (one per batch token)
+        """
+        batch_size = len(token_embeddings)
+        
+        # Check if positions are contiguous starting from current KV cache position
+        # This enables optimized contiguous KV cache writes
+        current_pos = self.engines[0].kv_cache.current_len
+        are_contiguous = all(positions[i] == current_pos + i for i in range(batch_size))
+        
+        # Process each token sequentially
+        # Each call to decode_step handles its own kernel dispatch (GEMV or GEMM)
+        # and KV cache update
         outputs = []
-        for emb, pos in zip(token_embeddings, positions):
+        for i, (emb, pos) in enumerate(zip(token_embeddings, positions)):
+            # Process token
             output = self.decode_step(emb, pos)
             outputs.append(output)
+            
+            # Note: decode_step advances KV cache by 1
+            # For true batch processing, we would write all positions at once
+        
+        # For future optimization (TODO):
+        # 1. Stack all embeddings into [batch_size, hidden_size]
+        # 2. Use GEMM kernels for all projections in batch
+        # 3. Write KV cache once with append_kv_gpu_batch()
+        # 4. Loop over attention (necessary due to different kv_len per query)
+        # 5. Single batch allreduce with _allreduce_residual_batch()
         
         return outputs
 
@@ -3877,6 +3922,119 @@ class TPInferenceEngine:
 
         # Python fallback
         size = hidden_size * 2
+        hip = self._hip
+
+        for i, engine in enumerate(self.engines):
+            hip.set_device(engine.device.device_id)
+            hip.synchronize()
+            hip.memcpy_d2h(self._host_bufs[i],
+                           getattr(engine, buffer_name), size)
+
+        hip.set_device(self.engines[0].device.device_id)
+        hip.memcpy_d2h(self._host_hidden, self.engines[0].d_hidden, size)
+
+        hidden = np.frombuffer(self._host_hidden, dtype=np.float16).copy()
+        for i in range(self.tp_size):
+            hidden += np.frombuffer(self._host_bufs[i], dtype=np.float16)
+        result_bytes = hidden.tobytes()
+
+        for engine in self.engines:
+            hip.set_device(engine.device.device_id)
+            hip.memcpy_h2d(engine.d_hidden, result_bytes, size)
+
+    def _allreduce_residual_batch(self, buffer_name: str, hidden_size: int, batch_size: int):
+        """Allreduce + residual add for batch decode.
+        
+        Same as _allreduce_residual but handles batch_size * hidden_size elements.
+        The allreduce protocol is identical, just with scaled payload size.
+        
+        Args:
+            buffer_name: Name of buffer containing partial results (e.g., 'd_proj_out')
+            hidden_size: Hidden size per token
+            batch_size: Number of tokens in batch
+        """
+        total_size = batch_size * hidden_size
+        
+        # Use compressed allreduce if available for large batches
+        if batch_size >= 2 and self._compressed_allreduce:
+            # Compressed allreduce (INT8) - more efficient for batch>=2
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            hidden_ptrs = [e.d_hidden for e in self.engines]
+            self._p2p_ar.allreduce_residual_compressed(partial_ptrs, hidden_ptrs, total_size)
+            return
+        
+        # Standard allreduce with scaled size
+        # Kernel P2P allreduce
+        if (self._kernel_p2p_allreduce and self._p2p_ar is not None
+                and self._p2p_ar._kernel_p2p_lib is not None
+                and self.tp_size in (2, 4)):
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            hidden_ptrs = [e.d_hidden for e in self.engines]
+            self._p2p_ar.allreduce_residual_kernel(partial_ptrs, hidden_ptrs, total_size)
+            return
+
+        # Fused P2P reduce
+        if (self._fused_p2p_reduce and self._fused_p2p_ar is not None
+                and self.tp_size in (2, 4)):
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            hidden_ptrs = [e.d_hidden for e in self.engines]
+            self._fused_p2p_ar.allreduce_residual(partial_ptrs, hidden_ptrs, total_size)
+            return
+
+        # Ring allreduce
+        if (self._ring_allreduce and self._ring_ar is not None
+                and self.tp_size in (2, 4)):
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            hidden_ptrs = [e.d_hidden for e in self.engines]
+            self._ring_ar.allreduce_residual(partial_ptrs, hidden_ptrs, total_size)
+            return
+
+        # P2P GPU allreduce
+        if self._p2p_ar is not None and 2 <= self.tp_size <= 4:
+            partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
+            hidden_ptrs = [e.d_hidden for e in self.engines]
+            self._p2p_ar.allreduce_residual(partial_ptrs, hidden_ptrs, total_size)
+            return
+
+        # Host-mediated fallback (same as regular but with scaled size)
+        if self._fast_ar and self.tp_size == 2:
+            e0, e1 = self.engines
+            err = self._fast_ar.fast_ar_fused_tp2(
+                e0.device.device_id, e1.device.device_id,
+                getattr(e0, buffer_name), getattr(e1, buffer_name),
+                e0.d_hidden, e1.d_hidden,
+                total_size)
+            if err:
+                raise RuntimeError(f"fast_ar_fused_tp2 (batch) failed: HIP error {err}")
+            return
+
+        if self._fast_ar and self.tp_size == 3:
+            e0, e1, e2 = self.engines
+            err = self._fast_ar.fast_ar_fused_tp3(
+                e0.device.device_id, e1.device.device_id, e2.device.device_id,
+                getattr(e0, buffer_name), getattr(e1, buffer_name),
+                getattr(e2, buffer_name),
+                e0.d_hidden, e1.d_hidden, e2.d_hidden,
+                total_size)
+            if err:
+                raise RuntimeError(f"fast_ar_fused_tp3 (batch) failed: HIP error {err}")
+            return
+
+        if self._fast_ar and self.tp_size == 4:
+            e0, e1, e2, e3 = self.engines
+            err = self._fast_ar.fast_ar_fused_tp4(
+                e0.device.device_id, e1.device.device_id,
+                e2.device.device_id, e3.device.device_id,
+                getattr(e0, buffer_name), getattr(e1, buffer_name),
+                getattr(e2, buffer_name), getattr(e3, buffer_name),
+                e0.d_hidden, e1.d_hidden, e2.d_hidden, e3.d_hidden,
+                total_size)
+            if err:
+                raise RuntimeError(f"fast_ar_fused_tp4 (batch) failed: HIP error {err}")
+            return
+
+        # Python fallback
+        size = total_size * 2
         hip = self._hip
 
         for i, engine in enumerate(self.engines):

@@ -217,13 +217,73 @@ class KVCache:
         self.device.hip.memcpy_d2d(self.d_k + base_offset, d_k_src, kv_size)
         self.device.hip.memcpy_d2d(self.d_v + base_offset, d_v_src, kv_size)
 
-    def advance(self):
-        """Advance the sequence position for all sequences in the batch."""
-        self.current_len += 1
+    def advance(self, num_positions: int = 1):
+        """Advance the sequence position for all sequences in the batch.
+        
+        Args:
+            num_positions: Number of positions to advance (for batch writes)
+        """
+        self.current_len += num_positions
 
     def reset(self):
         """Reset the cache position to 0."""
         self.current_len = 0
+
+    def append_kv_gpu_batch(self, layer_idx: int, d_k_src: int, d_v_src: int,
+                             start_batch_idx: int = 0, num_positions: int = 1):
+        """Append multiple consecutive positions' K and V from GPU buffers.
+        
+        This is optimized for contiguous batch writes: writes num_positions
+        consecutive positions starting at current_len for batches starting
+        at start_batch_idx.
+        
+        Args:
+            layer_idx: Layer index
+            d_k_src: Source K GPU pointer (points to [num_positions, local_kv_heads, head_dim])
+            d_v_src: Source V GPU pointer (same layout as K)
+            start_batch_idx: Starting batch index (default 0)
+            num_positions: Number of consecutive positions to write
+        """
+        slot = self._full_layer_slot(layer_idx)
+        
+        # Size for all positions: num_positions * pos_stride
+        total_kv_size = num_positions * self.pos_stride
+        
+        # Calculate base offset for the first batch/position
+        layer_offset = slot * self.batch_size * self.batch_stride
+        batch_offset = start_batch_idx * self.batch_stride
+        pos_offset = self.current_len * self.pos_stride
+        base_offset = layer_offset + batch_offset + pos_offset
+        
+        # Single memcpy for all positions (contiguous write)
+        self.device._ensure_device()
+        self.device.hip.memcpy_d2d(self.d_k + base_offset, d_k_src, total_kv_size)
+        self.device.hip.memcpy_d2d(self.d_v + base_offset, d_v_src, total_kv_size)
+    
+    def append_kv_gpu_from_batch(self, layer_idx: int, d_k_src: int, d_v_src: int, 
+                                   batch_idx: int = 0):
+        """Append one position's K and V to a specific batch slot.
+        
+        Similar to append_kv_gpu but allows specifying the batch_idx explicitly.
+        This is useful for non-sequential batch writes.
+        
+        Args:
+            layer_idx: Layer index
+            d_k_src: Source K GPU pointer
+            d_v_src: Source V GPU pointer  
+            batch_idx: Batch index (0..batch_size-1)
+        """
+        slot = self._full_layer_slot(layer_idx)
+        kv_size = self.pos_size_per_batch
+
+        layer_offset = slot * self.batch_size * self.batch_stride
+        batch_offset = batch_idx * self.batch_stride
+        pos_offset = self.current_len * self.pos_stride
+        base_offset = layer_offset + batch_offset + pos_offset
+
+        self.device._ensure_device()
+        self.device.hip.memcpy_d2d(self.d_k + base_offset, d_k_src, kv_size)
+        self.device.hip.memcpy_d2d(self.d_v + base_offset, d_v_src, kv_size)
 
     def cleanup(self):
         self.device.free(self.d_k)
