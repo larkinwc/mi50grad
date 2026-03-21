@@ -19,6 +19,14 @@ For 5120 FP16 elements (hidden_size=5120):
 - Total compressed: 5440 bytes (vs 10240 bytes uncompressed)
 - Layout in memory: [INT8 data (5120B)] [FP16 scales (320B)]
 
+### Actual Implementation (Fused Kernel)
+
+The fused kernel uses workgroup-based scales rather than block-based:
+- Each workgroup (16 columns) produces one FP16 scale
+- For n_local = hidden_size/tp_size = 1280 columns: num_wgs = ceil(1280/16) = 80
+- Compressed size = n_local + num_wgs*2 = 1280 + 160 = 1440 bytes/GPU
+- This is 56% of uncompressed FP16 buffer (2560 bytes)
+
 ## Kernel Integration Points
 
 ### Standalone allreduce (kernel_p2p_allreduce_compressed.hip)

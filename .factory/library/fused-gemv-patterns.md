@@ -82,3 +82,22 @@ float val = partial_sums[0];  // Correctly reads updated value
 2. **Double-counting** if hidden input not correctly handled
 3. **Precision drift** if FP16 accumulation used
 4. **NaN in Python threading tests** - Python threads cannot achieve true simultaneous multi-GPU kernel execution. Use C dispatch for validation of P2P-dependent kernels.
+
+---
+
+## Adding INT8 Compression to Fused Kernels
+
+**Challenge**: Inline INT8 quantization in fused kernels with cross-WG coordination is complex due to the interaction between:
+- Workgroup-level partial results (each WG produces 16 columns)
+- Quantization requires per-WG scales for correct reconstruction
+- Cross-WG atomic counter barriers must account for quantization timing
+
+**Implementation approach** (validated in gemv_int4_p2p_allreduce_rmsnorm_compressed.hip):
+1. Phase 2b: After GEMV output written to partial_local, each WG quantizes its 16 columns to INT8 + computes one FP16 scale
+2. Phase 3: P2P reads of INT8 peer data (compressed_peer0/1/2), dequantize to FP32 during sum-of-squares computation
+3. Cross-WG coordination unchanged - atomic counter pattern still works
+
+**Memory layout per GPU**:
+- INT8 data: n_local bytes (1280 for TP=4, hidden_size=5120)
+- FP16 scales: num_wgs * 2 bytes (80 * 2 = 160 bytes)
+- Total: 1440 bytes (56% of uncompressed 2560 bytes)

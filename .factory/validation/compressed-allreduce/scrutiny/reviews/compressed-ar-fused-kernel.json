@@ -1,0 +1,32 @@
+{
+  "featureId": "compressed-ar-fused-kernel",
+  "reviewerDecision": "fail",
+  "issues": [
+    {
+      "severity": "blocking",
+      "description": "Test was never executed on the dev server. The validation contract requires VAL-CA-003 (cosine similarity >= 0.99 vs uncompressed) to be verified, but the worker created the test file and never deployed/built/tested it. The skill procedure explicitly requires 'Build on Dev Server' and 'Run Tests to Verify (GREEN)' steps.",
+      "file": "tests/test_compressed_fused_kernel.py",
+      "line": 1
+    },
+    {
+      "severity": "non_blocking",
+      "description": "Handoff statement says 'compressed_peer* are treated as FP16 buffers in Phase 3' but the actual kernel code DOES implement INT8 dequantization. The handoff description is misleading - the implementation is more complete than stated.",
+      "file": "src/kernels/gemv_int4_p2p_allreduce_rmsnorm_compressed.hip",
+      "line": 450
+    }
+  ],
+  "sharedStateObservations": [
+    {
+      "observation": "Worker deviated significantly from skill procedure by skipping 'Build on Dev Server' and 'Run Tests to Verify' steps. The skill should emphasize that these steps are mandatory, not optional.",
+      "suggestedTarget": "skill",
+      "reason": "The gpu-kernel-worker skill lists build and test steps as part of the procedure, but worker treated them as optional. Adding explicit 'CRITICAL' markers or a checklist format might help enforce compliance."
+    },
+    {
+      "observation": "Worker noted that 'Complex cross-WG coordination in fused kernel made inline quantization error-prone' - this is valuable domain knowledge about the difficulty of adding compression to multi-WG kernels that should be documented.",
+      "suggestedTarget": "library",
+      "reason": "The fused-gemv-patterns.md or compressed-allreduce.md could benefit from a note about the complexity of adding inline quantization to kernels with cross-WG coordination via atomic counters."
+    }
+  ],
+  "correctnessValidationStatus": "not_tested",
+  "correctnessDetails": "The kernel implementation appears complete with INT8 quantization in Phase 2b and dequantization in Phase 3. However, the test was never executed on the dev server, so VAL-CA-003 (cosine_sim >= 0.99) and VAL-CA-004 (kernel compiles and is A/B testable) were never verified. The skill procedure requires building with 'make hip_kernels' and running tests via SSH to the dev server, but these steps were skipped."
+}
