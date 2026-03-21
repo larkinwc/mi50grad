@@ -723,6 +723,18 @@ class InferenceEngine:
         # but may regress at N=17408,K=5120. Use shape-based selection in _launch_gemv_int4().
         # Falls back to v5 if v6 is unavailable.
         # Try v7 first (FP32-only accumulation + 2x register blocking)
+        # Try v8 first (FP32-only accumulation + 4x register blocking)
+        self._gemv_int4_v8 = False
+        try:
+            hip_path = HIP_DIR / "gemv_int4_v8.hip"
+            if hip_path.exists() and self._gemv_int4_v2:
+                self.kernels.get_hip("gemv_int4_v8_t16", "gemv_int4_v8")
+                self.kernels.get_hip("gemv_int4_v8_t8", "gemv_int4_v8")
+                self.kernels.get_hip("gemv_int4_v8_t4", "gemv_int4_v8")
+                self._gemv_int4_v8 = True
+                print("GEMV INT4 v8 (FP32 accum + 4x register blocking) loaded as default")
+        except Exception as e:
+            print(f"GEMV INT4 v8 failed (falling back to v7): {e}")
         self._gemv_int4_v7 = False
         try:
             hip_path = HIP_DIR / "gemv_int4_v7.hip"
@@ -731,7 +743,10 @@ class InferenceEngine:
                 self.kernels.get_hip("gemv_int4_v7_t8", "gemv_int4_v7")
                 self.kernels.get_hip("gemv_int4_v7_t4", "gemv_int4_v7")
                 self._gemv_int4_v7 = True
-                print("GEMV INT4 v7 (FP32 accum + 2x register blocking) loaded as default")
+                if self._gemv_int4_v8:
+                    print("GEMV INT4 v7 (FP32 accum + 2x register blocking) loaded as fallback")
+                else:
+                    print("GEMV INT4 v7 (FP32 accum + 2x register blocking) loaded as default")
         except Exception as e:
             print(f"GEMV INT4 v7 failed (falling back to v6): {e}")
         try:
@@ -2466,22 +2481,35 @@ class InferenceEngine:
             #   - v5_t16 for N > 4096 (v6 may regress at N=17408,K=5120)
             # v5_t16 or v3_t16 as fallback if v6 unavailable.
             # v2_fused remains for residual GEMV (down_proj).
-            if not residual and (self._gemv_int4_v7 or self._gemv_int4_v6 or self._gemv_int4_v5 or self._gemv_int4_v3):
-                # Shape-based kernel selection: v7 > v6 > v5 > v3
-                if self._gemv_int4_v7:
-                    func = self.kernels.get_hip("gemv_int4_v7_t16", "gemv_int4_v7")
-                    kernel_name = "v7_t16"
-                elif self._gemv_int4_v6 and (N <= 4096):
-                    func = self.kernels.get_hip("gemv_int4_v6_t16", "gemv_int4_v6")
-                    kernel_name = "v6_t16"
-                elif self._gemv_int4_v5:
-                    func = self.kernels.get_hip("gemv_int4_v5_t16", "gemv_int4_v5")
-                    kernel_name = "v5_t16"
+            if not residual and (self._gemv_int4_v8 or self._gemv_int4_v7 or self._gemv_int4_v6 or self._gemv_int4_v5 or self._gemv_int4_v3):
+                # Shape-based kernel + thread config selection: v8 > v7 > v6 > v5 > v3
+                # Thread config: t4 for N<=640, t8 for N<=2048, t16 for larger
+                if N <= 640:
+                    t_suffix = "_t4"
+                    cols_per_wg = 64
+                elif N <= 2048:
+                    t_suffix = "_t8"
+                    cols_per_wg = 32
                 else:
-                    func = self.kernels.get_hip("gemv_int4_v3_t16", "gemv_int4_v3")
-                    kernel_name = "v3_t16"
+                    t_suffix = "_t16"
+                    cols_per_wg = 16
+
+                if self._gemv_int4_v8:
+                    func = self.kernels.get_hip("gemv_int4_v8" + t_suffix, "gemv_int4_v8")
+                    kernel_name = "v8" + t_suffix
+                elif self._gemv_int4_v7:
+                    func = self.kernels.get_hip("gemv_int4_v7" + t_suffix, "gemv_int4_v7")
+                    kernel_name = "v7" + t_suffix
+                elif self._gemv_int4_v6 and (N <= 4096):
+                    func = self.kernels.get_hip("gemv_int4_v6" + t_suffix, "gemv_int4_v6")
+                    kernel_name = "v6" + t_suffix
+                elif self._gemv_int4_v5:
+                    func = self.kernels.get_hip("gemv_int4_v5" + t_suffix, "gemv_int4_v5")
+                    kernel_name = "v5" + t_suffix
+                else:
+                    func = self.kernels.get_hip("gemv_int4_v3" + t_suffix, "gemv_int4_v3")
+                    kernel_name = "v3" + t_suffix
                 
-                cols_per_wg = 16  # 256 threads / 16 threads_per_col
                 grid_x = (N + cols_per_wg - 1) // cols_per_wg
                 params = [
                     ctypes.c_uint64(src),
