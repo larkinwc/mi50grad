@@ -180,13 +180,72 @@ extern "C" __global__ void gemv_int4_dual_fused(
     unsigned int kg_start = (num_k_groups * k_split_id) / k_splits;
     unsigned int kg_end = (num_k_groups * (k_split_id + 1)) / k_splits;
 
-    float acc_gate = 0.0f;
-    float acc_up = 0.0f;
+    // 4x register blocking with dual accumulators to break dependency chains
+    float acc_gate0 = 0.0f, acc_gate1 = 0.0f;
+    float acc_up0 = 0.0f, acc_up1 = 0.0f;
     float gate_s = 0.0f, gate_z = 0.0f;
     float up_s = 0.0f, up_z = 0.0f;
     unsigned int last_sg = 0xFFFFFFFF;
 
-    for (unsigned int kg = kg_start; kg < kg_end; kg++) {
+    unsigned int kg = kg_start;
+    unsigned int kg_end_4 = kg_start + ((kg_end - kg_start) & ~3u);
+
+    for (; kg < kg_end_4; kg += 4) {
+        unsigned int gp0 = B_gate[kg * N + col];
+        unsigned int up0 = B_up[kg * N + col];
+        unsigned int gp1 = B_gate[(kg+1) * N + col];
+        unsigned int up1 = B_up[(kg+1) * N + col];
+        unsigned int gp2 = B_gate[(kg+2) * N + col];
+        unsigned int up2 = B_up[(kg+2) * N + col];
+        unsigned int gp3 = B_gate[(kg+3) * N + col];
+        unsigned int up3 = B_up[(kg+3) * N + col];
+
+        unsigned int sg0 = kg / groups_per_scale;
+        if (sg0 != last_sg) {
+            gate_s = __half2float(gate_scales[sg0 * N + col]);
+            gate_z = __half2float(gate_zeros[sg0 * N + col]);
+            up_s   = __half2float(up_scales[sg0 * N + col]);
+            up_z   = __half2float(up_zeros[sg0 * N + col]);
+            last_sg = sg0;
+        }
+        acc_gate0 += dequant_dot8(gp0, gate_s, gate_z, A, kg << 3);
+        acc_up0   += dequant_dot8(up0, up_s,   up_z,   A, kg << 3);
+
+        unsigned int sg1 = (kg+1) / groups_per_scale;
+        if (sg1 != last_sg) {
+            gate_s = __half2float(gate_scales[sg1 * N + col]);
+            gate_z = __half2float(gate_zeros[sg1 * N + col]);
+            up_s   = __half2float(up_scales[sg1 * N + col]);
+            up_z   = __half2float(up_zeros[sg1 * N + col]);
+            last_sg = sg1;
+        }
+        acc_gate1 += dequant_dot8(gp1, gate_s, gate_z, A, (kg+1) << 3);
+        acc_up1   += dequant_dot8(up1, up_s,   up_z,   A, (kg+1) << 3);
+
+        unsigned int sg2 = (kg+2) / groups_per_scale;
+        if (sg2 != last_sg) {
+            gate_s = __half2float(gate_scales[sg2 * N + col]);
+            gate_z = __half2float(gate_zeros[sg2 * N + col]);
+            up_s   = __half2float(up_scales[sg2 * N + col]);
+            up_z   = __half2float(up_zeros[sg2 * N + col]);
+            last_sg = sg2;
+        }
+        acc_gate0 += dequant_dot8(gp2, gate_s, gate_z, A, (kg+2) << 3);
+        acc_up0   += dequant_dot8(up2, up_s,   up_z,   A, (kg+2) << 3);
+
+        unsigned int sg3 = (kg+3) / groups_per_scale;
+        if (sg3 != last_sg) {
+            gate_s = __half2float(gate_scales[sg3 * N + col]);
+            gate_z = __half2float(gate_zeros[sg3 * N + col]);
+            up_s   = __half2float(up_scales[sg3 * N + col]);
+            up_z   = __half2float(up_zeros[sg3 * N + col]);
+            last_sg = sg3;
+        }
+        acc_gate1 += dequant_dot8(gp3, gate_s, gate_z, A, (kg+3) << 3);
+        acc_up1   += dequant_dot8(up3, up_s,   up_z,   A, (kg+3) << 3);
+    }
+
+    for (; kg < kg_end; kg++) {
         unsigned int sg = kg / groups_per_scale;
         if (sg != last_sg) {
             gate_s = __half2float(gate_scales[sg * N + col]);
@@ -195,11 +254,12 @@ extern "C" __global__ void gemv_int4_dual_fused(
             up_z   = __half2float(up_zeros[sg * N + col]);
             last_sg = sg;
         }
-        unsigned int gate_packed = B_gate[kg * N + col];
-        unsigned int up_packed   = B_up[kg * N + col];
-        acc_gate += dequant_dot8(gate_packed, gate_s, gate_z, A, kg << 3);
-        acc_up   += dequant_dot8(up_packed,   up_s,   up_z,   A, kg << 3);
+        acc_gate0 += dequant_dot8(B_gate[kg * N + col], gate_s, gate_z, A, kg << 3);
+        acc_up0   += dequant_dot8(B_up[kg * N + col],   up_s,   up_z,   A, kg << 3);
     }
+
+    float acc_gate = acc_gate0 + acc_gate1;
+    float acc_up = acc_up0 + acc_up1;
 
     // Accumulate into persistent FP32 buffers
     atomicAdd(&C_gate_fp32[col], acc_gate);
