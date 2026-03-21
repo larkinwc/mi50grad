@@ -6,23 +6,23 @@
  *
  * This kernel eliminates intermediate buffer round-trips by fusing:
  *   1. INT4 GEMV: Dequantizes INT4 weights, computes FP16 GEMV with FP32 accumulation
- *   2. INT8 Quantization: Compresses GEMV output to INT8+scale format (block_size=32)
+ *   2. INT8 Quantization: Compresses GEMV output to INT8+scale format (16 elements per WG)
  *   3. P2P Allreduce: Each GPU reads peer compressed partials via BAR1 P2P pointers
  *   4. Dequantize + FP32 Accumulation: Dequantizes INT8 to FP32, reduces all partials
  *   5. RMSNorm: Applies RMSNorm with learned weights
  *   6. Write Result: Single write to output buffer
  *
- * Compression scheme (block-wise INT8, block_size=32):
- *   - For each block of 32 FP16 values: compute scale = max(abs(x)) / 127.0
+ * Compression scheme (workgroup-wise INT8, 16 elements per workgroup):
+ *   - Each workgroup (16 columns) computes its own scale = max(abs(x)) / 127.0
  *   - Quantize: quantized[i] = round(x[i] / scale), clamp to [-127, 127]
- *   - Store: 32 INT8 values (32 bytes) + 1 FP16 scale (2 bytes) = 34 bytes per block
- *   - Uncompressed: 32 * 2 = 64 bytes per block
- *   - Compression ratio: 34/64 = 53.1% (46.9% bandwidth reduction)
+ *   - Store: 16 INT8 values (16 bytes) + 1 FP16 scale (2 bytes) = 18 bytes per WG
+ *   - Uncompressed: 16 * 2 = 32 bytes per WG
+ *   - Compression ratio: 18/32 = 56.25% (43.75% bandwidth reduction)
  *
  * Memory layout for compressed buffers (per GPU):
  *   - Data section: [INT8 data (n bytes)] where n = hidden_size/tp_size
- *   - Scale section: [FP16 scales (num_blocks*2 bytes)] where num_blocks = ceil(n/32)
- *   - Total: n + ceil(n/32)*2 bytes (e.g., n=1280 -> 1280 + 80*2 = 1440 bytes)
+ *   - Scale section: [FP16 scales (num_wgs*2 bytes)] where num_wgs = ceil(n/16)
+ *   - Total: n + ceil(n/16)*2 bytes (e.g., n=1280 -> 1280 + 80*2 = 1440 bytes)
  *   - vs uncompressed: n*2 bytes (1280*2 = 2560 bytes)
  *
  * Compared to uncompressed fused kernel (gemv_int4_p2p_allreduce_rmsnorm.hip):
@@ -66,8 +66,10 @@
 /* ===================================================================
  * Constants for INT8 quantization
  * =================================================================== */
-#define BLOCK_SIZE 32
 #define QUANT_SCALE 127.0f
+
+/* Quantization block size for INT8 compression (16 elements per workgroup) */
+#define QUANT_BLOCK_SIZE 16
 
 /* ===================================================================
  * Global memory arrays for cross-WG coordination (M1 atomic counter fix)
@@ -140,10 +142,11 @@ __device__ __forceinline__ float dequant_fdot2(
 
 /**
  * quantize_block_fp16_to_int8:
- * Quantize a block of 32 FP16 values to INT8 + scale.
+ * Quantize a block of 16 FP16 values to INT8 + scale.
+ * NOTE: This function is defined for reference but not used - the kernel does inline quantization.
  * 
- * @param input      Input FP16 buffer (32 elements)
- * @param output     Output INT8 buffer (32 elements)
+ * @param input      Input FP16 buffer (16 elements)
+ * @param output     Output INT8 buffer (16 elements)
  * @param scale_out  Output FP16 scale (1 element)
  */
 __device__ __forceinline__ void quantize_block_fp16_to_int8(
@@ -153,7 +156,7 @@ __device__ __forceinline__ void quantize_block_fp16_to_int8(
 {
     // Find max absolute value in the block
     float max_abs = 0.0f;
-    for (int i = 0; i < BLOCK_SIZE; i++) {
+    for (int i = 0; i < QUANT_BLOCK_SIZE; i++) {
         float val = __half2float(input[i]);
         float abs_val = fabsf(val);
         max_abs = fmaxf(max_abs, abs_val);
@@ -166,7 +169,7 @@ __device__ __forceinline__ void quantize_block_fp16_to_int8(
     
     // Quantize: quantized[i] = round(x[i] / scale), clamp to [-127, 127]
     float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 1.0f;
-    for (int i = 0; i < BLOCK_SIZE; i++) {
+    for (int i = 0; i < QUANT_BLOCK_SIZE; i++) {
         float val = __half2float(input[i]);
         float q = roundf(val * inv_scale);
         q = fmaxf(-QUANT_SCALE, fminf(QUANT_SCALE, q));
@@ -177,10 +180,11 @@ __device__ __forceinline__ void quantize_block_fp16_to_int8(
 /**
  * dequantize_block_int8_to_fp32:
  * Dequantize a block of INT8 values back to FP32.
+ * NOTE: This function is defined for reference but not used - the kernel does inline dequantization.
  * 
- * @param input     Input INT8 buffer (32 elements)
+ * @param input     Input INT8 buffer (16 elements)
  * @param scale     FP16 scale for this block
- * @param output    Output FP32 buffer (32 elements)
+ * @param output    Output FP32 buffer (16 elements)
  */
 __device__ __forceinline__ void dequantize_block_int8_to_fp32(
     const int8_t* __restrict__ input,
@@ -188,7 +192,7 @@ __device__ __forceinline__ void dequantize_block_int8_to_fp32(
     float* __restrict__ output)
 {
     float scale_f = __half2float(scale);
-    for (int i = 0; i < BLOCK_SIZE; i++) {
+    for (int i = 0; i < QUANT_BLOCK_SIZE; i++) {
         output[i] = (float)input[i] * scale_f;
     }
 }
@@ -207,7 +211,7 @@ __device__ __forceinline__ void dequantize_block_int8_to_fp32(
  *
  * Runs on EACH of the 4 GPUs simultaneously. Each GPU:
  *   - Computes its partial GEMV result for assigned columns (N/4 columns per GPU)
- *   - Quantizes the GEMV output to INT8+scale format (block_size=32)
+ *   - Quantizes the GEMV output to INT8+scale format (16 elements per workgroup)
  *   - Reads 3 peer GPU compressed partial buffers via P2P BAR1 pointers
  *   - Dequantizes INT8 to FP32, reduces all 4 partials with FP32 accumulation
  *   - Applies RMSNorm with sum-of-squares reduction
@@ -229,8 +233,9 @@ __device__ __forceinline__ void dequantize_block_int8_to_fp32(
  * @param scales              Per-group scales [K/group_size, N/TP] (partitioned)
  * @param zeros               Per-group zeros [K/group_size, N/TP] (partitioned)
  * @param partial_local       This GPU's partial buffer [N] (used temporarily for GEMV output)
- * @param compressed_local    Local INT8 compressed buffer [n + num_blocks*2] where n=N/TP
- *                            Layout: [INT8 data (n bytes)] [FP16 scales (num_blocks*2 bytes)]
+ * @param compressed_local    Local INT8 compressed buffer [n + num_wgs*2] where n=N/TP
+ *                            Layout: [INT8 data (n bytes)] [FP16 scales (num_wgs*2 bytes)]
+ *                            where num_wgs = ceil(n/16) (one scale per workgroup)
  * @param compressed_peer0    Peer 0 INT8 compressed buffer (P2P BAR1 pointer)
  * @param compressed_peer1    Peer 1 INT8 compressed buffer (P2P BAR1 pointer)
  * @param compressed_peer2    Peer 2 INT8 compressed buffer (P2P BAR1 pointer)
@@ -238,6 +243,7 @@ __device__ __forceinline__ void dequantize_block_int8_to_fp32(
  * @param wg_partial_sum_sq   Global memory array [num_wgs] for cross-WG sum-of-squares (WG partial sums)
  * @param wg_write_counter    Global memory atomic counter [1] for write barrier (zeroed before launch)
  * @param wg_done_counter     Global memory atomic counter [1] for completion barrier (zeroed before launch)
+ * @param gpu_done_counter    Global memory atomic counter [1] for inter-GPU sync (zeroed before launch, shared across all GPUs)
  * @param K                   Input dimension (activation size)
  * @param N                   Total output dimension (all GPUs combined)
  * @param dim                 Hidden dimension for RMSNorm (typically = N)
@@ -254,7 +260,7 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_compressed_tp4_kernel(
     const __half* __restrict__ scales,
     const __half* __restrict__ zeros,
     __half* __restrict__ partial_local,
-    int8_t* __restrict__ compressed_local,      // [n + num_blocks*2] bytes
+    int8_t* __restrict__ compressed_local,      // [n + num_wgs*2] bytes
     const int8_t* __restrict__ compressed_peer0,  // P2P pointer
     const int8_t* __restrict__ compressed_peer1,  // P2P pointer
     const int8_t* __restrict__ compressed_peer2,  // P2P pointer
@@ -262,6 +268,7 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_compressed_tp4_kernel(
     float* __restrict__ wg_partial_sum_sq,      // [num_wgs] WG partial sums
     unsigned int* __restrict__ wg_write_counter,  // [1] atomic write barrier counter
     unsigned int* __restrict__ wg_done_counter,   // [1] atomic completion counter
+    unsigned int* __restrict__ gpu_done_counter,  // [1] inter-GPU sync counter (shared)
     unsigned int K,
     unsigned int N,
     unsigned int dim,
@@ -359,9 +366,9 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_compressed_tp4_kernel(
     __syncthreads();
 
     // =================================================================
-    // Phase 2: Store GEMV result for RMSNorm (no compression for simplicity)
-    // For this minimal implementation, we use the same approach as the
-    // uncompressed kernel but with INT8-compressed peer reads in Phase 3.
+    // Phase 2: Store GEMV result and quantize to INT8+scale format
+    // Each WG writes its FP16 result to partial_local (for test extraction)
+    // Then each WG independently quantizes its own columns.
     // =================================================================
     float total = partial_result;
     
@@ -370,20 +377,113 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_compressed_tp4_kernel(
         partial_local[col] = __float2half(total);
     }
     __syncthreads();
+    
+    // Phase 2b: Quantize GEMV output to INT8+scale format
+    // Layout of compressed_local: [INT8 data (n bytes)] [FP16 scales (num_wgs*2 bytes)]
+    // where n = cols_per_gpu = N/tp_size, num_wgs = ceil(n/16)
+    // Each workgroup (16 columns) is quantized independently with one FP16 scale per WG
+    
+    __shared__ __half s_wg_block[QUANT_BLOCK_SIZE];
+    __shared__ float s_wg_max_abs;
+    __shared__ float s_wg_scale;
+    
+    // Each WG processes its COLS_PER_WG columns as one block
+    unsigned int cols_in_wg = min(COLS_PER_WG, cols_per_gpu - blockIdx.x * COLS_PER_WG);
+    
+    if (cols_in_wg > 0) {
+        // Each thread loads one column's value
+        for (unsigned int i = threadIdx.x; i < cols_in_wg; i += 256) {
+            unsigned int local_col = blockIdx.x * COLS_PER_WG + i;
+            unsigned int global_col = col_start + local_col;
+            if (global_col < N) {
+                s_wg_block[i] = partial_local[global_col];
+            } else {
+                s_wg_block[i] = __float2half(0.0f);
+            }
+        }
+        __syncthreads();
+        
+        // Find max absolute value using parallel reduction
+        float local_max = 0.0f;
+        for (unsigned int i = threadIdx.x; i < cols_in_wg; i += 256) {
+            float abs_val = fabsf(__half2float(s_wg_block[i]));
+            local_max = fmaxf(local_max, abs_val);
+        }
+        
+        // Warp reduction
+        local_max = fmaxf(local_max, __shfl_down(local_max, 16));
+        local_max = fmaxf(local_max, __shfl_down(local_max, 8));
+        local_max = fmaxf(local_max, __shfl_down(local_max, 4));
+        local_max = fmaxf(local_max, __shfl_down(local_max, 2));
+        local_max = fmaxf(local_max, __shfl_down(local_max, 1));
+        
+        if ((threadIdx.x & 31) == 0) {
+            s_wg_max_abs = local_max;
+        }
+        __syncthreads();
+        
+        // Thread 0 computes scale
+        if (threadIdx.x == 0) {
+            s_wg_scale = (s_wg_max_abs > 0.0f) ? (s_wg_max_abs / QUANT_SCALE) : 1.0f;
+        }
+        __syncthreads();
+        
+        // Quantize and write INT8 values
+        float inv_scale = (s_wg_scale > 0.0f) ? (1.0f / s_wg_scale) : 1.0f;
+        int8_t* int8_data = (int8_t*)compressed_local;
+        __half* scale_data = (__half*)(int8_data + cols_per_gpu);
+        
+        for (unsigned int i = threadIdx.x; i < cols_in_wg; i += 256) {
+            unsigned int local_col = blockIdx.x * COLS_PER_WG + i;
+            // Write to LOCAL index within this GPU's compressed buffer (not global index)
+            // Each GPU's compressed buffer only holds its cols_per_gpu columns
+            if (local_col < cols_per_gpu) {
+                float val = __half2float(s_wg_block[i]);
+                float q = roundf(val * inv_scale);
+                q = fmaxf(-QUANT_SCALE, fminf(QUANT_SCALE, q));
+                int8_data[local_col] = (int8_t)q;
+            }
+        }
+        
+        // Thread 0 writes scale for this WG's block
+        if (threadIdx.x == 0) {
+            // Block index = WG index (one block per WG)
+            scale_data[blockIdx.x] = __float2half(s_wg_scale);
+        }
+        __syncthreads();
+    }
+
+    // =================================================================
+    // Phase 2c: Inter-GPU Synchronization Barrier
+    // All GPUs must finish writing compressed buffers before any GPU reads peer data
+    // =================================================================
+    
+    // Ensure all writes to compressed_local are visible to other GPUs
+    __threadfence_system();
+    
+    // Signal this GPU is done writing
+    unsigned int my_id = atomicAdd(gpu_done_counter, 1U);
+    
+    // Wait for all 4 GPUs to finish writing
+    volatile unsigned int* gpu_counter_ptr = gpu_done_counter;
+    while (*gpu_counter_ptr < tp_size) {
+        // Busy-wait for all GPUs
+    }
+    
+    // Ensure we see all peer GPU writes
+    __threadfence_system();
 
     // =================================================================
     // Phase 3: RMSNorm with Cross-WG Coordination
     // Sum-of-squares is computed by reading from compressed_peer* buffers
     // and dequantizing INT8 to FP32 on-the-fly.
-    // NOTE: For this minimal implementation, compressed_peer* buffers
-    // contain FP16 data (same as uncompressed), but the interface is
-    // designed for future INT8 compression.
+    // Each peer's compressed buffer: [INT8 data (n bytes)] [FP16 scales (num_wgs*2 bytes)]
     // =================================================================
     
     unsigned int wg_id = blockIdx.x;
     unsigned int num_wgs = gridDim.x;
     
-    // Phase 3a: Wait for all workgroups to finish writing
+    // Phase 3a: Wait for all workgroups to finish writing (intra-GPU barrier)
     __threadfence();
     atomicAdd(wg_write_counter, 1U);
     
@@ -395,35 +495,50 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_compressed_tp4_kernel(
     __threadfence();
     
     // Phase 3b: Each WG computes sum-of-squares
-    // For compressed version, read from compressed_peer* and dequantize
+    // For compressed version, read from compressed_peer* (INT8+scale) and dequantize to FP32
     float sum_sq = 0.0f;
     
     // Each of 256 threads processes elements with stride 256 across ALL N columns
+    // Compressed buffer layout: [INT8 data (n bytes)] [FP16 scales (num_blocks*2 bytes)]
+    // where n = cols_per_gpu, num_blocks = num_wgs (one 16-element block per WG)
+    
     for (unsigned int i = threadIdx.x; i < dim; i += 256) {
         float allreduce_result;
         
-        // Determine which GPU this column belongs to
+        // Determine which GPU this column belongs to and the column index within that GPU
         unsigned int col_gpu = i / cols_per_gpu;
+        unsigned int col_in_gpu = i % cols_per_gpu;
         
         if (col_gpu == tp_rank) {
-            // This column belongs to this GPU - read from partial_local
+            // This column belongs to this GPU - read from partial_local (FP16)
             allreduce_result = __half2float(partial_local[i]);
         } else {
-            // This column belongs to a peer GPU - read from compressed_peer buffer
-            // For minimal implementation, treat compressed_peer as FP16 buffer
-            // (In full implementation, this would dequantize INT8)
+            // This column belongs to a peer GPU - read from compressed_peer buffer (INT8+scale)
             unsigned int peer_idx = (col_gpu < tp_rank) ? col_gpu : (col_gpu - 1);
             
-            const __half* peer_fp16;
-            if (peer_idx == 0) {
-                peer_fp16 = (const __half*)compressed_peer0;
-            } else if (peer_idx == 1) {
-                peer_fp16 = (const __half*)compressed_peer1;
-            } else {
-                peer_fp16 = (const __half*)compressed_peer2;
-            }
+            const int8_t* peer_int8_data;
+            const __half* peer_scale_data;
             
-            allreduce_result = __half2float(peer_fp16[i]);
+            if (peer_idx == 0) {
+                peer_int8_data = (const int8_t*)compressed_peer0;
+            } else if (peer_idx == 1) {
+                peer_int8_data = (const int8_t*)compressed_peer1;
+            } else {
+                peer_int8_data = (const int8_t*)compressed_peer2;
+            }
+            // Scale section starts after INT8 data
+            peer_scale_data = (const __half*)(peer_int8_data + cols_per_gpu);
+            
+            // Dequantize: find which WG's block this column is in
+            // Each WG processed COLS_PER_WG=16 columns as one block
+            unsigned int peer_block_idx = col_in_gpu / COLS_PER_WG;
+            
+            // Use col_in_gpu to index into peer's compressed buffer
+            int8_t quant_val = peer_int8_data[col_in_gpu];
+            __half block_scale = peer_scale_data[peer_block_idx];
+            
+            // Dequantize to FP32: value = quant_val * scale
+            allreduce_result = (float)quant_val * __half2float(block_scale);
         }
         
         sum_sq += allreduce_result * allreduce_result;
@@ -711,8 +826,9 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp2_kernel(
  *   scales:              Per-group scales [K/group_size, N/4] (partitioned)
  *   zeros:               Per-group zeros [K/group_size, N/4] (partitioned)
  *   partial_local:       This GPU's partial buffer [N] (temp storage for GEMV output)
- *   compressed_local:    Local INT8 compressed buffer [n + num_blocks*2] where n=N/4
- *                        Layout: [INT8 data (n bytes)] [FP16 scales (num_blocks*2 bytes)]
+ *   compressed_local:    Local INT8 compressed buffer [n + num_wgs*2] where n=N/4
+ *                        Layout: [INT8 data (n bytes)] [FP16 scales (num_wgs*2 bytes)]
+ *                        where num_wgs = ceil(n/16) (one scale per workgroup)
  *   compressed_peer0:    Peer 0 INT8 compressed buffer (P2P pointer)
  *   compressed_peer1:    Peer 1 INT8 compressed buffer (P2P pointer)
  *   compressed_peer2:    Peer 2 INT8 compressed buffer (P2P pointer)
@@ -720,6 +836,7 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp2_kernel(
  *   wg_partial_sum_sq:   Global memory array [num_wgs] for WG partial sums
  *   wg_write_counter:    Global memory atomic counter [1] for write barrier (zeroed before launch)
  *   wg_done_counter:     Global memory atomic counter [1] for completion barrier (zeroed before launch)
+ *   gpu_done_counter:    Global memory atomic counter [1] for inter-GPU sync (zeroed before launch, shared across all GPUs)
  *   K:                   Input dimension
  *   N:                   Total output dimension (all GPUs combined)
  *   dim:                 Hidden dimension for RMSNorm
@@ -744,6 +861,7 @@ extern "C" int gemv_int4_p2p_allreduce_rmsnorm_compressed_tp4(
     void* wg_partial_sum_sq,        // [num_wgs] float array (WG partial sums)
     void* wg_write_counter,         // [1] uint counter for write barrier
     void* wg_done_counter,          // [1] uint counter for completion barrier
+    void* gpu_done_counter,         // [1] uint counter for inter-GPU sync (shared)
     unsigned int K,
     unsigned int N,
     unsigned int dim,
@@ -773,6 +891,7 @@ extern "C" int gemv_int4_p2p_allreduce_rmsnorm_compressed_tp4(
                        (float*)wg_partial_sum_sq,
                        (unsigned int*)wg_write_counter,
                        (unsigned int*)wg_done_counter,
+                       (unsigned int*)gpu_done_counter,
                        K, N, dim, group_size, eps,
                        tp_rank, tp_size);
     

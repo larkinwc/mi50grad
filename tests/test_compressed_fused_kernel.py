@@ -105,10 +105,10 @@ compressed_lib.gemv_int4_p2p_allreduce_rmsnorm_compressed_tp4.argtypes = [
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
-    ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,  # gpu_done_counter
+    ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
     ctypes.c_float, ctypes.c_uint32, ctypes.c_uint32,
-    ctypes.c_void_p,
+    ctypes.c_void_p,  # stream
 ]
 compressed_lib.gemv_int4_p2p_allreduce_rmsnorm_compressed_tp4.restype = ctypes.c_int
 
@@ -163,7 +163,7 @@ def run_uncompressed_kernel(tp_rank, K, N, group_size, buffers, results_dict, la
     """Run uncompressed fused kernel on one GPU."""
     try:
         dev = GPUDevice(tp_rank)
-        stream = dev.get_stream()
+        stream = dev.create_stream()
         
         # Allocate P2P pointers
         partial_ptrs = (ctypes.c_uint64 * 4)()
@@ -217,10 +217,10 @@ def run_compressed_kernel(tp_rank, K, N, group_size, buffers, results_dict, laun
     """Run compressed fused kernel on one GPU."""
     try:
         dev = GPUDevice(tp_rank)
-        stream = dev.get_stream()
+        stream = dev.create_stream()
         
         cols_per_gpu = (N + 3) // 4
-        num_blocks = (cols_per_gpu + 31) // 32
+        num_blocks = (cols_per_gpu + 15) // 16  # One block per WG (16 columns per WG)
         compressed_size = cols_per_gpu + num_blocks * 2
         
         # Allocate P2P pointers for compressed buffers
@@ -231,6 +231,10 @@ def run_compressed_kernel(tp_rank, K, N, group_size, buffers, results_dict, laun
         # Zero counters
         dev.upload(buffers[f'd_wg_write_{tp_rank}'], np.array([0], dtype=np.uint32).tobytes())
         dev.upload(buffers[f'd_wg_done_{tp_rank}'], np.array([0], dtype=np.uint32).tobytes())
+        
+        # Zero global GPU sync counter (only GPU 0 needs to do this)
+        if tp_rank == 0:
+            dev.upload(gpu_done_counter, np.array([0], dtype=np.uint32).tobytes())
         
         # Wait for all GPUs to be ready
         launch_barrier.wait()
@@ -251,6 +255,7 @@ def run_compressed_kernel(tp_rank, K, N, group_size, buffers, results_dict, laun
             buffers[f'd_wg_sum_sq_{tp_rank}'],
             buffers[f'd_wg_write_{tp_rank}'],
             buffers[f'd_wg_done_{tp_rank}'],
+            gpu_done_counter,
             K, N, N, group_size, 1e-6,
             tp_rank, 4,
             stream
@@ -272,14 +277,14 @@ def run_compressed_kernel(tp_rank, K, N, group_size, buffers, results_dict, laun
         results_dict[f'error_{tp_rank}'] = str(e)
 
 
-def run_test(tp_rank, K, N, group_size, buffers, results_dict, launch_barrier):
+def run_test(tp_rank, K, N, group_size, buffers, results_dict, launch_barrier, gpu_done_counter):
     """Run both uncompressed and compressed kernels."""
     try:
         dev = GPUDevice(tp_rank)
-        stream = dev.get_stream()
+        stream = dev.create_stream()
         
         cols_per_gpu = (N + 3) // 4
-        num_blocks = (cols_per_gpu + 31) // 32
+        num_blocks = (cols_per_gpu + 15) // 16  # One block per WG (16 columns per WG)
         compressed_size = cols_per_gpu + num_blocks * 2
         
         # Allocate P2P pointers
@@ -328,6 +333,10 @@ def run_test(tp_rank, K, N, group_size, buffers, results_dict, launch_barrier):
         dev.upload(buffers[f'd_wg_write_{tp_rank}'], np.array([0], dtype=np.uint32).tobytes())
         dev.upload(buffers[f'd_wg_done_{tp_rank}'], np.array([0], dtype=np.uint32).tobytes())
         
+        # Zero global GPU sync counter (only GPU 0 needs to do this)
+        if tp_rank == 0:
+            dev.upload(gpu_done_counter, np.array([0], dtype=np.uint32).tobytes())
+        
         # Second barrier before compressed launch
         launch_barrier.wait()
         
@@ -347,6 +356,7 @@ def run_test(tp_rank, K, N, group_size, buffers, results_dict, launch_barrier):
             buffers[f'd_wg_sum_sq_{tp_rank}'],
             buffers[f'd_wg_write_{tp_rank}'],
             buffers[f'd_wg_done_{tp_rank}'],
+            gpu_done_counter,
             K, N, N, group_size, 1e-6,
             tp_rank, 4,
             stream
@@ -380,7 +390,7 @@ def allocate_buffers(devices, K, N, group_size):
     weight_h16 = np.ones(N, dtype=np.float16)
     
     cols_per_gpu = (N + 3) // 4
-    num_blocks = (cols_per_gpu + 31) // 32
+    num_blocks = (cols_per_gpu + 15) // 16  # One block per WG (16 columns per WG)
     compressed_size = cols_per_gpu + num_blocks * 2
     
     # Partition weights
@@ -468,6 +478,29 @@ except Exception as e:
     print(f"  ERROR initializing GPUs: {e}")
     sys.exit(1)
 
+# Enable P2P access between all GPUs
+print("\nEnabling P2P access...")
+from src.runtime.hip_dispatch import HIPRuntime
+hip = HIPRuntime()
+hip.init()
+for i in range(4):
+    hip.set_device(i)
+    for j in range(4):
+        if i != j:
+            try:
+                hip.device_enable_peer_access(j)
+            except Exception as e:
+                print(f"  WARNING: GPU{i} -> GPU{j}: {e}")
+print("  P2P enabled")
+
+# Allocate global inter-GPU sync counter (shared across all GPUs)
+# Allocate on GPU 0, but all GPUs can access it via P2P
+print("\nAllocating global GPU sync counter...")
+hip.set_device(0)
+gpu_done_counter = hip.malloc(4)
+hip.memset(gpu_done_counter, 0, 4)
+print("  Global counter allocated")
+
 # Allocate buffers
 print("\nAllocating buffers...")
 buffers = allocate_buffers(devices, K, N, group_size)
@@ -481,7 +514,7 @@ launch_barrier = threading.Barrier(4, timeout=30)
 print(f"\nLaunching 4 threads (GPU 0-3)...")
 threads = []
 for tp_rank in range(4):
-    args = (tp_rank, K, N, group_size, buffers, results_dict, launch_barrier)
+    args = (tp_rank, K, N, group_size, buffers, results_dict, launch_barrier, gpu_done_counter)
     t = threading.Thread(target=run_test, args=args)
     threads.append(t)
     t.start()
