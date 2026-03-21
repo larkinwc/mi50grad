@@ -2239,6 +2239,16 @@ class TPInferenceEngine:
         print(f"Dispatch cache built for {len(self.engines)} engines × "
               f"{len(self.engines[0].layers)} layers")
 
+        # Rebuild C dispatch plan if it exists, since the plan's CKernelSpec
+        # params_array pointers reference the engine layer caches which were
+        # just rebuilt at new memory addresses.
+        if self._c_dispatch_plan is not None:
+            try:
+                self._c_dispatch_plan = self._build_c_dispatch_plan()
+            except Exception as e:
+                print(f"WARNING: Failed to rebuild C dispatch plan after "
+                      f"build_dispatch_cache: {e}")
+
     def set_stream_overlap_dispatch(self, overlap: bool):
         """Enable or disable stream overlap dispatch.
 
