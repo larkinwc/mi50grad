@@ -109,6 +109,14 @@ def test_batch1_no_regression():
     for i in range(config.num_hidden_layers):
         engine.load_layer_weights(i, loader.load_layer(i))
     engine.load_final_norm(loader.load_final_norm())
+    
+    # Enable cached dispatch for optimal throughput (required for batch decode)
+    print("Building dispatch cache...")
+    engine.build_dispatch_cache()
+    engine.set_c_dispatch(True)
+    engine.set_direct_kv_write(True)
+    engine.set_kernel_p2p_allreduce(True)
+    engine.set_deferred_attention_ar(True)
     print("Engine initialized and weights loaded")
     
     # Use embedding from model
@@ -219,6 +227,13 @@ def test_batch2_correctness():
     for i in range(config.num_hidden_layers):
         engine.load_layer_weights(i, loader.load_layer(i))
     engine.load_final_norm(loader.load_final_norm())
+    
+    # Enable cached dispatch for optimal throughput
+    engine.build_dispatch_cache()
+    engine.set_c_dispatch(True)
+    engine.set_direct_kv_write(True)
+    engine.set_kernel_p2p_allreduce(True)
+    engine.set_deferred_attention_ar(True)
     print("Engine initialized and weights loaded")
     
     # Use embeddings from model
@@ -296,6 +311,13 @@ def test_batch4_correctness():
     for i in range(config.num_hidden_layers):
         engine.load_layer_weights(i, loader.load_layer(i))
     engine.load_final_norm(loader.load_final_norm())
+    
+    # Enable cached dispatch for optimal throughput
+    engine.build_dispatch_cache()
+    engine.set_c_dispatch(True)
+    engine.set_direct_kv_write(True)
+    engine.set_kernel_p2p_allreduce(True)
+    engine.set_deferred_attention_ar(True)
     print("Engine initialized and weights loaded")
     
     # Use embeddings from model
@@ -379,6 +401,13 @@ def test_kv_cache_multi_position():
     for i in range(config.num_hidden_layers):
         engine.load_layer_weights(i, loader.load_layer(i))
     engine.load_final_norm(loader.load_final_norm())
+    
+    # Enable cached dispatch for optimal throughput
+    engine.build_dispatch_cache()
+    engine.set_c_dispatch(True)
+    engine.set_direct_kv_write(True)
+    engine.set_kernel_p2p_allreduce(True)
+    engine.set_deferred_attention_ar(True)
     print("Engine initialized and weights loaded")
     
     # Test: write KV cache for batch=4 at positions [0,1,2,3]
@@ -442,6 +471,13 @@ def test_batch_throughput_scaling():
     for i in range(config.num_hidden_layers):
         engine.load_layer_weights(i, loader.load_layer(i))
     engine.load_final_norm(loader.load_final_norm())
+    
+    # Enable cached dispatch for optimal throughput
+    engine.build_dispatch_cache()
+    engine.set_c_dispatch(True)
+    engine.set_direct_kv_write(True)
+    engine.set_kernel_p2p_allreduce(True)
+    engine.set_deferred_attention_ar(True)
     print("Engine initialized and weights loaded")
     
     embeddings = {
