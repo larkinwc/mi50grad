@@ -16,14 +16,15 @@
  *   - Each workgroup (16 columns) computes its own scale = max(abs(x)) / 127.0
  *   - Quantize: quantized[i] = round(x[i] / scale), clamp to [-127, 127]
  *   - Store: 16 INT8 values (16 bytes) + 1 FP16 scale (2 bytes) = 18 bytes per WG
- *   - Uncompressed: 16 * 2 = 32 bytes per WG
+ *   - Uncompressed: 16 * 2 = 32 bytes per WG (FP16)
  *   - Compression ratio: 18/32 = 56.25% (43.75% bandwidth reduction)
  *
  * Memory layout for compressed buffers (per GPU):
- *   - Data section: [INT8 data (n bytes)] where n = hidden_size/tp_size
+ *   - Data section: [INT8 data (n bytes)] where n = hidden_size/tp_size = cols_per_gpu
  *   - Scale section: [FP16 scales (num_wgs*2 bytes)] where num_wgs = ceil(n/16)
  *   - Total: n + ceil(n/16)*2 bytes (e.g., n=1280 -> 1280 + 80*2 = 1440 bytes)
  *   - vs uncompressed: n*2 bytes (1280*2 = 2560 bytes)
+ *   - Compression ratio: 1440/2560 = 56.25% (43.75% bandwidth reduction)
  *
  * Compared to uncompressed fused kernel (gemv_int4_p2p_allreduce_rmsnorm.hip):
  *   - Reduces P2P transfer volume by ~47% per allreduce call
@@ -510,11 +511,29 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_compressed_tp4_kernel(
         unsigned int col_in_gpu = i % cols_per_gpu;
         
         if (col_gpu == tp_rank) {
-            // This column belongs to this GPU - read from partial_local (FP16)
-            allreduce_result = __half2float(partial_local[i]);
+            // This column belongs to this GPU - read from compressed_local (INT8+scale format)
+            // Scale section starts after INT8 data
+            const int8_t* local_int8_data = (const int8_t*)compressed_local;
+            const __half* local_scale_data = (const __half*)(local_int8_data + cols_per_gpu);
+            
+            // Dequantize: find which WG's block this column is in
+            unsigned int local_block_idx = col_in_gpu / COLS_PER_WG;
+            int8_t quant_val = local_int8_data[col_in_gpu];
+            __half block_scale = local_scale_data[local_block_idx];
+            
+            // Dequantize to FP32: value = quant_val * scale
+            allreduce_result = (float)quant_val * __half2float(block_scale);
         } else {
             // This column belongs to a peer GPU - read from compressed_peer buffer (INT8+scale)
-            unsigned int peer_idx = (col_gpu < tp_rank) ? col_gpu : (col_gpu - 1);
+            // Map col_gpu (0-3) to peer index (0-2) by skipping tp_rank
+            // peer_idx = col_gpu - (col_gpu > tp_rank ? 1 : 0)
+            unsigned int peer_idx = col_gpu;
+            if (col_gpu > tp_rank) {
+                peer_idx = col_gpu - 1;
+            } else {
+                peer_idx = col_gpu;
+            }
+            // Now peer_idx is in range [0,2]
             
             const int8_t* peer_int8_data;
             const __half* peer_scale_data;
