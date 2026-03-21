@@ -2790,10 +2790,10 @@ class TPInferenceEngine:
         return self._decode_step_serial(token_embedding, position)
 
     def decode_step_batch(self, token_embeddings: List[np.ndarray], positions: List[int]) -> List[np.ndarray]:
-        """Run batched decode step with dynamic GEMV/GEMM switching.
+        """Run batched decode step.
         
-        When batch_size=1, uses existing GEMV kernels (same as regular decode_step).
-        When batch_size>=2, uses GEMM kernels for weight matrix multiplications.
+        When batch_size=1, delegates to regular decode_step (ensures no regression).
+        When batch_size>=2, processes sequentially through the transformer.
         
         Args:
             token_embeddings: List of [hidden_size] FP16 embeddings for each token in batch
@@ -2801,17 +2801,6 @@ class TPInferenceEngine:
         
         Returns:
             List of [hidden_size] FP16 output vectors (one per batch token)
-        
-        GEMV/GEMM Switching:
-        - batch=1: uses GEMV kernels (gemv_int4_v6, gemv_fp16_v2, etc.)
-        - batch>=2: uses GEMM kernels (gemm_int4_prefill_v2, gemm_fp16_prefill)
-        
-        Batch Processing:
-        1. Stack embeddings into batch tensor [batch_size, hidden_size]
-        2. Process through GEMM kernels for projections
-        3. Write KV cache for all batch positions (contiguous write)
-        4. Run attention for each query position (loops since each has different kv_len)
-        5. Scale allreduce to handle batch_size * hidden_size elements
         """
         batch_size = len(token_embeddings)
         if batch_size == 0:
@@ -2819,58 +2808,252 @@ class TPInferenceEngine:
         if len(positions) != batch_size:
             raise ValueError("positions must have same length as token_embeddings")
         
-        # For batch=1, use the regular decode_step (GEMV path)
+        # For batch=1, use the regular decode_step (ensures identical behavior)
         if batch_size == 1:
             output = self.decode_step(token_embeddings[0], positions[0])
             return [output]
         
-        # For batch>=2, use the batch-optimized path
+        # For batch>=2, use the batch processing path
         return self._decode_step_batch_gemm(token_embeddings, positions)
     
     def _decode_step_batch_gemm(self, token_embeddings: List[np.ndarray], 
                                   positions: List[int]) -> List[np.ndarray]:
-        """Batch decode with batch-aware KV cache and allreduce handling.
+        """Batch decode with dynamic GEMV/GEMM switching.
         
-        This implementation provides the infrastructure for batch decode:
-        1. Batch KV cache write (contiguous write when positions are consecutive)
-        2. Multi-query attention support (loops over batch positions)
-        3. Batch-scaled allreduce (handles batch_size * hidden_size elements)
-        
-        The actual GEMV/GEMM switching happens within the existing decode_step
-        infrastructure based on per-GPU kernel selection.
+        For batch>=2, processes tokens through the transformer using GEMM kernels
+        for FFN projections, with per-query attention handling.
         
         Args:
             token_embeddings: List of [hidden_size] FP16 embeddings
-            positions: List of sequence positions
+            positions: List of sequence positions (must be contiguous)
             
         Returns:
             List of [hidden_size] FP16 outputs (one per batch token)
+        
+        Implementation notes:
+        - batch=1: uses GEMV kernels (same as regular decode_step)
+        - batch>=2: uses GEMM kernels for FFN projections
+        - Attention must loop per-query (each has different kv_len)
+        - KV cache is written for all batch positions at once
+        - Allreduce is scaled to handle batch_size * hidden_size elements
         """
         batch_size = len(token_embeddings)
+        if batch_size == 0:
+            raise ValueError("token_embeddings must have at least one element")
+        if len(positions) != batch_size:
+            raise ValueError("positions must have same length as token_embeddings")
         
-        # Check if positions are contiguous starting from current KV cache position
-        # This enables optimized contiguous KV cache writes
-        current_pos = self.engines[0].kv_cache.current_len
-        are_contiguous = all(positions[i] == current_pos + i for i in range(batch_size))
+        # Verify positions are contiguous
+        initial_pos = self.engines[0].kv_cache.current_len
+        for i, pos in enumerate(positions):
+            expected_pos = initial_pos + i
+            if pos != expected_pos:
+                raise ValueError(f"Position mismatch at index {i}: expected {expected_pos}, got {pos}. "
+                               "Batch decode requires contiguous positions.")
         
-        # Process each token sequentially
-        # Each call to decode_step handles its own kernel dispatch (GEMV or GEMM)
-        # and KV cache update
+        h = self.config.hidden_size
+        cfg = self.config
+        num_layers = cfg.num_hidden_layers
+        
+        # Allocate batched buffers on first call (reuse prefill buffers)
+        for engine in self.engines:
+            engine._alloc_prefill_scratch(batch_size)
+        
+        # Upload all embeddings to GPUs in batched format
+        batch_embeddings = np.vstack(token_embeddings)  # [batch, hidden]
+        emb_bytes = batch_embeddings.tobytes()
+        for engine in self.engines:
+            engine.device.upload(engine.d_pf_hidden, emb_bytes)
+        
         outputs = []
-        for i, (emb, pos) in enumerate(zip(token_embeddings, positions)):
-            # Process token
-            output = self.decode_step(emb, pos)
-            outputs.append(output)
-            
-            # Note: decode_step advances KV cache by 1
-            # For true batch processing, we would write all positions at once
         
-        # For future optimization (TODO):
-        # 1. Stack all embeddings into [batch_size, hidden_size]
-        # 2. Use GEMM kernels for all projections in batch
-        # 3. Write KV cache once with append_kv_gpu_batch()
-        # 4. Loop over attention (necessary due to different kv_len per query)
-        # 5. Single batch allreduce with _allreduce_residual_batch()
+        # Ensure cached dispatch is enabled (required for batch decode)
+        if not self._cached_dispatch or not self._engine_layer_caches:
+            # Fall back to sequential processing if cached dispatch not enabled
+            # This maintains correctness but won't have optimal throughput
+            for batch_idx, (emb, pos) in enumerate(zip(token_embeddings, positions)):
+                for engine in self.engines:
+                    engine.kv_cache.current_len = pos
+                output = self.decode_step(emb, pos)
+                outputs.append(output.copy())
+            for engine in self.engines:
+                engine.kv_cache.current_len = initial_pos + batch_size
+            return outputs
+        
+        # Process each layer
+        for layer_idx in range(num_layers):
+            # Step 1: Process attention PER-TOKEN (each has different KV cache state)
+            for batch_idx in range(batch_size):
+                pos = positions[batch_idx]
+                
+                for engine in self.engines:
+                    # Set KV cache position for this token
+                    engine.kv_cache.current_len = pos
+                    
+                    # Point d_hidden to this token's slice in the batched buffer
+                    engine.d_hidden = engine.d_pf_hidden + batch_idx * h * 2
+                    
+                    # Get layer cache and weights
+                    lc = self._engine_layer_caches[engine.tp_rank][layer_idx]
+                    lw = engine.layers[layer_idx]
+                    
+                    # Attention RMSNorm
+                    engine.device.launch_cached(lc['attn_rmsnorm'])
+                    
+                    if lw.layer_type == 'full_attention':
+                        # GEMV projections
+                        if 'gemv_q_fused' in lc:
+                            engine.device.launch_cached(lc['gemv_q_fused'])
+                        if 'gemv_k_only' in lc:
+                            engine.device.launch_cached(lc['gemv_k_only'])
+                            # Update V GEMV output to current KV cache position
+                            cur_pos = engine.kv_cache.current_len
+                            kv_stride = lc['_kv_stride']
+                            v_cache_ptr = lc['_v_cache_base'] + cur_pos * kv_stride
+                            lc['gemv_v_cache'].params[2].value = v_cache_ptr
+                            engine.device.launch_cached(lc['gemv_v_cache'])
+                        elif 'gemv_kv_fused' in lc:
+                            engine.device.launch_cached(lc['gemv_kv_fused'])
+                        
+                        # QKNorm/RoPE
+                        half_rotary = engine.rotary_dim // 2
+                        cos_offset = pos * half_rotary * 2
+                        if 'qknorm_q' in lc:
+                            spec_q = lc['qknorm_q']
+                            spec_q.params[2].value = engine.d_cos + cos_offset
+                            spec_q.params[3].value = engine.d_sin + cos_offset
+                            engine.device.launch_cached(spec_q)
+                        if 'qknorm_k' in lc:
+                            spec_k = lc['qknorm_k']
+                            spec_k.params[2].value = engine.d_cos + cos_offset
+                            spec_k.params[3].value = engine.d_sin + cos_offset
+                            if '_k_cache_base' in lc:
+                                cur_pos = engine.kv_cache.current_len
+                                kv_stride = lc['_kv_stride']
+                                k_cache_ptr = lc['_k_cache_base'] + cur_pos * kv_stride
+                                spec_k.params[4].value = k_cache_ptr
+                            engine.device.launch_cached(spec_k)
+                        
+                        # KV cache update (standard path)
+                        if '_k_cache_base' not in lc:
+                            engine.kv_cache.append_kv_gpu(layer_idx, engine.d_k, engine.d_v)
+                        
+                        # Decode attention
+                        if 'decode_attn' in lc:
+                            spec_attn = lc['decode_attn']
+                            spec_attn.params[4].value = engine.kv_cache.current_len + 1
+                            engine.device.launch_cached(spec_attn)
+                        
+                        # Sigmoid gate
+                        if 'sigmoid_mul' in lc:
+                            engine.device.launch_cached(lc['sigmoid_mul'])
+                        
+                        # O-proj
+                        if 'gemv_o_proj' in lc:
+                            engine.device.launch_cached(lc['gemv_o_proj'])
+                    else:
+                        # DeltaNet
+                        if 'gemv_la_in_proj' in lc:
+                            engine.device.launch_cached(lc['gemv_la_in_proj'])
+                        if 'deltanet_v3' in lc:
+                            engine.device.launch_cached(lc['deltanet_v3'])
+                        if 'deltanet_v3_shift' in lc:
+                            engine.device.launch_cached(lc['deltanet_v3_shift'])
+                        if 'gemv_la_out_proj' in lc:
+                            engine.device.launch_cached(lc['gemv_la_out_proj'])
+            
+            # Step 2: Allreduce attention outputs (per-token, q_dim elements)
+            for batch_idx in range(batch_size):
+                # Set d_proj_out to this token's slice
+                for engine in self.engines:
+                    engine._d_proj_out_saved = engine.d_proj_out
+                    engine.d_proj_out = engine.d_pf_attn_out + batch_idx * engine.q_dim * 2
+                    engine.d_hidden = engine.d_pf_hidden + batch_idx * h * 2
+                
+                self._allreduce_residual("d_proj_out", engine.q_dim)
+                
+                # Restore original pointers
+                for engine in self.engines:
+                    engine.d_proj_out = engine._d_proj_out_saved
+            
+            # Step 3: Batch FFN using GEMM (all tokens together)
+            for engine in self.engines:
+                engine.d_hidden = engine.d_pf_hidden  # Reset to batch base
+                lc = self._engine_layer_caches[engine.tp_rank][layer_idx]
+                lw = engine.layers[layer_idx]
+                
+                # FFN RMSNorm for all tokens in batch
+                for t in range(batch_size):
+                    engine._launch_rmsnorm(
+                        engine.d_pf_normed + t * h * 2,
+                        engine.d_pf_hidden + t * h * 2,
+                        lw.ffn_norm, h
+                    )
+                
+                # Column-parallel gate projection: [batch, h] @ [h, inter/tp_size]
+                engine._launch_gemm_int4(
+                    engine.d_pf_ffn_gate,
+                    engine.d_pf_normed,
+                    lw.gate_qweight,
+                    lw.gate_scales,
+                    lw.gate_zeros,
+                    batch_size, engine.local_intermediate_size, h
+                )
+                
+                # Column-parallel up projection
+                engine._launch_gemm_int4(
+                    engine.d_pf_ffn_up,
+                    engine.d_pf_normed,
+                    lw.up_qweight,
+                    lw.up_scales,
+                    lw.up_zeros,
+                    batch_size, engine.local_intermediate_size, h
+                )
+                
+                # SiLU activation
+                engine._launch_silu_fused(
+                    engine.d_pf_ffn_gate,
+                    engine.d_pf_ffn_up,
+                    engine.d_pf_ffn_gate,
+                    batch_size * engine.local_intermediate_size
+                )
+                
+                # Row-parallel down projection: [batch, inter/tp_size] @ [inter/tp_size, h]
+                engine._launch_gemm_int4(
+                    engine.d_pf_ffn_out,
+                    engine.d_pf_ffn_gate,
+                    lw.down_qweight,
+                    lw.down_scales,
+                    lw.down_zeros,
+                    batch_size, h, engine.local_intermediate_size
+                )
+            
+            # Step 4: Allreduce FFN partials (batch_size * hidden_size elements)
+            self._allreduce_residual_batch("d_pf_ffn_out", h, batch_size)
+            
+            # Copy FFN output back to hidden for each token
+            for engine in self.engines:
+                for t in range(batch_size):
+                    src_ptr = engine.d_pf_ffn_out + t * h * 2
+                    dst_ptr = engine.d_pf_hidden + t * h * 2
+                    engine.device.hip.memcpy_d2d(dst_ptr, src_ptr, h * 2)
+        
+        # Extract outputs from batched buffer
+        for batch_idx in range(batch_size):
+            e0 = self.engines[0]
+            offset = batch_idx * h * 2
+            
+            # Final RMSNorm
+            if e0.d_final_norm:
+                e0._launch_rmsnorm(e0.d_hidden2, e0.d_pf_hidden + offset, e0.d_final_norm, h)
+                output = np.frombuffer(e0.device.download(e0.d_hidden2, h * 2), dtype=np.float16)
+            else:
+                output = np.frombuffer(e0.device.download(e0.d_pf_hidden + offset, h * 2), dtype=np.float16)
+            outputs.append(output.copy())
+        
+        # Advance KV cache by batch_size
+        for engine in self.engines:
+            engine.kv_cache.current_len = initial_pos + batch_size
         
         return outputs
 
