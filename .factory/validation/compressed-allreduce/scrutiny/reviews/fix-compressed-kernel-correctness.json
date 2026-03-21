@@ -1,0 +1,56 @@
+{
+  "featureId": "fix-compressed-kernel-correctness",
+  "reviewedAt": "2026-03-21T03:15:00Z",
+  "commitId": "66c5a0d",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "fail",
+  "codeReview": {
+    "summary": "The fix addressed INT8 dequantization bugs in the FUSED kernel (gemv_int4_p2p_allreduce_rmsnorm_compressed.hip), but the validation test (test_compressed_allreduce_working.py) tests the STANDALONE kernel (kernel_p2p_allreduce_compressed.hip), which was NOT modified by this fix. This is a critical mismatch between what was fixed and what is being validated.",
+    "issues": [
+      {
+        "file": "tests/test_compressed_allreduce_working.py",
+        "line": 50,
+        "severity": "blocking",
+        "description": "Test validates STANDALONE kernel (kernel_p2p_allreduce_compressed.so via kernel_p2p_allreduce_compressed_quantize) but the fix feature only modified the FUSED kernel (gemv_int4_p2p_allreduce_rmsnorm_compressed.hip). The validation is testing the wrong kernel, producing cos_sim=0.48. The standalone kernel's dequantization logic was NOT fixed in this commit."
+      },
+      {
+        "file": "src/kernels/kernel_p2p_allreduce_compressed.hip",
+        "line": 310,
+        "severity": "blocking",
+        "description": "The STANDALONE kernel's kernel_dequantize_sum_with_residual_fp32 function has the same dequantization pattern that was fixed in the fused kernel. It reads from local_int8 and peer*_int8 with scale offsets, but the test shows cos_sim=0.48, indicating this kernel has an unresolved bug. The fix feature did not address this kernel despite it being tested by the validation."
+      },
+      {
+        "file": ".factory/validation/compressed-allreduce/scrutiny/reviews/compressed-ar-fused-kernel.json",
+        "line": 1,
+        "severity": "non_blocking",
+        "description": "Original failure was for 'compressed-ar-fused-kernel' feature, but the validation test (test_compressed_allreduce_working.py) tests the standalone kernel, not the fused kernel. This indicates a mismatch in the validation setup that predates this fix."
+      },
+      {
+        "file": "src/kernels/gemv_int4_p2p_allreduce_rmsnorm_compressed.hip",
+        "line": 511,
+        "severity": "non_blocking",
+        "description": "The fix correctly addressed Phase 3 dequantization: now reads INT8+scale from compressed_local for self GPU columns (was incorrectly reading FP16 from partial_local). Peer index mapping also fixed. This code appears correct for the fused kernel."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "validation",
+      "observation": "Critical mismatch between validation test and feature scope: test_compressed_allreduce_working.py tests kernel_p2p_allreduce_compressed (standalone), but feature 'fix-compressed-kernel-correctness' only fixed gemv_int4_p2p_allreduce_rmsnorm_compressed (fused). The validation contract VAL-CA-003 specifies 'Fused GEMV+compressed AR+RMSNorm kernel correctness' but the test being run tests the standalone kernel.",
+      "evidence": "test_compressed_allreduce_working.py:50 loads 'kernel_p2p_allreduce_compressed.so' and calls 'kernel_p2p_allreduce_compressed_quantize'. Commit 66c5a0d only modified 'gemv_int4_p2p_allreduce_rmsnorm_compressed.hip' (fused kernel)."
+    },
+    {
+      "area": "conventions",
+      "observation": "Worker correctly documented test infrastructure limitations (Python threading cannot provide cross-GPU synchronization for fused kernel's atomic counters). However, the worker did not identify that the validation test was testing a different kernel.",
+      "evidence": "Handoff section 'skillFeedback.deviations' says tests produce NaN for fused kernel due to threading issues. But test_compressed_allreduce_working.py tests the standalone kernel which should work with threading."
+    },
+    {
+      "area": "skills",
+      "observation": "The gpu-kernel-worker skill procedure requires 'Run Tests to Verify (GREEN)' but the worker marked the feature as complete despite failing tests. The skill should clarify that failing validation tests must be resolved or explicitly waived before marking complete.",
+      "evidence": "Handoff says 'successState: success' but validation shows 'exit code: 1 (FAILURE)'. Worker documented test limitations but did not escalate the kernel mismatch issue."
+    }
+  ],
+  "addressesFailureFrom": "/Users/larkinwc/personal/ml/mi50grad/.factory/validation/compressed-allreduce/scrutiny/reviews/compressed-ar-fused-kernel.json",
+  "summary": "FAIL: The fix feature addressed bugs in the fused kernel (gemv_int4_p2p_allreduce_rmsnorm_compressed.hip) but the validation test (test_compressed_allreduce_working.py) tests the standalone kernel (kernel_p2p_allreduce_compressed.hip) which was NOT fixed. The test result cos_sim=0.48 indicates the standalone kernel has an unresolved bug in its INT8 quantization/dequantization path. The validation is testing the wrong kernel for this feature. Either: (1) the validation test should be changed to test the fused kernel, or (2) the standalone kernel needs the same dequantization fixes applied."
+}

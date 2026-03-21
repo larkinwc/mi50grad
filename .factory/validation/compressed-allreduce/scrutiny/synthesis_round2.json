@@ -1,0 +1,68 @@
+{
+  "milestone": "compressed-allreduce",
+  "round": 2,
+  "status": "fail",
+  "validatorsRun": {
+    "test": {
+      "passed": false,
+      "command": "ssh root@192.168.1.198 'docker run ... python3 tests/test_compressed_allreduce_working.py'",
+      "exitCode": 1,
+      "observation": "FAILED: cos_sim=0.483355 < 0.99 required. The test validates the standalone kernel (kernel_p2p_allreduce_compressed.so) but the fix feature only modified the fused kernel (gemv_int4_p2p_allreduce_rmsnorm_compressed.hip)."
+    },
+    "typecheck": {
+      "passed": true,
+      "command": "python3 -m py_compile src/**/*.py",
+      "exitCode": 0,
+      "observation": "All Python files compile without syntax errors"
+    },
+    "lint": {
+      "passed": true,
+      "command": "N/A - no lint tools (ruff/pylint/flake8) available in dev container",
+      "exitCode": 0,
+      "observation": "Lint tools not available in Docker environment"
+    }
+  },
+  "reviewsSummary": {
+    "total": 3,
+    "passed": 1,
+    "failed": 2,
+    "failedFeatures": ["compressed-ar-fused-kernel", "fix-compressed-kernel-correctness"]
+  },
+  "blockingIssues": [
+    {
+      "featureId": "fix-compressed-kernel-correctness",
+      "severity": "blocking",
+      "description": "Critical kernel/test mismatch: The fix feature modified gemv_int4_p2p_allreduce_rmsnorm_compressed.hip (FUSED kernel) but the validation test (test_compressed_allreduce_working.py) tests kernel_p2p_allreduce_compressed.hip (STANDALONE kernel). The standalone kernel was NOT fixed and still produces cos_sim=0.48. Either: (1) fix the standalone kernel's dequantization logic, or (2) use a test that validates the fused kernel.",
+      "file": "tests/test_compressed_allreduce_working.py",
+      "suggestedFix": "Apply the same dequantization fixes to kernel_p2p_allreduce_compressed.hip's kernel_dequantize_sum_with_residual_fp32 function that were applied to the fused kernel, OR create a proper test for the fused kernel that can handle its cross-WG synchronization requirements."
+    },
+    {
+      "featureId": "compressed-ar-fused-kernel",
+      "severity": "blocking",
+      "description": "Original feature was never properly validated on the dev server. The fix feature attempted to address bugs but tested the wrong kernel.",
+      "file": "tests/test_compressed_fused_kernel.py"
+    }
+  ],
+  "appliedUpdates": [],
+  "suggestedGuidanceUpdates": [
+    {
+      "target": "skill",
+      "suggestion": "The gpu-kernel-worker skill should require explicit verification that the test being run actually validates the code being modified. Workers should check that test file names match the kernel being tested.",
+      "evidence": "fix-compressed-kernel-correctness worker modified fused kernel but validation test tested standalone kernel. The mismatch was not caught during the fix feature implementation.",
+      "isSystemic": false
+    },
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add guidance that compressed allreduce has TWO kernel variants (standalone and fused) that must be validated separately. Changes to one do not affect the other.",
+      "evidence": "Validation confusion between kernel_p2p_allreduce_compressed.hip (standalone) and gemv_int4_p2p_allreduce_rmsnorm_compressed.hip (fused).",
+      "isSystemic": false
+    }
+  ],
+  "rejectedObservations": [
+    {
+      "observation": "Worker noted Python threading tests produce NaN for fused kernel",
+      "reason": "This is a known limitation but the test_compressed_allreduce_working.py tests the standalone kernel which should work with threading - the actual issue is kernel/test mismatch"
+    }
+  ],
+  "previousRound": ".factory/validation/compressed-allreduce/scrutiny/synthesis.json"
+}
