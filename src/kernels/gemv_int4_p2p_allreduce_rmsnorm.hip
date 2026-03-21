@@ -70,23 +70,25 @@
  * =================================================================== */
 
 /**
- * dequant_fdot2: Process one uint32 (8 INT4 weights) via fdot2.
- * Extracts nibbles, applies scale/zero dequantization, uses v_dot2_f32_f16.
+ * dequant_dot_fp32: Process one uint32 (8 INT4 weights) with FP32-only accumulation.
+ * Eliminates FP16 conversion overhead (v7 optimization): direct FP32 multiply-add
+ * instead of float2half + halves2half2 + fdot2 path.
  */
-__device__ __forceinline__ float dequant_fdot2(
+__device__ __forceinline__ float dequant_dot_fp32(
     unsigned int packed,
-    float cur_scale,
-    float cur_zero,
+    float scale,
+    float zero,
     const __half* __restrict__ A,
     unsigned int a_base
 ) {
-    __half2 a01 = *reinterpret_cast<const __half2*>(A + a_base);
-    __half2 a23 = *reinterpret_cast<const __half2*>(A + a_base + 2);
-    __half2 a45 = *reinterpret_cast<const __half2*>(A + a_base + 4);
-    __half2 a67 = *reinterpret_cast<const __half2*>(A + a_base + 6);
-
-    float scale = cur_scale;
-    float zero  = cur_zero;
+    float a0 = __half2float(A[a_base]);
+    float a1 = __half2float(A[a_base + 1]);
+    float a2 = __half2float(A[a_base + 2]);
+    float a3 = __half2float(A[a_base + 3]);
+    float a4 = __half2float(A[a_base + 4]);
+    float a5 = __half2float(A[a_base + 5]);
+    float a6 = __half2float(A[a_base + 6]);
+    float a7 = __half2float(A[a_base + 7]);
 
     float w0 = ((float)__builtin_amdgcn_ubfe(packed,  0, 4) - zero) * scale;
     float w1 = ((float)__builtin_amdgcn_ubfe(packed,  4, 4) - zero) * scale;
@@ -97,18 +99,7 @@ __device__ __forceinline__ float dequant_fdot2(
     float w6 = ((float)__builtin_amdgcn_ubfe(packed, 24, 4) - zero) * scale;
     float w7 = ((float)__builtin_amdgcn_ubfe(packed, 28, 4) - zero) * scale;
 
-    __half2 w01 = __halves2half2(__float2half(w0), __float2half(w1));
-    __half2 w23 = __halves2half2(__float2half(w2), __float2half(w3));
-    __half2 w45 = __halves2half2(__float2half(w4), __float2half(w5));
-    __half2 w67 = __halves2half2(__float2half(w6), __float2half(w7));
-
-    float acc = 0.0f;
-    acc = __builtin_amdgcn_fdot2(w01, a01, acc, false);
-    acc = __builtin_amdgcn_fdot2(w23, a23, acc, false);
-    acc = __builtin_amdgcn_fdot2(w45, a45, acc, false);
-    acc = __builtin_amdgcn_fdot2(w67, a67, acc, false);
-
-    return acc;
+    return w0*a0 + w1*a1 + w2*a2 + w3*a3 + w4*a4 + w5*a5 + w6*a6 + w7*a7;
 }
 
 /* ===================================================================
@@ -217,37 +208,46 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp4_kernel(
     unsigned int col_in_partition = local_col;
 
     // =================================================================
-    // Phase 1: INT4 GEMV (register-cached scale/zero + weight prefetch)
-    // Matches gemv_int4_v6 implementation for correctness
+    // Phase 1: INT4 GEMV (FP32 accumulation + 2x register blocking, v7)
     // =================================================================
     float gemv_acc = 0.0f;
     
-    // Register-cached scale/zero
     float cur_scale = 0.0f, cur_zero = 0.0f;
     unsigned int current_group = 0xFFFFFFFF;
-    
-    // Weight prefetch - load first weight before loop
-    unsigned int packed = 0;
-    if (kg_start < kg_end) {
-        packed = B_q4[kg_start * cols_per_gpu + col_in_partition];
+
+    // 2x register blocking: process pairs of weight words
+    unsigned int kg = kg_start;
+    unsigned int kg_end_even = kg_start + ((kg_end - kg_start) & ~1u);
+
+    for (; kg < kg_end_even; kg += 2) {
+        unsigned int packed0 = B_q4[kg * cols_per_gpu + col_in_partition];
+        unsigned int packed1 = B_q4[(kg + 1) * cols_per_gpu + col_in_partition];
+
+        unsigned int g0 = kg >> gps_log2;
+        if (g0 != current_group) {
+            cur_scale = __half2float(scales[g0 * cols_per_gpu + col_in_partition]);
+            cur_zero  = __half2float(zeros[g0 * cols_per_gpu + col_in_partition]);
+            current_group = g0;
+        }
+        gemv_acc += dequant_dot_fp32(packed0, cur_scale, cur_zero, A, kg << 3);
+
+        unsigned int g1 = (kg + 1) >> gps_log2;
+        if (g1 != current_group) {
+            cur_scale = __half2float(scales[g1 * cols_per_gpu + col_in_partition]);
+            cur_zero  = __half2float(zeros[g1 * cols_per_gpu + col_in_partition]);
+            current_group = g1;
+        }
+        gemv_acc += dequant_dot_fp32(packed1, cur_scale, cur_zero, A, (kg + 1) << 3);
     }
-    
-    for (unsigned int kg = kg_start; kg < kg_end; kg++) {
-        // Compute quantization group index and reload scale/zero if needed
-        unsigned int next_group = kg >> gps_log2;
-        if (next_group != current_group) {
-            cur_scale = __half2float(scales[next_group * cols_per_gpu + col_in_partition]);
-            cur_zero  = __half2float(zeros[next_group * cols_per_gpu + col_in_partition]);
-            current_group = next_group;
+
+    if (kg < kg_end) {
+        unsigned int packed = B_q4[kg * cols_per_gpu + col_in_partition];
+        unsigned int g = kg >> gps_log2;
+        if (g != current_group) {
+            cur_scale = __half2float(scales[g * cols_per_gpu + col_in_partition]);
+            cur_zero  = __half2float(zeros[g * cols_per_gpu + col_in_partition]);
         }
-        
-        // Compute with current weight
-        gemv_acc += dequant_fdot2(packed, cur_scale, cur_zero, A, kg << 3);
-        
-        // Prefetch next weight
-        if (kg + 1 < kg_end) {
-            packed = B_q4[(kg + 1) * cols_per_gpu + col_in_partition];
-        }
+        gemv_acc += dequant_dot_fp32(packed, cur_scale, cur_zero, A, kg << 3);
     }
 
     // Phase 1b: Intra-wavefront DPP reduction
@@ -501,29 +501,43 @@ __global__ void gemv_int4_p2p_allreduce_rmsnorm_tp2_kernel(
 
     unsigned int col_in_partition = local_col;
 
-    // Phase 1: INT4 GEMV
+    // Phase 1: INT4 GEMV (FP32 accumulation + 2x register blocking, v7)
     float gemv_acc = 0.0f;
     float cur_scale = 0.0f, cur_zero = 0.0f;
     unsigned int current_group = 0xFFFFFFFF;
-    unsigned int packed = 0;
-    
-    if (kg_start < kg_end) {
-        packed = B_q4[kg_start * cols_per_gpu + col_in_partition];
+
+    unsigned int kg = kg_start;
+    unsigned int kg_end_even = kg_start + ((kg_end - kg_start) & ~1u);
+
+    for (; kg < kg_end_even; kg += 2) {
+        unsigned int packed0 = B_q4[kg * cols_per_gpu + col_in_partition];
+        unsigned int packed1 = B_q4[(kg + 1) * cols_per_gpu + col_in_partition];
+
+        unsigned int g0 = kg >> gps_log2;
+        if (g0 != current_group) {
+            cur_scale = __half2float(scales[g0 * cols_per_gpu + col_in_partition]);
+            cur_zero  = __half2float(zeros[g0 * cols_per_gpu + col_in_partition]);
+            current_group = g0;
+        }
+        gemv_acc += dequant_dot_fp32(packed0, cur_scale, cur_zero, A, kg << 3);
+
+        unsigned int g1 = (kg + 1) >> gps_log2;
+        if (g1 != current_group) {
+            cur_scale = __half2float(scales[g1 * cols_per_gpu + col_in_partition]);
+            cur_zero  = __half2float(zeros[g1 * cols_per_gpu + col_in_partition]);
+            current_group = g1;
+        }
+        gemv_acc += dequant_dot_fp32(packed1, cur_scale, cur_zero, A, (kg + 1) << 3);
     }
-    
-    for (unsigned int kg = kg_start; kg < kg_end; kg++) {
-        unsigned int next_group = kg >> gps_log2;
-        if (next_group != current_group) {
-            cur_scale = __half2float(scales[next_group * cols_per_gpu + col_in_partition]);
-            cur_zero  = __half2float(zeros[next_group * cols_per_gpu + col_in_partition]);
-            current_group = next_group;
+
+    if (kg < kg_end) {
+        unsigned int packed = B_q4[kg * cols_per_gpu + col_in_partition];
+        unsigned int g = kg >> gps_log2;
+        if (g != current_group) {
+            cur_scale = __half2float(scales[g * cols_per_gpu + col_in_partition]);
+            cur_zero  = __half2float(zeros[g * cols_per_gpu + col_in_partition]);
         }
-        
-        gemv_acc += dequant_fdot2(packed, cur_scale, cur_zero, A, kg << 3);
-        
-        if (kg + 1 < kg_end) {
-            packed = B_q4[(kg + 1) * cols_per_gpu + col_in_partition];
-        }
+        gemv_acc += dequant_dot_fp32(packed, cur_scale, cur_zero, A, kg << 3);
     }
 
     // Phase 1b: DPP reduction
