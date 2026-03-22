@@ -1,0 +1,31 @@
+{
+  "featureId": "fix-ctypes-struct-mismatch",
+  "reviewedAt": "2026-03-22T02:00:00.000Z",
+  "commitId": "436b709",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "The fix correctly addresses the critical ctypes struct mismatch between Python and C. The worker added the missing `gemv_qkv_fused` field to the Python CEngineLayerSpec class in the correct position (between `gemv_kv_fused` and `qknorm_q`) to match the C struct field order exactly. Struct sizes now match at 1104 bytes each. The fix was validated on the dev server with the benchmark showing 56+ tok/s (exceeds 53 tok/s target), confirming C dispatch is active with no fallback to Python dispatch.",
+    "issues": []
+  },
+  "sharedStateObservations": [
+    {
+      "area": "conventions",
+      "observation": "The original fused-qkv-kernel feature (commit 79ec40a) modified the C CEngineLayerSpec struct in c_dispatch.c but forgot to update the Python ctypes mirror in tp_engine.py, causing a 56-byte struct size mismatch. This pattern (C struct modified without Python ctypes update) has occurred before and should be documented as an explicit rule.",
+      "evidence": "Commit 79ec40a added `CKernelSpec gemv_qkv_fused` to c_dispatch.c line 213 but did not add the corresponding field to Python CEngineLayerSpec in tp_engine.py. The scrutiny validator (e6b3cce) caught this with debug_struct_sizes.py showing C=1104, Python=1048 bytes."
+    },
+    {
+      "area": "skills",
+      "observation": "The worker followed the gpu-kernel-worker skill procedure correctly. The skill's procedure appears adequate for this type of fix.",
+      "evidence": "handoff.skillFeedback.followedProcedure = true, no deviations reported."
+    },
+    {
+      "area": "knowledge",
+      "observation": "The debug_struct_sizes.py test created by the scrutiny validator and enhanced by this fix worker is a valuable debugging tool that should be kept in the codebase for future struct mismatch detection.",
+      "evidence": "tests/debug_struct_sizes.py now provides automated verification of Python/C struct size match, with exit code 0 on success and 1 on mismatch."
+    }
+  ],
+  "addressesFailureFrom": ".factory/validation/dispatch-reduction/scrutiny/synthesis.json (round 1, fused-qkv-kernel failure)",
+  "summary": "PASS: The fix correctly resolves the ctypes struct mismatch. The Python CEngineLayerSpec now includes `gemv_qkv_fused` field in the correct position, matching the C struct exactly at 1104 bytes. Benchmark validates 56+ tok/s throughput with C dispatch active. No code issues found."
+}
