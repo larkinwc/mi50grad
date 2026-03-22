@@ -1,0 +1,50 @@
+{
+  "milestone": "dispatch-reduction",
+  "round": 1,
+  "status": "fail",
+  "validatorsRun": {
+    "test": {
+      "passed": false,
+      "command": "ssh root@192.168.1.198 'docker run ... python3 tests/bench_e2e_v7.py'",
+      "exitCode": 0,
+      "observation": "Test runs but C dispatch fails with CEngineLayerSpec size mismatch: Python=1048, C=1104. System falls back to cached+stream dispatch at ~15 tok/s instead of expected ~54 tok/s."
+    },
+    "typecheck": {
+      "passed": true,
+      "command": "N/A (no typecheck tool available)",
+      "exitCode": 0,
+      "observation": "No typecheck tool configured for this project"
+    },
+    "lint": {
+      "passed": true,
+      "command": "N/A (no lint tool available)",
+      "exitCode": 0,
+      "observation": "No lint tool configured for this project"
+    }
+  },
+  "reviewsSummary": {
+    "total": 2,
+    "passed": 1,
+    "failed": 1,
+    "failedFeatures": ["fused-qkv-kernel"]
+  },
+  "blockingIssues": [
+    {
+      "featureId": "fused-qkv-kernel",
+      "severity": "blocking",
+      "description": "Python ctypes CEngineLayerSpec struct is missing gemv_qkv_fused field. C struct has 18 CKernelSpec fields (including gemv_qkv_fused) totaling 1104 bytes, but Python struct has 17 CKernelSpec fields totaling 1048 bytes. This causes C dispatch to fail with 'CEngineLayerSpec size mismatch' error, falling back to slow Python dispatch path (~15 tok/s vs expected ~54 tok/s).",
+      "suggestedFix": "Add ('gemv_qkv_fused', CKernelSpec) field to Python CEngineLayerSpec class in tp_engine.py between gemv_kv_fused and qknorm_q fields (line ~5408). The field order must match the C struct exactly: attn_rmsnorm, gemv_q_fused, gemv_kv_fused, gemv_qkv_fused, qknorm_q, ..."
+    }
+  ],
+  "appliedUpdates": [],
+  "suggestedGuidanceUpdates": [
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add rule: When modifying C structs that have Python ctypes mirrors, workers must update BOTH the C struct and the Python struct definition in the same commit.",
+      "evidence": "fused-qkv-kernel worker added gemv_qkv_fused to c_dispatch.c CEngineLayerSpec but forgot to add it to tp_engine.py CEngineLayerSpec, causing critical struct size mismatch.",
+      "isSystemic": false
+    }
+  ],
+  "rejectedObservations": [],
+  "previousRound": null
+}
