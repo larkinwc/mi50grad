@@ -118,3 +118,38 @@ ssh root@192.168.1.198 'docker run --rm --device=/dev/kfd --device=/dev/dri --gr
 **Frictions Found:**
 - test_gemv_qkv_fused_isolate.py uses deprecated GPUDevice.upload() API
 - bench_current_state.py is slow (>5 min), prefer bench_e2e_v7.py for quick validation
+
+## Validation Results: bandwidth-optimization milestone
+
+### Round 1 (2026-03-22)
+
+**Status: FAIL** (1/4 assertions passed)
+
+| Assertion | Status | Evidence |
+|-----------|--------|----------|
+| VAL-BW-001 | PASS | set_weight_prefetch method exists, prefetch mechanism can be enabled/disabled |
+| VAL-BW-002 | FAIL | Weight prefetch REDUCES throughput by 5.62 tok/s (-10%), from 56.25 to 50.63 tok/s |
+| VAL-BW-003 | FAIL | Cosine similarity 0.58-0.88 (min 0.58), far below 0.999 threshold |
+| VAL-CROSS-001 | FAIL | 52.24 tok/s with prefetch enabled, below 53.0 baseline threshold |
+
+**Critical Bug Found:**
+The weight prefetch implementation uses `hipMemcpyAsync(dst=src)` which is NOT a valid prefetch mechanism on gfx906. This causes:
+1. Memory corruption leading to incorrect numerical output (cosine_sim as low as 0.58)
+2. Performance regression instead of improvement (-10% throughput)
+
+**Suggested Fix:**
+Replace hipMemcpyAsync with a proper prefetch mechanism:
+- `hipMemPrefetchAsync` for unified memory (if using managed memory)
+- Copy to a separate scratch buffer and discard
+- `hipMemAdvise` with `hipMemAdviseSetReadMostly`
+- Or simply remove the prefetch code and keep it disabled until a working solution is found
+
+**Test Script:**
+```bash
+ssh root@192.168.1.198 'docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video -e HIP_VISIBLE_DEVICES=0,1,2,3 -v /opt/mi50grad:/opt/mi50grad -v /opt/models:/opt/models mi50grad bash -c "cd /opt/mi50grad && python3 tests/val_bandwidth_optimization.py"'
+```
+
+**Measurements:**
+- Baseline without prefetch: 56.25 tok/s
+- With prefetch enabled: 50.63 tok/s (-5.62 tok/s, -10%)
+- Correctness: cosine_sim 0.58-0.88 (expected >= 0.999)
