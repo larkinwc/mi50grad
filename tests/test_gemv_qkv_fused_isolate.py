@@ -12,7 +12,7 @@ import numpy as np
 sys.path.insert(0, '/opt/mi50grad')
 
 from src.runtime.hip_dispatch import GPUDevice
-from src.model.qwen import QwenConfig
+from src.model.qwen import load_config_from_json
 from src.inference.engine import InferenceEngine
 
 def test_fused_qkv_correctness():
@@ -23,7 +23,7 @@ def test_fused_qkv_correctness():
     
     # Load config
     MODEL_DIR = "/opt/models/Qwen3.5-27B-GPTQ-Int4"
-    config = QwenConfig.from_pretrained(MODEL_DIR)
+    config = load_config_from_json(MODEL_DIR)
     
     # Create engine for TP=4
     tp_size = 4

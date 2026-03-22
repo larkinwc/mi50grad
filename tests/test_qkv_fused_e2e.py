@@ -11,7 +11,7 @@ import sys
 import numpy as np
 sys.path.insert(0, '/opt/mi50grad')
 
-from src.model.qwen import QwenConfig
+from src.model.qwen import load_config_from_json
 from src.inference.tp_engine import TPInferenceEngine
 from src.model.weight_loader import QwenWeightLoader
 
@@ -22,7 +22,7 @@ def test_e2e_correctness():
     print("=" * 70)
     
     MODEL_DIR = "/opt/models/Qwen3.5-27B-GPTQ-Int4"
-    config = QwenConfig.from_pretrained(MODEL_DIR)
+    config = load_config_from_json(MODEL_DIR)
     
     # Create TP engine
     print("\nInitializing TP=4 engine...")
