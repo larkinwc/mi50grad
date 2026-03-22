@@ -1,0 +1,84 @@
+{
+  "milestone": "speculative-tree",
+  "round": 1,
+  "status": "fail",
+  "validatorsRun": {
+    "test": { "passed": true, "command": "ssh dev server: tests/test_tree_*.py", "exitCode": 0 },
+    "typecheck": { "passed": true, "command": "python3 -m py_compile src/inference/tree_*.py", "exitCode": 0 },
+    "lint": { "passed": true, "command": "N/A (no linting tools configured)", "exitCode": 0 }
+  },
+  "reviewsSummary": {
+    "total": 3,
+    "passed": 1,
+    "failed": 2,
+    "failedFeatures": ["tree-attention-infrastructure", "ngram-tree-integration"]
+  },
+  "blockingIssues": [
+    {
+      "featureId": "tree-attention-infrastructure",
+      "severity": "blocking",
+      "description": "decode_step_tree() falls back to standard causal attention instead of using tree attention mask. The TODO comment at line 3186 acknowledges this is incomplete."
+    },
+    {
+      "featureId": "tree-attention-infrastructure",
+      "severity": "blocking",
+      "description": "flash_attn_tree.hip kernel is written but NOT compiled or integrated. Without this, tree attention cannot actually be used."
+    },
+    {
+      "featureId": "tree-attention-infrastructure",
+      "severity": "blocking",
+      "description": "Attention seq_len calculation (kv_len + tree_idx + 1) is incorrect for tree attention - gives causal attention, not ancestor-only attention."
+    },
+    {
+      "featureId": "ngram-tree-integration",
+      "severity": "blocking",
+      "description": "Validation uses MockEngine with time.sleep() simulated timing instead of real GPU execution. Cannot verify VAL-SPEC-005 (throughput improvement) with mock benchmarks."
+    },
+    {
+      "featureId": "ngram-tree-integration",
+      "severity": "blocking",
+      "description": "No integration with DP tree optimizer. Feature description requires 'Use the DP-optimal tree topology from tree_optimizer' but implementation only has hardcoded topologies."
+    },
+    {
+      "featureId": "ngram-tree-integration",
+      "severity": "blocking",
+      "description": "Mock-specific acceptance workaround at tree_speculative.py:276 forces acceptance when logits are small, artificially inflating acceptance rates."
+    }
+  ],
+  "nonBlockingIssues": [
+    {
+      "featureId": "tree-attention-infrastructure",
+      "description": "RoPE positions hardcoded to 0 for all tree nodes"
+    },
+    {
+      "featureId": "tree-dp-optimizer",
+      "description": "Naming collision: two classes named TreeTopology exist in tree_optimizer.py and tree_attention.py with different interfaces"
+    },
+    {
+      "featureId": "ngram-tree-integration",
+      "description": "generate() method doesn't update KV cache after accepting tokens"
+    }
+  ],
+  "appliedUpdates": [],
+  "suggestedGuidanceUpdates": [
+    {
+      "target": "AGENTS.md",
+      "suggestion": "Add boundary: gpu-kernel-worker features MUST run actual GPU validation on dev server before marking complete. Mock-based tests are insufficient for features that specify throughput or correctness requirements.",
+      "evidence": "Two features (tree-attention-infrastructure, ngram-tree-integration) skipped GPU execution. Both had validation requirements specifying real throughput measurements and correctness verification that cannot be satisfied with mocks.",
+      "isSystemic": true
+    },
+    {
+      "target": "gpu-kernel-worker skill",
+      "suggestion": "Strengthen Step 5-6 (dev server deployment/testing) to require actual GPU execution output in handoff.verification.commandsRun, not just mock test results.",
+      "evidence": "Workers completed 'Deploy and build on dev server' steps but then ran mock-based tests locally instead of actual GPU benchmarks. The skill should explicitly require GPU execution evidence.",
+      "isSystemic": true
+    }
+  ],
+  "rejectedObservations": [
+    {
+      "observation": "Add naming convention to avoid duplicate class names across modules",
+      "reason": "Too prescriptive - the TreeTopology naming collision is specific to this domain where both modules legitimately use the term. Better handled case-by-case."
+    }
+  ],
+  "previousRound": null
+}
