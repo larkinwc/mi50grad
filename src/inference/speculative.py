@@ -118,6 +118,114 @@ class NgramCache:
     def clear(self):
         """Clear the n-gram cache."""
         self.trie = {}
+    
+    def generate_tree_drafts(self,
+                             context: List[int],
+                             max_tree_size: int = 7,
+                             max_depth: int = 2,
+                             branching_factor: int = 2) -> Dict:
+        """Generate tree-structured draft tokens from n-gram cache.
+        
+        Builds a tree where each node is a draft token, and edges represent
+        possible continuations. Uses BFS to explore n-gram matches.
+        
+        Args:
+            context: Current token context
+            max_tree_size: Maximum total nodes in tree
+            max_depth: Maximum tree depth
+            branching_factor: Max children per node
+            
+        Returns:
+            Dict with tree structure:
+            - 'nodes': List of {id, token_id, parent_id, depth, children_ids}
+            - 'root_id': Root node index (always 0)
+            - 'size': Total nodes
+            - 'max_depth': Actual max depth reached
+        """
+        if len(context) < self.n - 1:
+            # Not enough context - return minimal tree
+            return {
+                'nodes': [{'id': 0, 'token_id': context[-1] if context else 0,
+                          'parent_id': None, 'depth': 0, 'children_ids': []}],
+                'root_id': 0,
+                'size': 1,
+                'max_depth': 0,
+            }
+        
+        # Update cache with recent context
+        window_start = max(0, len(context) - self.n * 2)
+        self.build_from_sequence(context[window_start:])
+        
+        nodes = []
+        node_id = 0
+        
+        # Root node: first n-gram match
+        root_candidates = self.query(context)
+        if root_candidates is None or len(root_candidates) == 0:
+            # No match - use last token as root
+            root_token = context[-1] if context else 0
+        else:
+            root_token = root_candidates[0]
+        
+        root = {
+            'id': node_id,
+            'token_id': root_token,
+            'parent_id': None,
+            'depth': 0,
+            'children_ids': [],
+            'context': context.copy()
+        }
+        nodes.append(root)
+        node_id += 1
+        
+        # BFS queue: (parent_node_index, depth)
+        queue = [(0, 0)]
+        max_depth_reached = 0
+        
+        while queue and len(nodes) < max_tree_size:
+            parent_idx, depth = queue.pop(0)
+            parent = nodes[parent_idx]
+            
+            if depth >= max_depth:
+                continue
+            
+            # Get candidates for parent's context
+            parent_context = parent['context'] + [parent['token_id']]
+            candidates = self.query(parent_context)
+            
+            if candidates is None:
+                continue
+            
+            # Add children
+            for candidate in candidates[:branching_factor]:
+                if len(nodes) >= max_tree_size:
+                    break
+                
+                child = {
+                    'id': node_id,
+                    'token_id': candidate,
+                    'parent_id': parent_idx,
+                    'depth': depth + 1,
+                    'children_ids': [],
+                    'context': parent_context.copy()
+                }
+                nodes.append(child)
+                parent['children_ids'].append(node_id)
+                node_id += 1
+                
+                queue.append((child['id'], depth + 1))
+                max_depth_reached = max(max_depth_reached, depth + 1)
+        
+        # Remove context from returned nodes (not needed for downstream)
+        for node in nodes:
+            del node['context']
+        
+        return {
+            'nodes': nodes,
+            'root_id': 0,
+            'size': len(nodes),
+            'max_depth': max_depth_reached,
+        }
 
 
 def speculative_decode(generator,
