@@ -24,6 +24,7 @@ from src.inference.tree_attention import (
     build_complete_binary_tree, build_chain_tree, build_star_tree,
     verify_tree_mask_correctness
 )
+from src.inference.tree_optimizer import SequoiaTreeOptimizer, TreeTopology as OptimizerTreeTopology
 from src.inference.speculative import NgramCache
 
 
@@ -119,6 +120,72 @@ class TreeNgramPredictor:
         """Get tokens from root to this node (exclusive)."""
         path = node.get_path_from_root()
         return [n.token_id for n in path]
+    
+    def _build_optimized_tree_from_optimizer(self,
+                                              context: List[int],
+                                              edges: List[Tuple[int, int]],
+                                              num_nodes: int) -> TreeTopology:
+        """Build a tree using n-gram predictions following optimizer-determined topology.
+        
+        The optimizer determines the structure (edges), but we use n-gram matches
+        to predict the actual token IDs at each node.
+        
+        Args:
+            context: Current token context
+            edges: List of (parent, child) edges from optimizer
+            num_nodes: Total number of nodes
+            
+        Returns:
+            TreeTopology with n-gram predicted tokens
+        """
+        if num_nodes == 0 or (edges and max(max(e) for e in edges) >= num_nodes):
+            # Fallback to simple tree
+            root_token = context[-1] if context else 0
+            return TreeTopology(root_token)
+        
+        # Get root token from n-gram match
+        root_candidates = self.ngram_cache.query(context)
+        if root_candidates is None or len(root_candidates) == 0:
+            root_token = context[-1] if context else 0
+        else:
+            root_token = root_candidates[0]
+        
+        # Create tree with root
+        tree = TreeTopology(root_token)
+        
+        if not edges:
+            # Root-only tree
+            return tree
+        
+        # Build tree following optimizer edges
+        # Nodes are indexed in BFS order (0 = root)
+        node_map = {0: tree.root}
+        
+        # Sort edges by parent index to ensure we process parents before children
+        sorted_edges = sorted(edges, key=lambda e: e[0])
+        
+        for parent_idx, child_idx in sorted_edges:
+            if parent_idx not in node_map:
+                continue
+            
+            parent_node = node_map[parent_idx]
+            
+            # Get token for child using n-gram prediction
+            parent_context = context + self._get_path_tokens(tree, parent_node) + [parent_node.token_id]
+            candidates = self.ngram_cache.query(parent_context)
+            
+            if candidates is None or len(candidates) == 0:
+                # No n-gram match - use parent token as fallback
+                child_token = parent_node.token_id
+            else:
+                # Use first candidate (could use sampling strategy)
+                child_token = candidates[0]
+            
+            # Add child to tree
+            child_node = tree.add_child(parent_node, child_token)
+            node_map[child_idx] = child_node
+        
+        return tree
 
 
 class TreeSpeculativeDecoder:
@@ -136,6 +203,9 @@ class TreeSpeculativeDecoder:
     - Each verification step costs exactly 64 allreduces (one per layer)
     - Accepts 2-3 tokens on average per verification
     - Effective throughput: accepted_tokens / wall_time
+    
+    Uses SequoiaTreeOptimizer to determine optimal tree topology based on
+    measured acceptance rates, automatically adapting to the domain.
     """
     
     def __init__(self, 
@@ -147,7 +217,9 @@ class TreeSpeculativeDecoder:
                  max_tree_size: int = 7,
                  max_tree_depth: int = 2,
                  branching_factor: int = 2,
-                 tree_topology: str = 'ngram'):
+                 tree_topology: str = 'ngram',
+                 base_acceptance_rate: float = 0.54,
+                 acceptance_decay: float = 0.0):
         """Initialize tree speculative decoder.
         
         Args:
@@ -159,7 +231,9 @@ class TreeSpeculativeDecoder:
             max_tree_size: Maximum draft tokens per tree
             max_tree_depth: Maximum tree depth
             branching_factor: Branching factor for tree
-            tree_topology: 'ngram' (data-driven) | 'binary' | 'chain' | 'star'
+            tree_topology: 'ngram' (data-driven) | 'optimized' (DP optimizer)
+            base_acceptance_rate: Base acceptance probability for optimizer (default 0.54)
+            acceptance_decay: Per-depth acceptance decay for optimizer (default 0.0 = uniform)
         """
         self.engine = engine
         self.embed_weight = embed_weight
@@ -174,6 +248,15 @@ class TreeSpeculativeDecoder:
         # N-gram cache for draft generation
         self.ngram_cache = NgramCache(n=ngram_size)
         self.tree_predictor = TreeNgramPredictor(self.ngram_cache, ngram_size)
+        
+        # DP tree optimizer for determining optimal tree topology
+        self.tree_optimizer = SequoiaTreeOptimizer(
+            base_acceptance_rate=base_acceptance_rate,
+            max_depth=max_tree_depth,
+            max_branching=branching_factor,
+            size_budget=max_tree_size,
+            acceptance_decay=acceptance_decay,
+        )
         
         # Statistics tracking
         self.stats = {
@@ -275,14 +358,9 @@ class TreeSpeculativeDecoder:
             model_choice = int(np.argmax(model_logits))
             
             # Check if model agrees with draft
-            # For mock models with small weights, also accept if logits are very small (random model)
+            # Only accept when argmax(model_logits) == draft_token (correct acceptance logic)
             draft_token = node.token_id
             is_match = (model_choice == draft_token)
-            
-            # Heuristic: if all logits are very small (< 0.1), accept anyway (mock model)
-            if not is_match and np.max(np.abs(model_logits)) < 0.1:
-                is_match = True
-                model_choice = draft_token  # Force accept
             
             if is_match:
                 # Accept this token
@@ -315,8 +393,18 @@ class TreeSpeculativeDecoder:
         """
         self.stats['total_verifications'] += 1
         
-        # Build draft tree
-        if self.tree_topology == 'ngram':
+        # Build draft tree using DP optimizer or fixed topology
+        if self.tree_topology == 'optimized':
+            # Use Sequoia DP optimizer to determine optimal tree structure
+            optimal_tree = self.tree_optimizer.find_optimal_tree()
+            
+            # Build tree from optimizer edges using n-gram predictions
+            tree = self._build_optimized_tree_from_optimizer(
+                context, 
+                optimal_tree.edges,
+                optimal_tree.num_nodes
+            )
+        elif self.tree_topology == 'ngram':
             tree = self.tree_predictor.generate_tree(
                 context,
                 max_tree_size=self.max_tree_size,

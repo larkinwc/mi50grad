@@ -1,17 +1,20 @@
 """
-Benchmark script for tree-based speculative decoding.
+Benchmark script for tree-based speculative decoding with REAL TPInferenceEngine.
 
 Measures:
 1. Effective throughput: accepted_tokens / wall_time
 2. Acceptance rate per verification step (target: >= 2.0)
 3. Speedup vs baseline (~54 tok/s for TP=4)
 4. Allreduce efficiency: 64 calls per verification regardless of tree size
+5. Correctness: output matches greedy decode
 
-Usage:
+Usage (on dev server with 4x MI50):
+    cd /opt/mi50grad
     python3 tests/bench_tree_speculative.py
     
     # With custom parameters
     python3 tests/bench_tree_speculative.py --max-tokens 100 --tree-size 7 --num-runs 5
+    python3 tests/bench_tree_speculative.py --tree-topology optimized
 """
 
 import argparse
@@ -20,103 +23,81 @@ import time
 import sys
 from pathlib import Path
 from typing import Dict, Any
+import numpy as np
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.inference.tree_speculative import TreeSpeculativeDecoder
 from src.inference.speculative import NgramCache
+from src.model.qwen import load_config_from_json
+from src.inference.tp_engine import TPInferenceEngine
+from src.model.weight_loader import QwenWeightLoader
+
+MODEL_DIR = "/opt/models/Qwen3.5-27B-GPTQ-Int4"
 
 
-# ============================================================================
-# Mock Components for Infrastructure Testing
-# ============================================================================
-
-class MockTokenizer:
-    """Simple character-level tokenizer for testing."""
-    
-    def __init__(self):
-        self.eos_token_id = 0
-    
-    def encode(self, text: str):
-        """Encode text to token IDs (simple char-level)."""
-        return [ord(c) % 256 for c in text]
-    
-    def decode(self, tokens):
-        """Decode token IDs to text."""
-        return ''.join(chr(t) for t in tokens)
-
-
-class MockEngine:
-    """Mock TP engine for benchmarking tree speculative infrastructure."""
-    
-    def __init__(self, hidden_size: int = 5120, num_layers: int = 64):
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.config = type('Config', (), {
-            'hidden_size': hidden_size,
-            'num_hidden_layers': num_layers,
-        })()
-        
-        # Track allreduce calls
-        self.total_allreduce_calls = 0
-        self.decode_step_tree_calls = 0
-        self.step_allreduce_calls = 0  # Reset per step
-    
-    def decode_step_tree(self, 
-                         token_embeddings,
-                         tree_mask,
-                         kv_embeddings=None):
-        """Mock tree decode step with realistic timing."""
-        self.decode_step_tree_calls += 1
-        self.step_allreduce_calls = self.num_layers  # 64 per call (reset for this step)
-        self.total_allreduce_calls += self.num_layers
-        
-        tree_size = len(token_embeddings)
-        
-        # Simulate compute time (proportional to tree size)
-        # Base: 18.5ms for single token, +0.5ms per additional tree token
-        compute_time_ms = 18.5 + (tree_size - 1) * 0.5
-        
-        # Simulate allreduce time: 64 calls × 79us = 5.06ms
-        allreduce_time_ms = 64 * 0.079
-        
-        # Total simulated time
-        time.sleep((compute_time_ms + allreduce_time_ms) / 1000.0)
-        
-        # Return mock outputs
-        import numpy as np
-        outputs = []
-        for i in range(tree_size):
-            # Make output correlated with input embedding for deterministic behavior
-            out = token_embeddings[i].copy().astype(np.float16)
-            outputs.append(out)
-        
-        return outputs
-
-
-def create_mock_decoder(max_tree_size: int = 7,
+def create_real_decoder(max_tree_size: int = 7,
                         max_tree_depth: int = 2,
-                        branching_factor: int = 2) -> TreeSpeculativeDecoder:
-    """Create TreeSpeculativeDecoder with mock components."""
-    import numpy as np
+                        branching_factor: int = 2,
+                        tree_topology: str = 'ngram',
+                        base_acceptance_rate: float = 0.54) -> TreeSpeculativeDecoder:
+    """Create TreeSpeculativeDecoder with real TPInferenceEngine.
     
-    engine = MockEngine(hidden_size=128, num_layers=64)
-    vocab_size = 1000
-    embed_weight = np.random.randn(vocab_size, 128).astype(np.float16) * 0.01
-    lm_head_weight = np.random.randn(vocab_size, 128).astype(np.float16) * 0.01
-    tokenizer = MockTokenizer()
+    Loads the full model on 4x MI50 GPUs.
+    """
+    print("Loading model and TP engine...")
+    config = load_config_from_json(MODEL_DIR)
+    
+    # Create TP engine on all 4 GPUs
+    tp_engine = TPInferenceEngine(config, device_ids=[0, 1, 2, 3], max_seq_len=512)
+    
+    # Load weights
+    loader = QwenWeightLoader(MODEL_DIR, config)
+    for layer_idx in range(config.num_hidden_layers):
+        if layer_idx % 8 == 0:
+            print(f"  Loading layer {layer_idx}/{config.num_hidden_layers}...")
+        tp_engine.load_layer_weights(layer_idx, loader.load_layer(layer_idx))
+    
+    print("  Loading final norm and lm_head...")
+    tp_engine.load_final_norm(loader.load_final_norm())
+    lm_head_weight = loader.load_lm_head()
+    
+    # Configure engine
+    tp_engine.build_dispatch_cache()
+    tp_engine.set_direct_kv_write(True)
+    tp_engine.set_c_dispatch(True)
+    tp_engine.set_kernel_p2p_allreduce(True)
+    tp_engine.set_deferred_attention_ar(True)
+    
+    print("Model loaded successfully.")
+    
+    # Extract lm_head weight for decoder
+    lm_head_np = lm_head_weight.copy()
+    
+    # Get embed weight from first GPU
+    embed_weight = tp_engine.engines[0]._embed_weight.copy()
+    
+    # Try to load tokenizer
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+        print("Tokenizer loaded successfully.")
+    except Exception as e:
+        print(f"Warning: Could not load tokenizer ({e}). Using token IDs directly.")
+        tokenizer = None
     
     decoder = TreeSpeculativeDecoder(
-        engine=engine,
+        engine=tp_engine,
         embed_weight=embed_weight,
-        lm_head_weight=lm_head_weight,
+        lm_head_weight=lm_head_np,
         tokenizer=tokenizer,
         ngram_size=3,
         max_tree_size=max_tree_size,
         max_tree_depth=max_tree_depth,
         branching_factor=branching_factor,
-        tree_topology='ngram',
+        tree_topology=tree_topology,
+        base_acceptance_rate=base_acceptance_rate,
     )
     
     return decoder
@@ -158,7 +139,14 @@ def benchmark_effective_throughput(decoder: TreeSpeculativeDecoder,
         print(f"  Tree topology: {decoder.tree_topology}")
         print(f"  Max tree size: {decoder.max_tree_size}")
     
-    input_ids = decoder.tokenizer.encode(prompt)
+    # Encode prompt - use tokenizer if available, otherwise work with token IDs directly
+    if decoder.tokenizer is not None:
+        input_ids = decoder.tokenizer.encode(prompt)
+    else:
+        # Fallback: convert prompt to simple token IDs (ord values)
+        # This is for testing only - real usage should have a tokenizer
+        input_ids = [ord(c) % 1000 for c in prompt]
+        print(f"  Warning: No tokenizer - using character-level encoding")
     
     all_stats = []
     total_wall_time = 0.0
@@ -247,7 +235,11 @@ def benchmark_allreduce_efficiency(decoder: TreeSpeculativeDecoder,
     print(f"BENCHMARK: Allreduce Efficiency")
     print(f"{'='*60}")
     
-    input_ids = decoder.tokenizer.encode(prompt)
+    # Encode prompt
+    if decoder.tokenizer is not None:
+        input_ids = decoder.tokenizer.encode(prompt)
+    else:
+        input_ids = [ord(c) % 1000 for c in prompt]
     decoder.ngram_cache.build_from_sequence(input_ids)
     
     context = input_ids.copy()
@@ -290,14 +282,16 @@ def benchmark_allreduce_efficiency(decoder: TreeSpeculativeDecoder,
 def run_full_benchmark(args):
     """Run complete benchmark suite."""
     print("\n" + "="*70)
-    print("TREE SPECULATIVE DECODING - FULL BENCHMARK SUITE")
+    print("TREE SPECULATIVE DECODING - FULL BENCHMARK SUITE (REAL ENGINE)")
     print("="*70)
     
-    # Create decoder
-    decoder = create_mock_decoder(
+    # Create decoder with real TPInferenceEngine
+    decoder = create_real_decoder(
         max_tree_size=args.tree_size,
         max_tree_depth=args.tree_depth,
         branching_factor=args.branching,
+        tree_topology=args.tree_topology,
+        base_acceptance_rate=args.base_acceptance_rate,
     )
     
     # Select prompt
@@ -385,6 +379,11 @@ def main():
                        help='Maximum tree depth (default: 2)')
     parser.add_argument('--branching', type=int, default=2,
                        help='Branching factor (default: 2)')
+    parser.add_argument('--tree-topology', type=str, default='ngram',
+                       choices=['ngram', 'optimized', 'binary', 'chain', 'star'],
+                       help='Tree topology strategy (default: ngram)')
+    parser.add_argument('--base-acceptance-rate', type=float, default=0.54,
+                       help='Base acceptance rate for optimizer (default: 0.54)')
     parser.add_argument('--num-runs', type=int, default=3,
                        help='Number of benchmark runs')
     parser.add_argument('--prompt', type=str, default=None,
