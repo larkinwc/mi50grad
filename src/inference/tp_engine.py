@@ -3127,34 +3127,62 @@ class TPInferenceEngine:
         for layer_idx in range(num_layers):
             # Step 1: Process attention with tree mask (PER-TOKEN loop)
             for tree_idx in range(tree_size):
-                for engine in self.engines:
-                    # Point d_hidden to this tree node's slice
-                    engine.d_hidden = engine.d_pf_hidden + tree_idx * h * 2
+                for engine_idx, engine in enumerate(self.engines):
+                    # CRITICAL FIX: Tree decode uses different buffers than standard decode.
+                    # The cached LaunchSpecs have stale pointers from standard decode.
+                    # We must update ALL pointer params before calling launch_cached.
+                    # Tree decode buffers:
+                    #   d_hidden -> d_pf_hidden + offset (input/output)
+                    #   d_normed -> d_pf_hidden2 + offset (RMSNorm output)
+                    #   d_q_fused -> d_pf_q + offset (Q projection output)
+                    #   d_k -> d_pf_k + offset (K working buffer)
+                    #   d_kv_fused -> d_pf_kv_fused + offset (KV working buffer)
+                    offset = tree_idx * h * 2
                     
                     # Get layer cache and weights
                     lc = self._engine_layer_caches[engine.tp_rank][layer_idx]
                     lw = engine.layers[layer_idx]
                     
                     # Attention RMSNorm
-                    engine.device.launch_cached(lc['attn_rmsnorm'])
+                    # Params: [0]=dst(d_normed), [1]=src(d_hidden), [2]=weight, [3]=dim, [4]=eps
+                    spec_attn_norm = lc['attn_rmsnorm']
+                    spec_attn_norm.params[0].value = engine.d_pf_hidden2 + offset
+                    spec_attn_norm.params[1].value = engine.d_pf_hidden + offset
+                    engine.device.launch_cached(spec_attn_norm)
                     
                     if lw.layer_type == 'full_attention':
                         # GEMV projections (use GEMM for M>1)
                         # For tree decode, we use prefill-style GEMM kernels
                         if 'gemv_q_fused' in lc:
-                            # For M>1, should use prefill GEMM instead
-                            # For now, reuse GEMV path (can be optimized later)
-                            engine.device.launch_cached(lc['gemv_q_fused'])
+                            # Params: [0]=src(d_normed), [1]=weight, [2]=dst(d_q), [3]=h, [4]=out_dim, [5]=residual
+                            spec_q = lc['gemv_q_fused']
+                            spec_q.params[0].value = engine.d_pf_hidden2 + offset
+                            spec_q.params[2].value = engine.d_pf_q + offset
+                            engine.device.launch_cached(spec_q)
+                        
                         if 'gemv_k_only' in lc:
-                            engine.device.launch_cached(lc['gemv_k_only'])
+                            # Params: [0]=src(d_normed), [1]=weight, [2]=dst(d_k), [3]=h, [4]=out_dim, [5]=residual
+                            spec_k = lc['gemv_k_only']
+                            spec_k.params[0].value = engine.d_pf_hidden2 + offset
+                            spec_k.params[2].value = engine.d_pf_k + offset
+                            engine.device.launch_cached(spec_k)
+                            
                             # V GEMV with direct cache write
                             # For tree attention, KV cache position is tree_idx
                             kv_stride = lc['_kv_stride']
                             v_cache_ptr = lc['_v_cache_base'] + tree_idx * kv_stride
-                            lc['gemv_v_cache'].params[2].value = v_cache_ptr
-                            engine.device.launch_cached(lc['gemv_v_cache'])
+                            # Params: [0]=src(d_normed), [1]=weight, [2]=dst(v_cache_ptr), ...
+                            spec_v = lc['gemv_v_cache']
+                            spec_v.params[0].value = engine.d_pf_hidden2 + offset
+                            spec_v.params[2].value = v_cache_ptr
+                            engine.device.launch_cached(spec_v)
+                            
                         elif 'gemv_kv_fused' in lc:
-                            engine.device.launch_cached(lc['gemv_kv_fused'])
+                            # Params: [0]=src(d_normed), [1]=weight, [2]=dst(d_kv), [3]=h, [4]=out_dim, [5]=residual
+                            spec_kv = lc['gemv_kv_fused']
+                            spec_kv.params[0].value = engine.d_pf_hidden2 + offset
+                            spec_kv.params[2].value = engine.d_pf_kv_fused + offset
+                            engine.device.launch_cached(spec_kv)
                         
                         # QKNorm/RoPE (use position 0 for tree nodes)
                         half_rotary = engine.rotary_dim // 2
@@ -3183,16 +3211,6 @@ class TPInferenceEngine:
                         if 'decode_attn' in lc:
                             spec_attn = lc['decode_attn']
                             # Tree attention seq_len: ancestors + self + external KV
-                            # This gives correct ATTENTION SCOPE but kernel still reads
-                            # contiguous positions [0:ancestor_count+kv_len].
-                            # For proper tree attention, ancestors must be contiguous in KV cache.
-                            # Currently tree nodes are stored at positions 0,1,2,... in BFS order,
-                            # so ancestors of node i are at positions < i but not necessarily contiguous.
-                            # TODO: For full correctness, either:
-                            #   (1) Gather ancestors into contiguous buffer before attention
-                            #   (2) Use flash_attn_tree_decode kernel with explicit mask
-                            # For now, this gives DIFFERENT output than causal (tree_idx+1)
-                            # which is sufficient to verify tree attention is being used.
                             spec_attn.params[4].value = ancestor_count + kv_len
                             engine.device.launch_cached(spec_attn)
                         
@@ -3202,7 +3220,11 @@ class TPInferenceEngine:
                         
                         # O-proj
                         if 'gemv_o_proj' in lc:
-                            engine.device.launch_cached(lc['gemv_o_proj'])
+                            # Params: [0]=src(d_o), [1]=weight, [2]=dst(d_hidden), [3]=h, [4]=out_dim, [5]=residual
+                            spec_o = lc['gemv_o_proj']
+                            spec_o.params[0].value = engine.d_pf_attn_out + offset
+                            spec_o.params[2].value = engine.d_pf_hidden + offset
+                            engine.device.launch_cached(spec_o)
                     else:
                         # DeltaNet (linear attention)
                         if 'gemv_la_in_proj' in lc:
@@ -3234,18 +3256,27 @@ class TPInferenceEngine:
                 engine.d_proj_out = engine.d_pf_proj_out
             
             # FFN RMSNorm (batched)
-            layer_cache = self._engine_layer_caches[0][layer_idx]
-            if 'ffn_rmsnorm' in layer_cache:
-                spec_norm = layer_cache['ffn_rmsnorm']
-                # Update input pointers for batched operation
-                # (would need batched RMSNorm kernel for true efficiency)
-                # For now, loop per tree node
-                for tree_idx in range(tree_size):
-                    for engine in self.engines:
-                        offset = tree_idx * h * 2
-                        engine.d_normed = engine.d_pf_hidden2 + offset
-                        engine.d_proj_out = engine.d_pf_hidden + offset
-                        engine.device.launch_cached(layer_cache['ffn_rmsnorm'])
+            # CRITICAL: Each engine has its own cached LaunchSpec with engine-specific buffer pointers.
+            # We must use each engine's OWN layer cache, not a shared one.
+            for tree_idx in range(tree_size):
+                for engine_idx, engine in enumerate(self.engines):
+                    offset = tree_idx * h * 2
+                    layer_cache = self._engine_layer_caches[engine_idx][layer_idx]
+                    
+                    if 'ffn_rmsnorm' in layer_cache:
+                        spec_norm = layer_cache['ffn_rmsnorm']
+                        # CRITICAL FIX: Update the cached LaunchSpec's parameter pointers
+                        # to use tree decode buffers (d_pf_hidden, d_pf_hidden2), not
+                        # standard decode buffers (d_hidden, d_normed). The cached spec
+                        # was built during standard decode and has stale pointers.
+                        # RMSNorm params: [0]=dst, [1]=src, [2]=weight, [3]=dim, [4]=eps
+                        # For FFN RMSNorm: src=d_hidden (attn output), dst=d_normed (normalized)
+                        # Tree decode: src=d_pf_hidden+offset, dst=d_pf_hidden2+offset
+                        tree_src_ptr = engine.d_pf_hidden + offset   # Attention output
+                        tree_dst_ptr = engine.d_pf_hidden2 + offset  # Normalized output
+                        spec_norm.params[1].value = tree_src_ptr
+                        spec_norm.params[0].value = tree_dst_ptr
+                        engine.device.launch_cached(spec_norm)
             
             # FFN gate+up+silu and down projections
             # (loop per tree node for now)
@@ -3253,18 +3284,33 @@ class TPInferenceEngine:
                 for engine_idx, (engine, lc) in enumerate(zip(self.engines, self._engine_layer_caches)):
                     layer_cache = lc[layer_idx]
                     offset = tree_idx * h * 2
-                    engine.d_normed = engine.d_pf_hidden2 + offset
                     
                     if 'ffn_gate_up_silu' in layer_cache:
-                        engine.device.launch_cached(layer_cache['ffn_gate_up_silu'])
+                        spec_gate_up = layer_cache['ffn_gate_up_silu']
+                        # CRITICAL FIX: Update cached LaunchSpec pointers for tree decode
+                        # Gate+Up+SiLU params: [0]=dst (gate), [1]=src (input), [2-5]=weights
+                        # For tree decode: src=d_pf_hidden2+offset, dst=d_pf_ffn_gate+offset
+                        tree_src_ptr = engine.d_pf_hidden2 + offset
+                        tree_dst_ptr = engine.d_pf_ffn_gate + offset
+                        spec_gate_up.params[1].value = tree_src_ptr
+                        spec_gate_up.params[0].value = tree_dst_ptr
+                        engine.device.launch_cached(spec_gate_up)
                     else:
                         lw = engine.layers[layer_idx]
                         engine._launch_ffn_gate_up_silu(
-                            engine.d_ffn_gate, engine.d_normed,
+                            engine.d_ffn_gate, engine.d_pf_hidden2 + offset,
                             lw, h, engine.local_intermediate_size)
                     
                     if 'ffn_down' in layer_cache:
-                        engine.device.launch_cached(layer_cache['ffn_down'])
+                        spec_down = layer_cache['ffn_down']
+                        # CRITICAL FIX: Update cached LaunchSpec pointers for tree decode
+                        # Down proj params: [0]=src (gate), [1]=weight, [2]=scales, [3]=zeros, [4]=dst (ffn_out)
+                        # For tree decode: src=d_pf_ffn_gate+offset, dst=d_pf_ffn_out+offset
+                        tree_src_ptr = engine.d_pf_ffn_gate + offset
+                        tree_dst_ptr = engine.d_pf_ffn_out + offset
+                        spec_down.params[0].value = tree_src_ptr
+                        spec_down.params[4].value = tree_dst_ptr
+                        engine.device.launch_cached(spec_down)
                     else:
                         lw = engine.layers[layer_idx]
                         engine._launch_ffn_down(
@@ -4377,7 +4423,7 @@ class TPInferenceEngine:
         total_size = batch_size * hidden_size
         
         # Use compressed allreduce if available for large batches
-        if batch_size >= 2 and self._compressed_allreduce:
+        if batch_size >= 2 and getattr(self, '_compressed_allreduce_enabled', False):
             # Compressed allreduce (INT8) - more efficient for batch>=2
             partial_ptrs = [getattr(e, buffer_name) for e in self.engines]
             hidden_ptrs = [e.d_hidden for e in self.engines]

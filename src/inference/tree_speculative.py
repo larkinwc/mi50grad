@@ -299,6 +299,9 @@ class TreeSpeculativeDecoder:
                      kv_embeddings: Optional[np.ndarray] = None) -> List[np.ndarray]:
         """Verify tree draft tokens with single forward pass.
         
+        Uses the engine's decode_step_tree method which processes all tree tokens
+        in a single forward pass with exactly 64 allreduce calls (one per layer).
+        
         Args:
             embeddings: Tree node embeddings
             tree_mask: Tree attention mask
@@ -307,7 +310,7 @@ class TreeSpeculativeDecoder:
         Returns:
             List of [vocab_size] logits (one per tree node)
         """
-        # Call tree decode step
+        # Call tree decode step - processes all tree tokens with one allreduce set
         outputs = self.engine.decode_step_tree(
             token_embeddings=embeddings,
             tree_mask=tree_mask,

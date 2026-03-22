@@ -1,0 +1,67 @@
+{
+  "featureId": "tree-attention-infrastructure",
+  "reviewedAt": "2026-03-22T17:50:00Z",
+  "commitId": "pending_manual_commit",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "fail",
+  "codeReview": {
+    "summary": "The TreeAttentionMask class and test infrastructure are well-implemented and comprehensive. However, the core tree attention integration is incomplete: the decode_step_tree() method uses standard causal attention instead of the tree attention kernel, and the HIP kernel is not compiled or integrated.",
+    "issues": [
+      {
+        "file": "src/inference/tp_engine.py",
+        "line": 3186,
+        "severity": "blocking",
+        "description": "decode_step_tree() falls back to standard decode attention kernel instead of using the tree attention mask. The TODO comment acknowledges: 'TODO: Replace with tree attention kernel launch'. This means tree-structured attention is NOT actually implemented in the decode path - just regular causal attention with modified seq_len."
+      },
+      {
+        "file": "src/inference/tp_engine.py",
+        "line": 3183,
+        "severity": "blocking",
+        "description": "The attention seq_len is set to 'kv_len + tree_idx + 1' which is incorrect for tree attention. Each tree node should attend to ancestors + self + KV cache, not all previous tree nodes causally. This produces incorrect attention patterns."
+      },
+      {
+        "file": "src/kernels/flash_attn_tree.hip",
+        "line": 1,
+        "severity": "blocking",
+        "description": "Tree attention HIP kernel is created but NOT compiled or tested. The handoff notes: 'Tree attention kernel integration with actual model execution requires HIP kernel compilation on dev server'. Without this, the kernel cannot be used."
+      },
+      {
+        "file": "src/inference/tp_engine.py",
+        "line": 3165,
+        "severity": "non_blocking",
+        "description": "RoPE positions hardcoded to 0 for all tree nodes (cos_offset = 0). Tree nodes may need distinct position indices based on their depth in the tree for correct rotary embeddings."
+      },
+      {
+        "file": "src/inference/tp_engine.py",
+        "line": 3093,
+        "severity": "non_blocking",
+        "description": "No validation that tree_mask.kv_len matches the actual KV cache length in the engine. Mismatch could cause incorrect attention or out-of-bounds access."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "conventions",
+      "observation": "The tree-speculative.md library file was properly updated with implementation details and design decisions, following the established documentation pattern.",
+      "evidence": ".factory/library/tree-speculative.md updated with 'Implementation' section documenting files created and key design decisions"
+    },
+    {
+      "area": "skills",
+      "observation": "Worker followed the gpu-kernel-worker skill procedure for reading library files and implementing tests first, but deviated by not building the kernel on dev server (step 4 of skill) before marking feature complete.",
+      "evidence": "Transcript shows skill invoked, library files read, tests written, but no 'rsync' or 'ssh root@192.168.1.198' commands to build/test on dev server. Handoff explicitly notes kernel needs compilation."
+    },
+    {
+      "area": "knowledge",
+      "observation": "The TreeAttentionMask class correctly implements ancestor-only attention patterns for tree topologies. The BFS node ordering ensures ancestors have lower indices, enabling correct mask construction.",
+      "evidence": "verify_tree_mask_correctness() validates: (1) self-attention, (2) ancestor attention, (3) KV attention, (4) no non-ancestor attention. All 12 unit tests pass."
+    },
+    {
+      "area": "knowledge",
+      "observation": "The bit-packed mask representation (32 bits per uint32 word) is a good design choice for efficient memory usage and fast mask checking. The kernel comment documents: mask_words_per_row = ceil(kv_len / 32).",
+      "evidence": "src/kernels/flash_attn_tree.hip lines 37-40 document mask layout: 'mask_words[i * mask_words_per_row + j / 32] & (1 << (j % 32))'"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "FAIL: The TreeAttentionMask infrastructure is well-designed and thoroughly tested, but the core integration is incomplete. The decode_step_tree() method does NOT use tree attention - it falls back to causal attention with an incorrect seq_len calculation. The flash_attn_tree.hip kernel is written but not compiled or integrated. The feature description requires: 'Tree attention output matches sequential per-path attention' and 'batch_decode_step_tree processes tree_size tokens with exactly 64 allreduce calls' - neither can be verified without the actual tree attention kernel integration. The worker correctly noted in the handoff that 'Tree attention kernel integration with actual model execution requires HIP kernel compilation on dev server' but should have completed this step before marking the feature complete."
+}

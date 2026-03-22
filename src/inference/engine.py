@@ -3014,7 +3014,7 @@ class InferenceEngine:
         # Free old buffers if reallocating
         if hasattr(self, '_pf_seq_len'):
             for attr in ['d_pf_hidden', 'd_pf_hidden2', 'd_pf_normed', 'd_pf_q', 'd_pf_q_gate',
-                          'd_pf_k', 'd_pf_v', 'd_pf_attn_out',
+                          'd_pf_k', 'd_pf_v', 'd_pf_kv_fused', 'd_pf_attn_out',
                           'd_pf_ffn_gate', 'd_pf_ffn_up', 'd_pf_ffn_out', 'd_pf_proj_out']:
                 ptr = getattr(self, attr, 0)
                 if ptr:
@@ -3031,6 +3031,7 @@ class InferenceEngine:
         self.d_pf_q_gate = self.device.malloc(seq_len * q_dim * 2)
         self.d_pf_k = self.device.malloc(seq_len * kv_dim * 2)
         self.d_pf_v = self.device.malloc(seq_len * kv_dim * 2)
+        self.d_pf_kv_fused = self.device.malloc(seq_len * 2 * kv_dim * 2)  # For tree decode with fused KV
         self.d_pf_attn_out = self.device.malloc(seq_len * q_dim * 2)
         inter = self.config.intermediate_size
         self.d_pf_proj_out = self.device.malloc(seq_len * h * 2)  # For batched allreduce

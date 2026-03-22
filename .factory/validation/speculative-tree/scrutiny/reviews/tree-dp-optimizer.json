@@ -1,0 +1,55 @@
+{
+  "featureId": "tree-dp-optimizer",
+  "reviewedAt": "2026-03-22T17:00:00.000Z",
+  "commitId": "5782c00",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "pass",
+  "codeReview": {
+    "summary": "Well-implemented DP tree optimizer for speculative decoding. The implementation correctly follows the Sequoia algorithm to maximize E[accepted_tokens] given hardware constraints. Code is clean, well-documented, and achieves all targets (E[accepted]=2.479 >= 2.0, runtime 0.56ms < 1s, 121% improvement over chain). Test coverage is comprehensive with 13 test cases covering initialization, DP correctness, tree validity, and integration scenarios.",
+    "issues": [
+      {
+        "file": "src/inference/tree_optimizer.py",
+        "line": 31,
+        "severity": "non_blocking",
+        "description": "TreeTopology class defined in tree_optimizer.py has the same name as TreeTopology in tree_attention.py (line 60). Both exist independently with different interfaces. The optimizer's TreeTopology is a simple dataclass (edges, num_nodes, expected_tokens) while tree_attention's TreeTopology manages TreeNode objects with token IDs and parent-child relationships. This naming collision could cause confusion when integrating the optimizer output with the tree attention infrastructure. Consider renaming to OptimizedTreeTopology or similar, or adding a method to convert between the two."
+      },
+      {
+        "file": "src/inference/tree_optimizer.py",
+        "line": 286,
+        "severity": "non_blocking",
+        "description": "The chain expectation calculation in compare_with_chain() uses a loop-based approach. For uniform acceptance, this could be a closed-form geometric series formula p*(1-p^L)/(1-p), which would be more numerically stable for very large L and serve as an independent verification. The current implementation is correct but the loop approach could accumulate floating-point errors for long chains."
+      },
+      {
+        "file": "src/inference/tree_optimizer.py",
+        "line": 176,
+        "severity": "non_blocking",
+        "description": "The _generate_child_distributions method generates all partitions, which has exponential complexity in the number of children. For max_branching=2 this is manageable, but if max_branching increases significantly, this could become a bottleneck. Consider adding a note about complexity or implementing a smarter enumeration for larger branching factors."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "knowledge",
+      "observation": "The DP recurrence correctly implements Sequoia's tree optimization algorithm but the feature description was missing a key insight that the worker discovered during implementation: with uniform acceptance, the optimal structure is NOT always a tree - it depends on the acceptance pattern. The tree advantage comes from being able to accept multiple parallel branches when acceptance decays with depth. This insight should be documented in the tree-speculative.md library file for future reference.",
+      "evidence": "Transcript shows worker debugging chain vs tree comparison: 'The tree advantage comes from: (1) Position-dependent decay (deeper = lower acceptance) - tree lets you verify multiple shallow nodes (2) Hardware cost is constant - you can verify many tokens in one pass'. Worker also discovered chain expectation formula E[chain] = p + p^2 + ... + p^L which is geometric series."
+    },
+    {
+      "area": "skills",
+      "observation": "The gpu-kernel-worker skill lists reading .factory/library/tree-speculative.md as step 1, but during the worker's session, an attempt to read '/Users/larkinwc/.factory/library/tree-speculative.md' returned ENOENT. The worker then found the file at '/Users/larkinwc/personal/ml/mi50grad/.factory/library/tree-speculative.md'. This suggests the skill may have an incorrect path or the worker was searching in wrong location initially. The skill does not mention the path explicitly but the worker tried an incorrect path first.",
+      "evidence": "Transcript shows: 'Tool: Read { \"file_path\": \"/Users/larkinwc/.factory/library/tree-speculative.md\" }' followed by 'Error: ENOENT' and then 'Tool: Read { \"file_path\": \"/Users/larkinwc/personal/ml/mi50grad/.factory/library/tree-speculative.md\" }' which succeeded. The file exists at the repo-relative path, not at ~/.factory/library."
+    },
+    {
+      "area": "conventions",
+      "observation": "Two classes named TreeTopology exist in the codebase (tree_optimizer.py and tree_attention.py) with different interfaces. While Python allows this, it creates potential for confusion. No naming convention is documented in AGENTS.md about avoiding duplicate class names across modules or how to handle this when modules have different concerns but overlapping terminology.",
+      "evidence": "Grep output shows: './tree_attention.py:60:class TreeTopology:' and './tree_optimizer.py:31:class TreeTopology:'. Both classes serve tree-related purposes but with different data models (edges vs TreeNode objects)."
+    },
+    {
+      "area": "knowledge",
+      "observation": "The chain expectation formula discovered during implementation (E[chain] = sum of p^d for each position, geometric series) should be documented. This is a key mathematical insight that differs from naive expectation (not p * length). The worker fixed this bug during implementation.",
+      "evidence": "Transcript shows worker correcting chain calculation: 'For a chain of length L with uniform p: P(node 0 accepted) = p, P(node 1 accepted) = p * p (node 0 AND node 1 correct), P(node 2 accepted) = p^3, E[chain] = p + p^2 + p^3 + ... + p^L. That's very different from 5 * 0.54 = 2.7! My chain calculation is wrong.'"
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "PASS. The DP tree optimizer implementation is solid and meets all requirements: E[accepted_tokens]=2.479 >= 2.0 target, runtime 0.56ms < 1s target, and 121% improvement over chain speculation. Test coverage is comprehensive (13 tests). Minor issues identified are non-blocking: naming collision between two TreeTopology classes could cause integration confusion, and some algorithmic/mathematical insights discovered during implementation should be documented for future workers. The implementation correctly discovered that tree advantage comes from position-dependent acceptance decay, not uniform acceptance."
+}

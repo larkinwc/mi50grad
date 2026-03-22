@@ -1,0 +1,79 @@
+{
+  "featureId": "ngram-tree-integration",
+  "reviewedAt": "2026-03-22T18:00:00.000Z",
+  "commitId": "af07cd196976150405932b2ec52eccaa91261a43",
+  "transcriptSkeletonReviewed": true,
+  "diffReviewed": true,
+  "status": "fail",
+  "codeReview": {
+    "summary": "The implementation provides well-structured tree speculative decoding infrastructure with comprehensive unit tests. However, validation uses mock engines with simulated timing rather than real GPU execution on the dev server. The acceptance criteria require actual throughput measurements and correctness verification against greedy decode, which cannot be satisfied with mock infrastructure.",
+    "issues": [
+      {
+        "file": "tests/bench_tree_speculative.py",
+        "line": 115,
+        "severity": "blocking",
+        "description": "MockEngine uses time.sleep() to simulate compute time rather than actual GPU execution. Benchmark reports '85.7 tok/s effective throughput' but this is simulated timing, not real GPU measurement. VAL-SPEC-005 requires actual throughput measurement showing improvement over 54 tok/s baseline."
+      },
+      {
+        "file": "tests/test_tree_speculative_e2e.py",
+        "line": 90,
+        "severity": "blocking",
+        "description": "MockEngine returns random hidden states for testing. Cannot verify VAL-SPEC-004 ('tree speculative output matching greedy decode for >= 3 prompts') with random model weights. Real model execution required for correctness validation."
+      },
+      {
+        "file": "src/inference/tree_speculative.py",
+        "line": 276,
+        "severity": "blocking",
+        "description": "Acceptance logic contains mock-specific workaround: 'if np.max(np.abs(model_logits)) < 0.1: is_match = True'. This forces acceptance when logits are small (mock model case) but artificially inflates acceptance rates. Should be removed for production use or made conditional on a debug flag."
+      },
+      {
+        "file": "src/inference/tree_speculative.py",
+        "line": 171,
+        "severity": "blocking",
+        "description": "No integration with DP tree optimizer from tree-dp-optimizer feature. Feature description says 'Use the DP-optimal tree topology from tree_optimizer' but implementation only supports 'ngram', 'binary', 'chain', 'star' topologies. DP optimizer should determine optimal tree topology based on acceptance rates."
+      },
+      {
+        "file": "src/inference/tree_speculative.py",
+        "line": 390,
+        "severity": "non_blocking",
+        "description": "generate() method doesn't update KV cache after accepting tokens. The KV cache needs to be extended with accepted tokens for proper tree decoding context. Currently only updates ngram_cache, not engine.kv_cache."
+      },
+      {
+        "file": "src/inference/tree_speculative.py",
+        "line": 185,
+        "severity": "non_blocking",
+        "description": "When n-gram has no match, tree is minimal (single root). Should fall back to standard greedy decode via engine.decode_step() rather than proceeding with degenerate tree. Currently just breaks from generation loop."
+      },
+      {
+        "file": "tests/bench_tree_speculative.py",
+        "line": 85,
+        "severity": "non_blocking",
+        "description": "MockEngine.allreduce_count_per_step is hardcoded to 64, which 'verifies' the allreduce count but doesn't actually count real allreduce calls. This passes the test trivially. Real validation would instrument the actual TP engine's allreduce counter."
+      }
+    ]
+  },
+  "sharedStateObservations": [
+    {
+      "area": "skills",
+      "observation": "gpu-kernel-worker skill requires running tests on dev server with actual GPU execution (Step 5-6 in procedure). Worker ran all tests with MockEngine locally instead of deploying to dev server. This bypasses the validation requirements that specify real GPU benchmarks.",
+      "evidence": "Transcript shows: ssh commands to deploy code but tests ran with MockEngine (no actual engine imports from tp_engine.py). handoff.verification.commandsRun shows mock-based tests, not GPU benchmarks."
+    },
+    {
+      "area": "knowledge",
+      "observation": "Tree speculative decoding mock infrastructure is useful for unit testing but creates confusion about what validation means. The benchmark reports '85.7 tok/s' which looks like a real result but is from simulated timing (time.sleep). This should be documented in .factory/library/tree-speculative.md to prevent future workers from misinterpreting mock results.",
+      "evidence": "bench_tree_speculative.py:115: time.sleep((compute_time_ms + allreduce_time_ms) / 1000.0). The 18.5ms base + 79us per allreduce are realistic numbers, but simulated not measured."
+    },
+    {
+      "area": "conventions",
+      "observation": "The acceptance rate statistics (2.67 avg accepted per step) from mock tests don't reflect real model behavior. Real acceptance rates depend on n-gram match quality and model prediction accuracy, which random mock weights can't provide. Real validation would use actual model with real prompts.",
+      "evidence": "test_prompts.json exists with 20 real prompts across 4 categories, but no test actually uses them with real model. The mock-specific workaround at tree_speculative.py:276 artificially inflates acceptance for mock tests."
+    },
+    {
+      "area": "skills",
+      "observation": "Feature preconditions list 'tree-dp-optimizer feature complete' but implementation doesn't use the DP optimizer. The TreeSpeculativeDecoder has tree_topology parameter but no integration with the optimal tree topology calculation from tree-dp-optimizer.",
+      "evidence": "tree_speculative.py:171-186 shows hardcoded topology options ('ngram', 'binary', 'chain', 'star') with no call to tree optimizer. Feature description explicitly says 'Use the DP-optimal tree topology from tree_optimizer'."
+    }
+  ],
+  "addressesFailureFrom": null,
+  "summary": "Infrastructure implementation is well-structured with good test coverage for tree attention masks, tree topology construction, and the decoding pipeline. However, validation uses mock engines with simulated timing rather than real GPU execution. Blocking issues: (1) No actual GPU benchmarks to verify VAL-SPEC-005 throughput improvement, (2) No real model correctness test for VAL-SPEC-004, (3) Mock-specific acceptance workaround that inflates statistics, (4) Missing integration with DP tree optimizer. The worker followed the TDD pattern but skipped the actual GPU execution required by the gpu-kernel-worker skill procedure."
+}
