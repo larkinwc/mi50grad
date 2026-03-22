@@ -72,6 +72,65 @@ Our measured rates: ~54% overall. Typically:
 - `src/kernels/gemm_int4_prefill_v2.hip`: INT4 GEMM kernel for M>1
 - `data/test_prompts.json`: Test prompt corpus (4 domains, 20 prompts)
 
+## Implementation (tree-attention-infrastructure milestone)
+
+### Files Created
+
+1. **src/inference/tree_attention.py** - Core tree attention infrastructure
+   - `TreeNode`: Represents a node in the draft token tree
+   - `TreeTopology`: Manages tree construction and traversal
+   - `TreeAttentionMask`: Builds [tree_size, tree_size + kv_len] boolean masks
+   - `build_complete_binary_tree()`: Creates balanced binary trees
+   - `build_chain_tree()`: Creates linear chain trees
+   - `build_star_tree()`: Creates star-shaped trees
+   - `verify_tree_mask_correctness()`: Validates mask correctness
+
+2. **src/kernels/flash_attn_tree.hip** - Tree attention CUDA kernel
+   - `flash_attn_tree_decode`: Main tree attention kernel with bit-packed mask
+   - `flash_attn_tree_decode_sparse`: Optimized variant with index lists
+   - Grid: (num_heads, tree_size, 1), Block: (64, 1, 1)
+   - Supports tree sizes 4-16 tokens
+
+3. **src/inference/tp_engine.py** - Updated with tree decode support
+   - `decode_step_tree()`: Processes tree with exactly 64 allreduce calls
+   - Accepts TreeAttentionMask and list of embeddings
+   - Returns list of output hidden states (one per tree node)
+
+### Tests Created
+
+1. **tests/test_tree_attention_mask.py** - Unit tests for mask construction
+   - TreeNode/TreeTopology basic functionality
+   - Binary, chain, and star tree construction
+   - Mask correctness verification
+   - Edge cases (single node, zero KV, etc.)
+   - Tree sizes 4, 8, 16 validation
+
+2. **tests/test_tree_attention_integration.py** - Integration tests
+   - TreeAttentionMask with NumPy arrays
+   - API verification
+   - Comprehensive mask correctness (7 topologies × 4 KV lengths)
+   - Attention pattern validation
+   - Allreduce count verification (64 calls)
+
+### Key Design Decisions
+
+1. **Bit-packed mask representation**: Mask stored as uint32 words (32 bits per word)
+   - Efficient memory usage: 1 bit per (query, kv) pair
+   - Fast mask checking: `mask_word & (1 << bit_idx)`
+
+2. **BFS node ordering**: Tree nodes indexed in breadth-first order
+   - Ensures ancestors always have lower indices than descendants
+   - Enables causal (lower triangular) mask structure
+
+3. **Separation of concerns**: Tree topology vs attention mask
+   - `TreeTopology` manages parent-child relationships
+   - `TreeAttentionMask` builds attention patterns from topology
+   - Allows reusing topology with different KV lengths
+
+4. **GEMM over GEMV for M>1**: Tree decode uses batched GEMM kernels
+   - More efficient for M=4-16 tree sizes
+   - Existing `gemm_int4_prefill_v2.hip` can handle small M
+
 ## Verification Pipeline
 
 1. Generate draft tokens using n-gram predictor in tree structure
