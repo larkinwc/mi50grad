@@ -92,6 +92,8 @@ KERNEL_HIP_SRCS += $(wildcard src/kernels/*_v7*.hip)
 KERNEL_HIP_SRCS += $(wildcard src/kernels/*_v8*.hip)
 KERNEL_HIP_SRCS += $(wildcard src/kernels/*_qkv_fused.hip)
 KERNEL_HIP_SRCS += $(wildcard src/kernels/*_dual*.hip)
+# Tree attention kernel
+KERNEL_HIP_SRCS += src/kernels/flash_attn_tree.hip
 KERNEL_SO = $(patsubst src/kernels/%.hip,$(BUILD_DIR)/kernels/%.so,$(KERNEL_HIP_SRCS))
 
 .PHONY: hip_kernels
