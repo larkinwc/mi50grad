@@ -398,6 +398,12 @@ class LayerWeights:
         self.o_qweight = 0      # [hidden/8, Q_dim] INT32 packed
         self.o_scales = 0       # [hidden/group_size, Q_dim] FP16
         self.o_zeros = 0        # [hidden/group_size, Q_dim] FP16 (all zeros)
+        
+        # Concatenated QKV weights for fused QKV GEMV kernel
+        # Fuses q/k/v projections into single kernel launch
+        self.qkv_qweight = 0    # [N_total/8, hidden] INT32 packed, N_total = q_dim + 2*kv_dim
+        self.qkv_scales = 0     # [N_total/group_size, hidden] FP16
+        self.qkv_zeros = 0      # [N_total/group_size, hidden] FP16
 
         # Linear attention weights — large projections on GPU, small ops on CPU/GPU
         self.la_in_proj_qkv = 0     # GPU ptr [10240, 5120]
@@ -735,6 +741,25 @@ class InferenceEngine:
                 print("GEMV INT4 v8 (FP32 accum + 4x register blocking) loaded as default")
         except Exception as e:
             print(f"GEMV INT4 v8 failed (falling back to v7): {e}")
+        
+        # Try to load fused QKV GEMV kernel (reduces 3 launches to 1 per attention layer)
+        # Based on v8 patterns with 4x register blocking and FP32 accumulation
+        # Fuses Q, K, V projections into single kernel launch
+        self._gemv_int4_qkv_fused = False
+        try:
+            hip_path = HIP_DIR / "gemv_int4_qkv_fused.hip"
+            if hip_path.exists():
+                self.kernels.get_hip("gemv_int4_qkv_fused_t16", "gemv_int4_qkv_fused",
+                                      hsaco_suffix="_t16")
+                self.kernels.get_hip("gemv_int4_qkv_fused_t8", "gemv_int4_qkv_fused",
+                                      hsaco_suffix="_t8")
+                self.kernels.get_hip("gemv_int4_qkv_fused_t4", "gemv_int4_qkv_fused",
+                                      hsaco_suffix="_t4")
+                self._gemv_int4_qkv_fused = True
+                print("Fused QKV GEMV kernel (gemv_int4_qkv_fused.hip) loaded — 3-in-1 launch")
+        except Exception as e:
+            print(f"Fused QKV GEMV kernel failed to load: {e}")
+        
         self._gemv_int4_v7 = False
         try:
             hip_path = HIP_DIR / "gemv_int4_v7.hip"
@@ -1314,6 +1339,29 @@ class InferenceEngine:
                     lw.q_gate_qweight = upload(weights['q_gate_qweight'])
                     lw.q_gate_scales = upload(weights['q_gate_scales'])
                     lw.q_gate_zeros = upload(weights['q_gate_zeros'])
+                
+                # Concatenate Q, K, V weights for fused QKV GEMV kernel
+                # Concatenate along output dimension (dim 0): [N_total/8, hidden]
+                # where N_total = q_dim + 2*kv_dim
+                if 'q_qweight' in weights and 'k_qweight' in weights and 'v_qweight' in weights:
+                    q_qw = weights.get('q_qweight')
+                    k_qw = weights.get('k_qweight')
+                    v_qw = weights.get('v_qweight')
+                    q_sc = weights.get('q_scales')
+                    k_sc = weights.get('k_scales')
+                    v_sc = weights.get('v_scales')
+                    q_z = weights.get('q_zeros')
+                    k_z = weights.get('k_zeros')
+                    v_z = weights.get('v_zeros')
+                    
+                    # Concatenate along output dimension (axis 0)
+                    qkv_qweight = np.concatenate([q_qw, k_qw, v_qw], axis=0)
+                    qkv_scales = np.concatenate([q_sc, k_sc, v_sc], axis=0)
+                    qkv_zeros = np.concatenate([q_z, k_z, v_z], axis=0)
+                    
+                    lw.qkv_qweight = upload(qkv_qweight)
+                    lw.qkv_scales = upload(qkv_scales)
+                    lw.qkv_zeros = upload(qkv_zeros)
             else:
                 # FP16 attention projections (standard GPTQ/AWQ format)
                 if 'q_weight' in weights and 'q_gate_weight' in weights:
@@ -3362,6 +3410,74 @@ class InferenceEngine:
                             ],
                         )
 
+                # --- INT4 attention GEMV projections (compressed-tensors AWQ format) ---
+                # Use fused QKV kernel when available (3 launches → 1)
+                if self._gemv_int4_qkv_fused and hasattr(lw, 'qkv_qweight') and lw.qkv_qweight:
+                    # Fused QKV GEMV: single kernel launches for Q, K, V projections
+                    N_total = self.q_dim + 2 * self.kv_dim
+                    # Use v8-style grid: 256 threads/WG, 16 cols/WG for t16
+                    qkv_grid = (2 * N_total + 3) // 4
+                    
+                    # Select kernel variant based on N_total size (same as v8)
+                    if N_total <= 2048:
+                        qkv_func = self.kernels.get_hip("gemv_int4_qkv_fused_t16", "gemv_int4_qkv_fused",
+                                                         hsaco_suffix="_t16")
+                    elif N_total <= 4096:
+                        qkv_func = self.kernels.get_hip("gemv_int4_qkv_fused_t8", "gemv_int4_qkv_fused",
+                                                         hsaco_suffix="_t8")
+                    else:
+                        qkv_func = self.kernels.get_hip("gemv_int4_qkv_fused_t4", "gemv_int4_qkv_fused",
+                                                         hsaco_suffix="_t4")
+                    
+                    # V cache pointer for direct KV write mode (mutable, updated per step)
+                    if self._direct_kv_write and self._qknorm_rope_cachew:
+                        v_cache_ptr_init = self.kv_cache.layer_v_ptr(layer_idx)
+                        kv_stride = self.local_num_kv_heads * cfg.head_dim * 2
+                        lc['gemv_qkv_fused'] = LaunchSpec(
+                            func=qkv_func,
+                            grid=(qkv_grid, 1, 1), block=(256, 1, 1),
+                            params=[
+                                ctypes.c_uint64(self.d_normed),
+                                ctypes.c_uint64(lw.qkv_qweight),
+                                ctypes.c_uint64(lw.qkv_scales),
+                                ctypes.c_uint64(lw.qkv_zeros),
+                                ctypes.c_uint64(self.d_q),           # Q output buffer
+                                ctypes.c_uint64(self.d_k),           # K output buffer  
+                                ctypes.c_uint64(v_cache_ptr_init),   # V output (mutable: cache position)
+                                ctypes.c_uint32(h),
+                                ctypes.c_uint32(self.q_dim),
+                                ctypes.c_uint32(self.kv_dim),
+                                ctypes.c_uint32(cfg.group_size),
+                                ctypes.c_uint64(v_cache_ptr_init),   # v_cache_dst (same as V output)
+                            ],
+                        )
+                        # Store for C dispatch and mutable updates
+                        lc['_v_cache_base'] = v_cache_ptr_init
+                        lc['_kv_stride'] = kv_stride
+                    else:
+                        # Standard mode: V writes to d_v working buffer
+                        lc['gemv_qkv_fused'] = LaunchSpec(
+                            func=qkv_func,
+                            grid=(qkv_grid, 1, 1), block=(256, 1, 1),
+                            params=[
+                                ctypes.c_uint64(self.d_normed),
+                                ctypes.c_uint64(lw.qkv_qweight),
+                                ctypes.c_uint64(lw.qkv_scales),
+                                ctypes.c_uint64(lw.qkv_zeros),
+                                ctypes.c_uint64(self.d_q),           # Q output buffer
+                                ctypes.c_uint64(self.d_k),           # K output buffer
+                                ctypes.c_uint64(self.d_v),           # V output buffer
+                                ctypes.c_uint32(h),
+                                ctypes.c_uint32(self.q_dim),
+                                ctypes.c_uint32(self.kv_dim),
+                                ctypes.c_uint32(cfg.group_size),
+                                ctypes.c_uint64(0),                  # v_cache_dst = null
+                            ],
+                        )
+                    
+                    # Skip separate Q/K/V launches when using fused kernel
+                    # (don't create gemv_q_fused, gemv_k_only, gemv_v_cache, gemv_kv_fused)
+
                 # --- QK-norm + RoPE (position-mutable) ---
                 # params[2] = cos ptr, params[3] = sin ptr — updated per step
                 if self._qknorm_rope_fused:
@@ -3460,6 +3576,31 @@ class InferenceEngine:
                             ctypes.c_uint32(self.q_dim),
                             ctypes.c_uint32(h),
                             ctypes.c_uint64(0),  # no residual (TP path)
+                        ],
+                    )
+                
+                # INT4 O projection (AWQ format) - uses v8 kernel with shape-based selection
+                if hasattr(lw, 'o_qweight') and lw.o_qweight and (self._gemv_int4_v8 or self._gemv_int4_v7):
+                    o_grid = (h + 3) // 4
+                    # Select kernel based on output size
+                    if h <= 2048:
+                        o_func = self.kernels.get_hip("gemv_int4_v8_t16", "gemv_int4_v8")
+                    elif h <= 4096:
+                        o_func = self.kernels.get_hip("gemv_int4_v8_t8", "gemv_int4_v8")
+                    else:
+                        o_func = self.kernels.get_hip("gemv_int4_v8_t4", "gemv_int4_v8")
+                    lc['gemv_o_proj'] = LaunchSpec(
+                        func=o_func,
+                        grid=(o_grid, 1, 1), block=(256, 1, 1),
+                        params=[
+                            ctypes.c_uint64(self.d_attn_out),
+                            ctypes.c_uint64(lw.o_qweight),
+                            ctypes.c_uint64(lw.o_scales),
+                            ctypes.c_uint64(lw.o_zeros),
+                            ctypes.c_uint64(self.d_proj_out),
+                            ctypes.c_uint32(self.q_dim),
+                            ctypes.c_uint32(h),
+                            ctypes.c_uint32(cfg.group_size),
                         ],
                     )
 

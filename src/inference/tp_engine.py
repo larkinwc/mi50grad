@@ -5564,6 +5564,7 @@ class TPInferenceEngine:
                 fill_kernel_spec(es.attn_rmsnorm,      lc.get('attn_rmsnorm'))
                 fill_kernel_spec(es.gemv_q_fused,      lc.get('gemv_q_fused'))
                 fill_kernel_spec(es.gemv_kv_fused,     lc.get('gemv_kv_fused'))
+                fill_kernel_spec(es.gemv_qkv_fused,    lc.get('gemv_qkv_fused'))
                 fill_kernel_spec(es.qknorm_q,          lc.get('qknorm_q'))
                 fill_kernel_spec(es.qknorm_k,          lc.get('qknorm_k'))
                 fill_kernel_spec(es.decode_attn,       lc.get('decode_attn'))
@@ -5602,10 +5603,12 @@ class TPInferenceEngine:
                     es.kv_cache_v_base = engine.kv_cache.layer_v_ptr(layer_idx)
                     es.kv_stride       = kv_stride
                     # Enable direct KV write if engine has it enabled and kernels built
+                    # Supports both separate kernels (gemv_k_only + gemv_v_cache) and fused QKV kernel
                     es.use_direct_kv_write = (
                         1 if (engine._direct_kv_write and
-                              lc.get('gemv_k_only') is not None and
-                              lc.get('gemv_v_cache') is not None)
+                              (lc.get('gemv_k_only') is not None and
+                               lc.get('gemv_v_cache') is not None) or
+                              lc.get('gemv_qkv_fused') is not None)
                         else 0
                     )
                 else:

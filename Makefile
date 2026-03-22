@@ -86,6 +86,12 @@ KERNEL_HIP_SRCS = $(wildcard src/kernels/kernel_*.hip) $(wildcard src/kernels/ge
 # Also include v2 and v3 optimized kernels
 KERNEL_HIP_SRCS += $(wildcard src/kernels/*_v2.hip)
 KERNEL_HIP_SRCS += $(wildcard src/kernels/*_v3.hip)
+KERNEL_HIP_SRCS += $(wildcard src/kernels/*_v5*.hip)
+KERNEL_HIP_SRCS += $(wildcard src/kernels/*_v6*.hip)
+KERNEL_HIP_SRCS += $(wildcard src/kernels/*_v7*.hip)
+KERNEL_HIP_SRCS += $(wildcard src/kernels/*_v8*.hip)
+KERNEL_HIP_SRCS += $(wildcard src/kernels/*_qkv_fused.hip)
+KERNEL_HIP_SRCS += $(wildcard src/kernels/*_dual*.hip)
 KERNEL_SO = $(patsubst src/kernels/%.hip,$(BUILD_DIR)/kernels/%.so,$(KERNEL_HIP_SRCS))
 
 .PHONY: hip_kernels

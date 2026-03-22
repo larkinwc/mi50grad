@@ -210,6 +210,7 @@ typedef struct {
     CKernelSpec attn_rmsnorm;
     CKernelSpec gemv_q_fused;
     CKernelSpec gemv_kv_fused;   /* standard: fused [K,V] GEMV */
+    CKernelSpec gemv_qkv_fused;  /* fused QKV GEMV (3-in-1, INT4 only) */
     CKernelSpec qknorm_q;
     CKernelSpec qknorm_k;        /* standard: qknorm_rope_fused; or cachew variant */
     CKernelSpec decode_attn;
@@ -962,22 +963,37 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
 
             if (es->layer_type == 0) {
                 /* ---- Full attention ---- */
-                err = launch_kernel(&es->gemv_q_fused, plan);
-                if (err) return err;
-
-                if (es->use_direct_kv_write) {
-                    /* Direct KV write mode: K to working buffer, V directly to cache */
-                    err = launch_kernel(&es->gemv_k_only, plan);
+                /* Check for fused QKV kernel (INT4 attention, 3-in-1 launch) */
+                if (es->gemv_qkv_fused.present) {
+                    /* Fused QKV GEMV: single kernel for Q, K, V projections */
+                    /* Update V cache pointer if in direct KV write mode */
+                    if (es->use_direct_kv_write) {
+                        uint64_t pos = (uint64_t)(seq_len - 1);
+                        uint64_t dst_v = es->kv_cache_v_base + pos * (uint64_t)es->kv_stride;
+                        update_v_cache_ptr(&es->gemv_qkv_fused, dst_v);
+                    }
+                    err = launch_kernel(&es->gemv_qkv_fused, plan);
                     if (err) return err;
-                    /* Update V GEMV output ptr to current cache position */
-                    uint64_t pos = (uint64_t)(seq_len - 1);
-                    uint64_t dst_v = es->kv_cache_v_base + pos * (uint64_t)es->kv_stride;
-                    update_v_cache_ptr(&es->gemv_v_cache, dst_v);
-                    err = launch_kernel(&es->gemv_v_cache, plan);
-                    if (err) return err;
+                    /* Skip separate Q/K/V launches */
                 } else {
-                    err = launch_kernel(&es->gemv_kv_fused, plan);
+                    /* Standard path: separate Q, K, V launches */
+                    err = launch_kernel(&es->gemv_q_fused, plan);
                     if (err) return err;
+
+                    if (es->use_direct_kv_write) {
+                        /* Direct KV write mode: K to working buffer, V directly to cache */
+                        err = launch_kernel(&es->gemv_k_only, plan);
+                        if (err) return err;
+                        /* Update V GEMV output ptr to current cache position */
+                        uint64_t pos = (uint64_t)(seq_len - 1);
+                        uint64_t dst_v = es->kv_cache_v_base + pos * (uint64_t)es->kv_stride;
+                        update_v_cache_ptr(&es->gemv_v_cache, dst_v);
+                        err = launch_kernel(&es->gemv_v_cache, plan);
+                        if (err) return err;
+                    } else {
+                        err = launch_kernel(&es->gemv_kv_fused, plan);
+                        if (err) return err;
+                    }
                 }
 
                 /* No stream sync: Q/KV GEMVs now run on the default (null) stream.
