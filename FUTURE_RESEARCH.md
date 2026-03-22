@@ -1,9 +1,9 @@
 # Future Research: Performance Improvement Opportunities
 
-**Current:** ~54 tok/s decode (TP=4, 4x MI50 gfx906, Qwen3.5-27B-GPTQ-Int4)
-**Current gap:** ~6 tok/s to 60 tok/s target (~11% improvement needed)
+**Current:** ~56.5 tok/s decode (TP=4, 4x MI50 gfx906, Qwen3.5-27B-GPTQ-Int4)
+**Current gap:** ~3.5 tok/s to 60 tok/s target (~6% improvement needed)
 **Theoretical bandwidth floor:** ~3.1ms/tok (2.63GB weights / 860 GB/s peak HBM2)
-**Actual:** ~18.5ms/tok → **6x gap** between theoretical and actual (significant room)
+**Actual:** ~17.7ms/tok → **5.7x gap** between theoretical and actual
 
 ---
 
@@ -20,6 +20,10 @@
 | Allreduce v2 kernel optimization | No improvement | BAR1 P2P latency dominates, not kernel efficiency |
 | Double-buffer pipeline overlap | -9.3% degradation | Buffer copy + swap overhead > overlap benefit |
 | Flat speculative decode (n-gram/EAGLE) | ~0% throughput gain | High acceptance (54%) but allreduce still dominates per-token cost |
+| Weight prefetch during allreduce | Memory corruption | hipMemcpyAsync (self-copy and scratch buffer) interferes with P2P BAR1 transfers on gfx906 |
+| hipSetDevice caching | **+2.5 tok/s (+4.6%)** | APPLIED: reduced ~1792 to ~450 calls/token via device tracking + batched allreduce ops |
+| Fused QKV attention projection | **+2.0 tok/s (stacked)** | APPLIED: 3 attention GEMV launches fused to 1 per engine/layer (512 fewer launches/token) |
+| Sequoia tree speculative decode | Not viable (infrastructure) | P2P allreduce gather buffers only support M=1; batch allreduce requires fundamental TP rework |
 
 ---
 
