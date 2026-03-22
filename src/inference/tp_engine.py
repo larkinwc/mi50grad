@@ -5403,6 +5403,7 @@ class TPInferenceEngine:
                 ('attn_rmsnorm',        CKernelSpec),
                 ('gemv_q_fused',        CKernelSpec),
                 ('gemv_kv_fused',       CKernelSpec),
+                ('gemv_qkv_fused',      CKernelSpec),  # Fused QKV GEMV (3-in-1, INT4 only)
                 ('qknorm_q',            CKernelSpec),
                 ('qknorm_k',            CKernelSpec),
                 ('decode_attn',         CKernelSpec),

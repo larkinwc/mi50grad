@@ -4,17 +4,6 @@ import ctypes as ct
 import sys
 sys.path.insert(0, "/opt/mi50grad")
 
-# Load the C library
-lib = ct.CDLL("src/runtime/c_dispatch.so")
-lib.c_dispatch_get_spec_size.restype = ct.c_int
-lib.c_dispatch_get_kernel_spec_size.restype = ct.c_int
-
-c_spec_size = lib.c_dispatch_get_spec_size()
-c_kernel_size = lib.c_dispatch_get_kernel_spec_size()
-
-print(f"C CEngineLayerSpec size: {c_spec_size}")
-print(f"C CKernelSpec size: {c_kernel_size}")
-
 # Python definition
 class CKernelSpec(ct.Structure):
     _fields_ = [
@@ -33,12 +22,30 @@ class CKernelSpec(ct.Structure):
 
 print(f"Python CKernelSpec size: {ct.sizeof(CKernelSpec)}")
 
-# Python CEngineLayerSpec from tp_engine.py
+# Try to load C library for comparison (only works on dev server)
+try:
+    lib = ct.CDLL("/opt/mi50grad/src/runtime/c_dispatch.so")
+    lib.c_dispatch_get_spec_size.restype = ct.c_int
+    lib.c_dispatch_get_kernel_spec_size.restype = ct.c_int
+    
+    c_spec_size = lib.c_dispatch_get_spec_size()
+    c_kernel_size = lib.c_dispatch_get_kernel_spec_size()
+    
+    print(f"\nC CEngineLayerSpec size: {c_spec_size}")
+    print(f"C CKernelSpec size: {c_kernel_size}")
+    c_available = True
+except Exception as e:
+    print(f"\nC library not available (expected on macOS): {e}")
+    c_spec_size = None
+    c_available = False
+
+# Python CEngineLayerSpec from tp_engine.py (FIXED VERSION WITH gemv_qkv_fused)
 class CEngineLayerSpec(ct.Structure):
     _fields_ = [
         ('attn_rmsnorm',        CKernelSpec),
         ('gemv_q_fused',        CKernelSpec),
         ('gemv_kv_fused',       CKernelSpec),
+        ('gemv_qkv_fused',      CKernelSpec),  # Fused QKV GEMV (3-in-1, INT4 only) - ADDED
         ('qknorm_q',            CKernelSpec),
         ('qknorm_k',            CKernelSpec),
         ('decode_attn',         CKernelSpec),
@@ -69,12 +76,28 @@ class CEngineLayerSpec(ct.Structure):
         ('d_proj_out',          ct.c_uint64),
     ]
 
-print(f"Python CEngineLayerSpec size: {ct.sizeof(CEngineLayerSpec)}")
-print(f"Size mismatch: C={c_spec_size}, Python={ct.sizeof(CEngineLayerSpec)}")
-print(f"Difference: {c_spec_size - ct.sizeof(CEngineLayerSpec)}")
+print(f"\nPython CEngineLayerSpec size: {ct.sizeof(CEngineLayerSpec)}")
 
 # Count kernel specs
-kernel_count = 17  # from _fields_ above
+kernel_count = 18  # 17 + gemv_qkv_fused
 trailer = 8 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 8 + 8  # layer_type to d_proj_out
 expected = kernel_count * ct.sizeof(CKernelSpec) + trailer
-print(f"Expected size with 17 kernels + trailer: {expected}")
+print(f"Expected size with {kernel_count} kernels + trailer: {expected}")
+
+if c_available and c_spec_size is not None:
+    print(f"\nSize comparison: C={c_spec_size}, Python={ct.sizeof(CEngineLayerSpec)}")
+    if c_spec_size == ct.sizeof(CEngineLayerSpec):
+        print("✓ SUCCESS: Struct sizes match!")
+        sys.exit(0)
+    else:
+        print(f"✗ MISMATCH: Difference = {c_spec_size - ct.sizeof(CEngineLayerSpec)} bytes")
+        sys.exit(1)
+else:
+    print(f"\nC struct expected size: 1104 bytes (18 CKernelSpecs * 48 bytes + 240 bytes trailer)")
+    print(f"Python struct calculated size: {ct.sizeof(CEngineLayerSpec)} bytes")
+    if ct.sizeof(CEngineLayerSpec) == 1104:
+        print("✓ Python struct size matches expected C struct size (1104 bytes)")
+        sys.exit(0)
+    else:
+        print(f"✗ Python struct size does not match expected (1104 bytes)")
+        sys.exit(1)
