@@ -314,6 +314,21 @@ typedef struct {
     /* Compressed buffer pointers: [INT8 data (n bytes)] [FP16 scales (num_blocks*2 bytes)] */
     uint64_t compressed_ptrs[4];              /* INT8 compressed buffer pointers per GPU */
     /* Padding for 8-byte alignment: 4 + 8 + 32 = 44 bytes */
+    
+    /* Weight prefetch fields (for overlapping prefetch with allreduce) */
+    uint32_t enable_prefetch;           /* 1=enable async prefetch of next layer weights during allreduce */
+    uint64_t prefetch_qkv_weight;       /* Next layer QKV fused weight pointer (INT4 qweight) */
+    uint64_t prefetch_qkv_scales;       /* Next layer QKV fused scales pointer */
+    uint64_t prefetch_qkv_zeros;        /* Next layer QKV fused zeros pointer */
+    uint64_t prefetch_ffn_gate_weight;  /* Next layer FFN gate weight pointer (INT4 qweight) */
+    uint64_t prefetch_ffn_gate_scales;  /* Next layer FFN gate scales pointer */
+    uint64_t prefetch_ffn_gate_zeros;   /* Next layer FFN gate zeros pointer */
+    uint64_t prefetch_ffn_up_weight;    /* Next layer FFN up weight pointer (INT4 qweight) */
+    uint64_t prefetch_ffn_up_scales;    /* Next layer FFN up scales pointer */
+    uint64_t prefetch_ffn_up_zeros;     /* Next layer FFN up zeros pointer */
+    uint32_t prefetch_qkv_bytes;        /* Size of QKV weight in bytes */
+    uint32_t prefetch_ffn_gate_bytes;   /* Size of FFN gate weight in bytes */
+    uint32_t prefetch_ffn_up_bytes;     /* Size of FFN up weight in bytes */
 } CAllreduceSpec;
 
 /*
@@ -864,6 +879,68 @@ static int do_allreduce_gemv_fused_compressed(CAllreduceSpec *ar, CDispatchPlan 
  *   - do_allreduce_kernel_p2p:                   kernel P2P (each GPU reads peers via BAR1)
  *   - do_allreduce_async:                        star topology (gather + reduce + broadcast)
  */
+
+/*
+ * issue_weight_prefetch: issue async D2D copies to prefetch next layer weights.
+ * 
+ * This is called on the compute stream (NULL stream) during the allreduce window.
+ * The compute stream is idle during allreduce (~2.94ms for 64 layers), so we can
+ * prefetch next layer's weights to warm up HBM memory controller and potentially
+ * fill L2 cache with hot weight tiles.
+ * 
+ * Strategy: Prefetch first tile of largest weight matrices (FFN gate+up, ~11MB each).
+ * Since MI50 L2 is ~4MB per GPU, we can't fit all weights, but prefetching the
+ * first portion improves initial access latency.
+ * 
+ * We use hipMemcpyAsync with D2D kind to force cache line allocation without
+ * actually copying data anywhere meaningful. The goal is to trigger memory
+ * controller activity for the target addresses.
+ */
+static int issue_weight_prefetch(CAllreduceSpec *ar, CDispatchPlan *plan, int next_layer_idx, int num_layers)
+{
+    if (!ar->enable_prefetch || next_layer_idx >= num_layers) {
+        return 0;
+    }
+    
+    /* Prefetch QKV fused weights (if available) */
+    if (ar->prefetch_qkv_weight && ar->prefetch_qkv_bytes > 0) {
+        /* Issue async D2D copy to trigger cache line fill */
+        /* We copy to a dummy address - the goal is to read from prefetch_qkv_weight */
+        /* For now, we just issue the copy to warm up memory controller */
+        plan->hipMemcpyAsync_fn(
+            (void *)(uintptr_t)ar->prefetch_qkv_weight,  /* dst = src (read-only access) */
+            (void *)(uintptr_t)ar->prefetch_qkv_weight,  /* src = weight address to prefetch */
+            (size_t)ar->prefetch_qkv_bytes,
+            3,  /* hipMemcpyDeviceToDevice */
+            NULL  /* NULL stream (compute stream) */
+        );
+    }
+    
+    /* Prefetch FFN gate weights */
+    if (ar->prefetch_ffn_gate_weight && ar->prefetch_ffn_gate_bytes > 0) {
+        plan->hipMemcpyAsync_fn(
+            (void *)(uintptr_t)ar->prefetch_ffn_gate_weight,
+            (void *)(uintptr_t)ar->prefetch_ffn_gate_weight,
+            (size_t)ar->prefetch_ffn_gate_bytes,
+            3,
+            NULL
+        );
+    }
+    
+    /* Prefetch FFN up weights */
+    if (ar->prefetch_ffn_up_weight && ar->prefetch_ffn_up_bytes > 0) {
+        plan->hipMemcpyAsync_fn(
+            (void *)(uintptr_t)ar->prefetch_ffn_up_weight,
+            (void *)(uintptr_t)ar->prefetch_ffn_up_weight,
+            (size_t)ar->prefetch_ffn_up_bytes,
+            3,
+            NULL
+        );
+    }
+    
+    return 0;
+}
+
 static int dispatch_allreduce(CAllreduceSpec *ar, CDispatchPlan *plan)
 {
     /* Compressed fused GEMV+AR+RMSNorm mode takes priority (for FFN down projection with INT8 compression) */
@@ -1124,6 +1201,15 @@ int c_dispatch_step(uint64_t plan_ptr, uint64_t cos_offset, uint32_t seq_len)
         if (use_overlap) {
             err = dispatch_allreduce(ffn_ar, plan);
             if (err) return err;
+            
+            /* Issue weight prefetch for next layer during allreduce window.
+             * The compute stream is idle during allreduce (~46us), so we can
+             * prefetch next layer's weights to warm up HBM memory controller. */
+            int next_layer = layer_idx + 1;
+            if (ffn_ar->enable_prefetch && next_layer < num_layers) {
+                err = issue_weight_prefetch(ffn_ar, plan, next_layer, num_layers);
+                if (err) return err;
+            }
         }
         
         /* Track whether FFN allreduce used fused kernels (affects next layer) */

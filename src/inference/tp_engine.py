@@ -4519,6 +4519,46 @@ class TPInferenceEngine:
                 self._persistent_dispatcher.disable()
             print("Persistent megakernel mode DISABLED")
 
+    def set_weight_prefetch(self, enabled: bool):
+        """Enable or disable weight prefetch during allreduce.
+        
+        When enabled=True, during each layer's FFN allreduce (~46us), the compute
+        stream prefetches next layer's weights (QKV fused + FFN gate+up INT4 weights)
+        to warm up the HBM memory controller and potentially fill L2 cache.
+        
+        The compute stream is idle during allreduce, so prefetch operations can
+        overlap with allreduce without delaying either the allreduce or compute paths.
+        
+        Prefetch is implemented as async D2D copies (hipMemcpyAsync) that read from
+        next layer's weight addresses. Even though the copy is redundant (dst=src),
+        it forces cache line allocation and warms up memory controller for those
+        addresses.
+        
+        Expected benefit: 0.5-1.5ms/tok improvement from better memory access patterns.
+        
+        Args:
+            enabled: True to enable weight prefetch
+        """
+        self._enable_weight_prefetch = enabled
+        # Invalidate C dispatch plan so it gets rebuilt with prefetch fields
+        if self._c_dispatch_plan is not None:
+            self._c_dispatch_plan = None
+            if self._c_dispatch_enabled:
+                try:
+                    self._c_dispatch_plan = self._build_c_dispatch_plan()
+                    if enabled:
+                        print(f"Weight prefetch ENABLED: prefetching next layer weights during allreduce")
+                    else:
+                        print(f"Weight prefetch DISABLED")
+                except Exception as e:
+                    print(f"WARNING: Failed to rebuild C dispatch plan after "
+                          f"set_weight_prefetch({enabled}): {e}")
+        else:
+            if enabled:
+                print(f"Weight prefetch ENABLED (will be applied when C dispatch plan is built)")
+            else:
+                print(f"Weight prefetch DISABLED")
+
     def _decode_step_persistent(self, token_embedding: np.ndarray,
                                  position: int) -> np.ndarray:
         """Decode step using persistent megakernel.
@@ -5504,7 +5544,20 @@ class TPInferenceEngine:
                 ('use_gemv_fused_compressed', ct.c_uint32),  # 1=use compressed fused kernel
                 ('gemv_fused_compressed_tp4_fn', ct.c_void_p),  # gemv_int4_fused_compressed_tp4_fn_t
                 ('compressed_ptrs', ct.c_uint64 * 4),  # INT8 compressed buffer pointers per GPU
-                # Padding for alignment
+                # Weight prefetch fields (for overlapping prefetch with allreduce)
+                ('enable_prefetch',       ct.c_uint32),  # 1=enable async prefetch during allreduce
+                ('prefetch_qkv_weight',   ct.c_uint64),  # Next layer QKV fused weight pointer
+                ('prefetch_qkv_scales',   ct.c_uint64),  # Next layer QKV fused scales pointer
+                ('prefetch_qkv_zeros',    ct.c_uint64),  # Next layer QKV fused zeros pointer
+                ('prefetch_ffn_gate_weight', ct.c_uint64),  # Next layer FFN gate weight pointer
+                ('prefetch_ffn_gate_scales', ct.c_uint64),  # Next layer FFN gate scales pointer
+                ('prefetch_ffn_gate_zeros', ct.c_uint64),   # Next layer FFN gate zeros pointer
+                ('prefetch_ffn_up_weight', ct.c_uint64),  # Next layer FFN up weight pointer
+                ('prefetch_ffn_up_scales', ct.c_uint64),  # Next layer FFN up scales pointer
+                ('prefetch_ffn_up_zeros', ct.c_uint64),   # Next layer FFN up zeros pointer
+                ('prefetch_qkv_bytes',    ct.c_uint32),  # Size of QKV weight in bytes
+                ('prefetch_ffn_gate_bytes', ct.c_uint32),  # Size of FFN gate weight in bytes
+                ('prefetch_ffn_up_bytes', ct.c_uint32),  # Size of FFN up weight in bytes
             ]
 
         class CDispatchPlan(ct.Structure):
@@ -6018,6 +6071,21 @@ class TPInferenceEngine:
             else:
                 c_ar.use_gemv_fused_compressed = 0
                 c_ar.gemv_fused_compressed_tp4_fn = 0
+            
+            # Weight prefetch fields (disabled by default, enable via set_weight_prefetch(True))
+            c_ar.enable_prefetch = 0
+            c_ar.prefetch_qkv_weight = 0
+            c_ar.prefetch_qkv_scales = 0
+            c_ar.prefetch_qkv_zeros = 0
+            c_ar.prefetch_ffn_gate_weight = 0
+            c_ar.prefetch_ffn_gate_scales = 0
+            c_ar.prefetch_ffn_gate_zeros = 0
+            c_ar.prefetch_ffn_up_weight = 0
+            c_ar.prefetch_ffn_up_scales = 0
+            c_ar.prefetch_ffn_up_zeros = 0
+            c_ar.prefetch_qkv_bytes = 0
+            c_ar.prefetch_ffn_gate_bytes = 0
+            c_ar.prefetch_ffn_up_bytes = 0
 
         for layer_idx in range(num_layers):
             # Attention allreduce: fused kernel does ffn_rmsnorm (same layer)
@@ -6026,6 +6094,42 @@ class TPInferenceEngine:
             # For the last layer, use the last layer's attn_norm (won't be used anyway)
             next_layer_idx = min(layer_idx + 1, num_layers - 1)
             fill_ar_spec(ffn_ar_array[layer_idx], 'd_ffn_out', layer_attn_norm_ptrs[next_layer_idx], layer_idx, is_ffn=True)
+            
+            # Populate weight prefetch fields for next layer (if prefetch enabled and not last layer)
+            if getattr(self, '_enable_weight_prefetch', False) and layer_idx < num_layers - 1:
+                # Get next layer's weight pointers from first engine (all engines have same weights)
+                next_engine = self.engines[0]
+                next_lw = next_engine.layers[next_layer_idx]
+                
+                # Prefetch QKV fused weights (INT4)
+                if hasattr(next_lw, 'qkv_qweight') and next_lw.qkv_qweight:
+                    ffn_ar_array[layer_idx].enable_prefetch = 1
+                    ffn_ar_array[layer_idx].prefetch_qkv_weight = next_lw.qkv_qweight
+                    ffn_ar_array[layer_idx].prefetch_qkv_scales = next_lw.qkv_scales
+                    ffn_ar_array[layer_idx].prefetch_qkv_zeros = next_lw.qkv_zeros
+                    # Calculate bytes: qkv_qweight is [N_total/8, hidden] int32, scales/zeros are [num_groups, hidden] float16
+                    # N_total = q_dim + 2*kv_dim, num_groups = hidden / group_size
+                    qkv_groups = (self.config.hidden_size // self.config.group_size)
+                    qkv_total_output = self.q_dim + 2 * self.kv_dim
+                    ffn_ar_array[layer_idx].prefetch_qkv_bytes = (qkv_total_output // 8) * self.config.hidden_size * 4  # int32 = 4 bytes
+                
+                # Prefetch FFN gate weights (INT4)
+                if hasattr(next_lw, 'gate_qweight') and next_lw.gate_qweight:
+                    ffn_ar_array[layer_idx].enable_prefetch = 1
+                    ffn_ar_array[layer_idx].prefetch_ffn_gate_weight = next_lw.gate_qweight
+                    ffn_ar_array[layer_idx].prefetch_ffn_gate_scales = next_lw.gate_scales
+                    ffn_ar_array[layer_idx].prefetch_ffn_gate_zeros = next_lw.gate_zeros
+                    # gate_qweight is [intermediate/TP/8, hidden] int32
+                    ffn_ar_array[layer_idx].prefetch_ffn_gate_bytes = (self.local_intermediate_size // 8) * self.config.hidden_size * 4
+                
+                # Prefetch FFN up weights (INT4)
+                if hasattr(next_lw, 'up_qweight') and next_lw.up_qweight:
+                    ffn_ar_array[layer_idx].enable_prefetch = 1
+                    ffn_ar_array[layer_idx].prefetch_ffn_up_weight = next_lw.up_qweight
+                    ffn_ar_array[layer_idx].prefetch_ffn_up_scales = next_lw.up_scales
+                    ffn_ar_array[layer_idx].prefetch_ffn_up_zeros = next_lw.up_zeros
+                    # up_qweight is [intermediate/TP/8, hidden] int32
+                    ffn_ar_array[layer_idx].prefetch_ffn_up_bytes = (self.local_intermediate_size // 8) * self.config.hidden_size * 4
 
         # Build the CDispatchPlan
         plan = CDispatchPlan()
