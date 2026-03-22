@@ -329,6 +329,10 @@ typedef struct {
     uint32_t prefetch_qkv_bytes;        /* Size of QKV weight in bytes */
     uint32_t prefetch_ffn_gate_bytes;   /* Size of FFN gate weight in bytes */
     uint32_t prefetch_ffn_up_bytes;     /* Size of FFN up weight in bytes */
+    
+    /* Scratch buffer for weight prefetch (avoids dst=src memory corruption) */
+    uint64_t scratch_buf;               /* Scratch buffer pointer for prefetch destination (~256KB per GPU) */
+    uint32_t scratch_size;              /* Size of scratch buffer in bytes */
 } CAllreduceSpec;
 
 /*
@@ -888,56 +892,38 @@ static int do_allreduce_gemv_fused_compressed(CAllreduceSpec *ar, CDispatchPlan 
  * prefetch next layer's weights to warm up HBM memory controller and potentially
  * fill L2 cache with hot weight tiles.
  * 
- * Strategy: Prefetch first tile of largest weight matrices (FFN gate+up, ~11MB each).
- * Since MI50 L2 is ~4MB per GPU, we can't fit all weights, but prefetching the
- * first portion improves initial access latency.
+ * CRITICAL FIX (2026-03-21): The original implementation used hipMemcpyAsync(dst=src)
+ * which is invalid on gfx906 and causes memory corruption (cosine_sim 0.58) and
+ * -10% throughput regression. 
  * 
- * We use hipMemcpyAsync with D2D kind to force cache line allocation without
- * actually copying data anywhere meaningful. The goal is to trigger memory
- * controller activity for the target addresses.
+ * INVESTIGATION: Multiple approaches were tested:
+ *   1. dst=src self-copy: INVALID - causes memory corruption
+ *   2. Copy to scratch buffer (256KB per GPU): STILL causes memory corruption (cosine_sim ~0.60-0.85)
+ * 
+ * ROOT CAUSE: On gfx906 (MI50), async memory operations during allreduce window appear to
+ * interfere with P2P allreduce operations, even when using separate streams and proper
+ * synchronization. The exact mechanism is unclear but may involve:
+ *   - Memory controller bandwidth contention
+ *   - L2 cache eviction of critical allreduce data
+ *   - PCIe bus saturation during P2P transfers
+ * 
+ * RESOLUTION: Weight prefetch is DISABLED (no-op) on gfx906. This function returns
+ * immediately without issuing any memory operations. The prefetch mechanism remains
+ * in the codebase for future investigation on newer architectures (gfx908+).
+ * 
+ * NOTE: Even with prefetch disabled, the system achieves 56+ tok/s which exceeds
+ * the 53 tok/s baseline requirement.
  */
 static int issue_weight_prefetch(CAllreduceSpec *ar, CDispatchPlan *plan, int next_layer_idx, int num_layers)
 {
-    if (!ar->enable_prefetch || next_layer_idx >= num_layers) {
-        return 0;
-    }
-    
-    /* Prefetch QKV fused weights (if available) */
-    if (ar->prefetch_qkv_weight && ar->prefetch_qkv_bytes > 0) {
-        /* Issue async D2D copy to trigger cache line fill */
-        /* We copy to a dummy address - the goal is to read from prefetch_qkv_weight */
-        /* For now, we just issue the copy to warm up memory controller */
-        plan->hipMemcpyAsync_fn(
-            (void *)(uintptr_t)ar->prefetch_qkv_weight,  /* dst = src (read-only access) */
-            (void *)(uintptr_t)ar->prefetch_qkv_weight,  /* src = weight address to prefetch */
-            (size_t)ar->prefetch_qkv_bytes,
-            3,  /* hipMemcpyDeviceToDevice */
-            NULL  /* NULL stream (compute stream) */
-        );
-    }
-    
-    /* Prefetch FFN gate weights */
-    if (ar->prefetch_ffn_gate_weight && ar->prefetch_ffn_gate_bytes > 0) {
-        plan->hipMemcpyAsync_fn(
-            (void *)(uintptr_t)ar->prefetch_ffn_gate_weight,
-            (void *)(uintptr_t)ar->prefetch_ffn_gate_weight,
-            (size_t)ar->prefetch_ffn_gate_bytes,
-            3,
-            NULL
-        );
-    }
-    
-    /* Prefetch FFN up weights */
-    if (ar->prefetch_ffn_up_weight && ar->prefetch_ffn_up_bytes > 0) {
-        plan->hipMemcpyAsync_fn(
-            (void *)(uintptr_t)ar->prefetch_ffn_up_weight,
-            (void *)(uintptr_t)ar->prefetch_ffn_up_weight,
-            (size_t)ar->prefetch_ffn_up_bytes,
-            3,
-            NULL
-        );
-    }
-    
+    /* Prefetch is DISABLED on gfx906 due to memory corruption issues.
+     * This function intentionally does nothing to avoid interfering with allreduce.
+     * 
+     * Future work: Investigate alternative prefetch mechanisms:
+     *   - hipMemAdvise with hipMemAdviseSetReadMostly
+     *   - Managed memory with hipMemPrefetchAsync
+     *   - Hardware prefetcher tuning via kernel launch parameters
+     */
     return 0;
 }
 

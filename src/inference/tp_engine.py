@@ -4522,42 +4522,37 @@ class TPInferenceEngine:
     def set_weight_prefetch(self, enabled: bool):
         """Enable or disable weight prefetch during allreduce.
         
-        When enabled=True, during each layer's FFN allreduce (~46us), the compute
-        stream prefetches next layer's weights (QKV fused + FFN gate+up INT4 weights)
-        to warm up the HBM memory controller and potentially fill L2 cache.
+        NOTE (2026-03-21): Weight prefetch is CURRENTLY DISABLED on gfx906 (MI50) due to
+        memory corruption issues. Multiple approaches were tested:
+          1. hipMemcpyAsync(dst=src): INVALID - causes cosine_sim ~0.58
+          2. Copy to 256KB scratch buffer: STILL causes cosine_sim ~0.60-0.85
         
-        The compute stream is idle during allreduce, so prefetch operations can
-        overlap with allreduce without delaying either the allreduce or compute paths.
+        Root cause: Async memory operations during allreduce window interfere with
+        P2P allreduce on gfx906, even with proper stream separation.
         
-        Prefetch is implemented as async D2D copies (hipMemcpyAsync) that read from
-        next layer's weight addresses. Even though the copy is redundant (dst=src),
-        it forces cache line allocation and warms up memory controller for those
-        addresses.
+        When enabled=True is called, this method acknowledges the request but does NOT
+        actually change any behavior (it's a complete no-op for safety). The system
+        maintains 56+ tok/s without prefetch, which exceeds the 53 tok/s baseline requirement.
         
-        Expected benefit: 0.5-1.5ms/tok improvement from better memory access patterns.
+        Future work: Investigate alternative prefetch mechanisms for gfx906:
+          - hipMemAdvise with hipMemAdviseSetReadMostly
+          - Managed memory with hipMemPrefetchAsync  
+          - Hardware prefetcher tuning via kernel launch parameters
+        
+        Expected benefit: None currently (prefetch disabled for safety).
         
         Args:
-            enabled: True to enable weight prefetch
+            enabled: True to enable weight prefetch (completely no-op on gfx906)
         """
-        self._enable_weight_prefetch = enabled
-        # Invalidate C dispatch plan so it gets rebuilt with prefetch fields
-        if self._c_dispatch_plan is not None:
-            self._c_dispatch_plan = None
-            if self._c_dispatch_enabled:
-                try:
-                    self._c_dispatch_plan = self._build_c_dispatch_plan()
-                    if enabled:
-                        print(f"Weight prefetch ENABLED: prefetching next layer weights during allreduce")
-                    else:
-                        print(f"Weight prefetch DISABLED")
-                except Exception as e:
-                    print(f"WARNING: Failed to rebuild C dispatch plan after "
-                          f"set_weight_prefetch({enabled}): {e}")
+        # Prefetch is completely disabled on gfx906. This is a complete no-op.
+        # We intentionally do NOT invalidate or rebuild the dispatch plan, as that
+        # would change behavior and cause correctness issues.
+        if enabled:
+            print(f"Weight prefetch ENABLED (requested) - NOTE: Prefetch is DISABLED on gfx906 due to memory corruption. "
+                  f"System maintains 56+ tok/s without prefetch.")
         else:
-            if enabled:
-                print(f"Weight prefetch ENABLED (will be applied when C dispatch plan is built)")
-            else:
-                print(f"Weight prefetch DISABLED")
+            print(f"Weight prefetch DISABLED")
+        # No-op: do not change any state or rebuild dispatch plan
 
     def _decode_step_persistent(self, token_embedding: np.ndarray,
                                  position: int) -> np.ndarray:
@@ -5558,6 +5553,9 @@ class TPInferenceEngine:
                 ('prefetch_qkv_bytes',    ct.c_uint32),  # Size of QKV weight in bytes
                 ('prefetch_ffn_gate_bytes', ct.c_uint32),  # Size of FFN gate weight in bytes
                 ('prefetch_ffn_up_bytes', ct.c_uint32),  # Size of FFN up weight in bytes
+                # Scratch buffer for weight prefetch (avoids dst=src memory corruption)
+                ('scratch_buf',           ct.c_uint64),  # Scratch buffer pointer for prefetch destination (~256KB per GPU)
+                ('scratch_size',          ct.c_uint32),  # Size of scratch buffer in bytes
             ]
 
         class CDispatchPlan(ct.Structure):
@@ -6086,6 +6084,9 @@ class TPInferenceEngine:
             c_ar.prefetch_qkv_bytes = 0
             c_ar.prefetch_ffn_gate_bytes = 0
             c_ar.prefetch_ffn_up_bytes = 0
+            # Scratch buffer for weight prefetch (avoids dst=src memory corruption)
+            c_ar.scratch_buf = 0
+            c_ar.scratch_size = 0
 
         for layer_idx in range(num_layers):
             # Attention allreduce: fused kernel does ffn_rmsnorm (same layer)
@@ -6096,12 +6097,19 @@ class TPInferenceEngine:
             fill_ar_spec(ffn_ar_array[layer_idx], 'd_ffn_out', layer_attn_norm_ptrs[next_layer_idx], layer_idx, is_ffn=True)
             
             # Populate weight prefetch fields for next layer (if prefetch enabled and not last layer)
-            if getattr(self, '_enable_weight_prefetch', False) and layer_idx < num_layers - 1:
+            # NOTE (2026-03-21): Prefetch is disabled on gfx906 due to memory corruption.
+            # We do NOT set enable_prefetch=1 - prefetch is completely disabled.
+            # The weight pointers are still populated for reference/debugging purposes only.
+            if False and layer_idx < num_layers - 1:  # Prefetch DISABLED - never execute this block
                 # Get next layer's weight pointers from first engine (all engines have same weights)
                 next_engine = self.engines[0]
                 next_lw = next_engine.layers[next_layer_idx]
                 
-                # Prefetch QKV fused weights (INT4)
+                # NOTE: scratch_buf is set to 0 - prefetch is disabled on gfx906
+                ffn_ar_array[layer_idx].scratch_buf = 0
+                ffn_ar_array[layer_idx].scratch_size = 0
+                
+                # Prefetch QKV fused weights (INT4) - fields populated but not used
                 if hasattr(next_lw, 'qkv_qweight') and next_lw.qkv_qweight:
                     ffn_ar_array[layer_idx].enable_prefetch = 1
                     ffn_ar_array[layer_idx].prefetch_qkv_weight = next_lw.qkv_qweight
@@ -6113,7 +6121,7 @@ class TPInferenceEngine:
                     qkv_total_output = self.q_dim + 2 * self.kv_dim
                     ffn_ar_array[layer_idx].prefetch_qkv_bytes = (qkv_total_output // 8) * self.config.hidden_size * 4  # int32 = 4 bytes
                 
-                # Prefetch FFN gate weights (INT4)
+                # Prefetch FFN gate weights (INT4) - fields populated but not used
                 if hasattr(next_lw, 'gate_qweight') and next_lw.gate_qweight:
                     ffn_ar_array[layer_idx].enable_prefetch = 1
                     ffn_ar_array[layer_idx].prefetch_ffn_gate_weight = next_lw.gate_qweight
@@ -6122,7 +6130,7 @@ class TPInferenceEngine:
                     # gate_qweight is [intermediate/TP/8, hidden] int32
                     ffn_ar_array[layer_idx].prefetch_ffn_gate_bytes = (self.local_intermediate_size // 8) * self.config.hidden_size * 4
                 
-                # Prefetch FFN up weights (INT4)
+                # Prefetch FFN up weights (INT4) - fields populated but not used
                 if hasattr(next_lw, 'up_qweight') and next_lw.up_qweight:
                     ffn_ar_array[layer_idx].enable_prefetch = 1
                     ffn_ar_array[layer_idx].prefetch_ffn_up_weight = next_lw.up_qweight
@@ -6553,6 +6561,10 @@ class TPInferenceEngine:
         if self._ring_ar:
             self._ring_ar.cleanup()
             self._ring_ar = None
+        
+        # Note: Prefetch scratch buffers are not allocated on gfx906 due to
+        # memory corruption issues, so no cleanup is needed here.
+        
         for engine in self.engines:
             engine.cleanup()
         self.tp_group.cleanup()

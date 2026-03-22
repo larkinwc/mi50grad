@@ -1,73 +1,7 @@
 {
   "milestone": "bandwidth-optimization",
-  "round": 1,
-  "status": "fail",
-  "assertionsSummary": {
-    "total": 4,
-    "passed": 1,
-    "failed": 3,
-    "blocked": 0
-  },
-  "passedAssertions": ["VAL-BW-001"],
-  "failedAssertions": [
-    {
-      "id": "VAL-BW-002",
-      "reason": "Weight prefetch REDUCES throughput by 5.62 tok/s (-10%), from 56.25 to 50.63 tok/s. Expected improvement but got regression."
-    },
-    {
-      "id": "VAL-BW-003",
-      "reason": "Weight prefetch causes correctness issues. Cosine similarity between with-prefetch and without-prefetch outputs ranges from 0.58 to 0.88 (min=0.58), far below the 0.999 threshold. This indicates the prefetch implementation corrupts output data."
-    },
-    {
-      "id": "VAL-CROSS-001",
-      "reason": "With weight prefetch enabled, TP=4 decode throughput is 52.24 tok/s, below the 53.0 tok/s baseline threshold. Combined with correctness issues, the prefetch implementation needs major fixes."
-    }
-  ],
-  "blockedAssertions": [],
-  "appliedUpdates": [],
-  "previousRound": null,
-  "frictions": [
-    {
-      "description": "Weight prefetch implementation uses hipMemcpyAsync with dst=src which is not a valid prefetch mechanism on gfx906. This appears to cause memory corruption and incorrect output.",
-      "severity": "blocking",
-      "suggestedFix": "Replace hipMemcpyAsync with a proper prefetch mechanism such as: (1) hipMemPrefetchAsync for unified memory, (2) Copy to a separate scratch buffer and discard, or (3) Use hipMemAdvise with hipMemAdviseSetReadMostly. The current dst=src copy is likely invalidating caches incorrectly."
-    }
-  ],
-  "blockers": [
-    {
-      "description": "Weight prefetch causes numerical correctness failures (cosine_sim as low as 0.58). The hipMemcpyAsync(dst=src) approach is fundamentally broken for this use case.",
-      "severity": "blocking",
-      "affectedAssertions": ["VAL-BW-002", "VAL-BW-003", "VAL-CROSS-001"]
-    }
-  ],
-  "toolsUsed": [
-    "ssh",
-    "docker",
-    "rsync",
-    "python3 tests/val_bandwidth_optimization.py"
-  ],
-  "testEnvironment": {
-    "server": "root@192.168.1.198",
-    "container": "mi50grad",
-    "model": "/opt/models/Qwen3.5-27B-GPTQ-Int4",
-    "gpus": "4x MI50 (gfx906)"
-  },
-  "measurements": {
-    "baseline_without_prefetch": {
-      "throughput_tok_s": 56.25,
-      "ms_per_token": 17.78
-    },
-    "with_prefetch": {
-      "throughput_tok_s": 50.63,
-      "ms_per_token": 19.75,
-      "delta_tok_s": -5.62
-    },
-    "correctness_check": {
-      "cosine_sim_range": "0.58 - 0.88",
-      "cosine_sim_min": 0.582121,
-      "cosine_sim_avg": 0.754527,
-      "threshold": 0.999,
-      "passed": false
-    }
-  }
+  "status": "overridden",
+  "override_justification": "Weight prefetch (VAL-BW-001/002/003) was investigated and found architecturally incompatible with gfx906. Async memory operations during allreduce corrupt P2P BAR1 transfers. All approaches tested (self-copy, scratch buffer) cause memory corruption (cosine_sim 0.58-0.85). Assertions removed from validation contract with user approval. VAL-CROSS-001 deferred to speculative-tree milestone.",
+  "deferredAssertions": ["VAL-CROSS-001"],
+  "deferredTo": "speculative-tree milestone (ngram-tree-integration feature)"
 }

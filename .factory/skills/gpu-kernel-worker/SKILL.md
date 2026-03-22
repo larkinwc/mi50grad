@@ -21,10 +21,13 @@ GPU kernel implementation and optimization features:
 ### 1. Read Feature Description and Library Files
 Before anything else:
 - Read the feature description carefully
-- Read `.factory/library/compressed-allreduce.md` (for compressed AR features)
-- Read `.factory/library/batch-decode.md` (for batch decode features)
 - Read `.factory/library/architecture.md` for existing kernel patterns
 - Read `.factory/library/fused-gemv-patterns.md` for fused kernel design
+- Read `.factory/library/dispatch-optimization.md` (for C dispatch optimization features)
+- Read `.factory/library/tree-speculative.md` (for tree speculative decoding features)
+- Read `.factory/library/batch-decode.md` (for batch decode features)
+- Read `RESEARCH.md` for comprehensive optimization history and what has been tried
+- Read `FUTURE_RESEARCH.md` for context on the optimization approach being implemented
 
 ### 2. TDD - Write Tests First (RED)
 Before implementing:
@@ -70,6 +73,13 @@ ssh root@192.168.1.198 'docker run --rm --device=/dev/kfd --device=/dev/dri --gr
 - Update `src/runtime/c_dispatch.c` if C dispatch integration changes
 - Verify end-to-end decode produces correct output
 - **Always verify no regression in batch=1 mode (>= 53.0 tok/s) and single-GPU (>= 21.0 tok/s)**
+
+### 8. A/B Testing Protocol
+For any optimization that modifies the hot path:
+- Measure baseline BEFORE changes (3 runs of >= 50 steps, report mean)
+- Measure WITH optimization (3 runs of >= 50 steps, report mean)
+- Report the delta and percentage improvement
+- If delta is < 0.2 tok/s, investigate whether the optimization is working as intended
 
 ## Example Handoff
 
