@@ -65,6 +65,7 @@ def create_real_decoder(max_tree_size: int = 7,
     
     # Configure engine
     tp_engine.build_dispatch_cache()
+    tp_engine.set_cached_dispatch(True)  # Enable cached dispatch for tree decode
     tp_engine.set_direct_kv_write(True)
     tp_engine.set_c_dispatch(True)
     tp_engine.set_kernel_p2p_allreduce(True)
@@ -75,8 +76,11 @@ def create_real_decoder(max_tree_size: int = 7,
     # Extract lm_head weight for decoder
     lm_head_np = lm_head_weight.copy()
     
-    # Get embed weight from first GPU
-    embed_weight = tp_engine.engines[0]._embed_weight.copy()
+    # Get embed weight from loader
+    embed_weight = loader.load_embedding()
+    
+    print(f"  Embed weight shape: {embed_weight.shape}")
+    print(f"  LM head weight shape: {lm_head_np.shape}")
     
     # Try to load tokenizer
     try:
