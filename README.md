@@ -4,6 +4,8 @@ High-throughput inference optimization for **Qwen 3.5 27B** (GPTQ-Int4) on **AMD
 
 ## Performance
 
+### Optimization Modes (TP=4, decode)
+
 | Mode | Throughput | Speedup |
 |---|---|---|
 | Star topology baseline (TP=4) | 15.3 tok/s | 1.00x |
@@ -12,6 +14,26 @@ High-throughput inference optimization for **Qwen 3.5 27B** (GPTQ-Int4) on **AMD
 | Single-GPU | 22.0 tok/s | -- |
 
 **Gap closure:** 81.5% toward 60 tok/s target. Kernel launches reduced from 192 to 64 per token.
+
+### Prompt Processing & Text Generation (Qwen 3.5 27B GPTQ-Int4)
+
+Benchmarked on 4x MI50 32GB (gfx906), ROCm 7.1.0. All optimizations enabled (C dispatch, kernel P2P allreduce, deferred attention AR, fused GEMV+AR+RMSNorm).
+
+| Config | Test | Throughput (tok/s) |
+|---|---|---|
+| TP=1 (1x MI50) | pp256 | 28.27 |
+| TP=1 (1x MI50) | tg128 | 20.39 |
+| **TP=2 (2x MI50)** | **pp512** | **38.88** |
+| TP=2 (2x MI50) | tg128 | 32.34 |
+| TP=4 (4x MI50) | pp512 | 32.12 |
+| **TP=4 (4x MI50)** | **tg128** | **56.33** |
+
+Notes:
+- **pp** = prompt processing (prefill), **tg** = text generation (autoregressive decode)
+- TP=1 limited to pp256 (27B model uses ~25GB of 32GB VRAM, insufficient for pp512 KV cache)
+- TP prefill uses batched GEMM + FlashAttention with FusedP2PReduce allreduce (no buffer size limitation)
+- TP=2 achieves best pp512 throughput (38.88 tok/s) -- TP=4 pp is bottlenecked by PCIe P2P allreduce of 5MB payloads per layer (128 allreduces x 512*5120 FP16 elements)
+- TP=4 tg128 achieves 56.33 tok/s with all optimizations (C dispatch + kernel P2P + deferred AR + fused kernels)
 
 ## Research & Optimization History
 

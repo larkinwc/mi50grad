@@ -2086,9 +2086,9 @@ class TPInferenceEngine:
             partial_ptrs = [e.d_pf_normed for e in self.engines]
             hidden_ptrs = [e.d_pf_hidden for e in self.engines]
             
-            if self._ring_allreduce and self._ring_ar is not None:
-                self._ring_ar.allreduce_residual(partial_ptrs, hidden_ptrs, seq_len * h)
-            elif self._fused_p2p_reduce and self._fused_p2p_ar is not None:
+            # Prefill allreduce uses FusedP2PReduce (no buffer size limitation)
+            # P2PAllreduce/RingAllreduce gather buffers are sized for single-token decode
+            if self._fused_p2p_ar is not None:
                 self._fused_p2p_ar.allreduce_residual(partial_ptrs, hidden_ptrs, seq_len * h)
             else:
                 self._p2p_ar.allreduce_residual(partial_ptrs, hidden_ptrs, seq_len * h)
@@ -2208,10 +2208,9 @@ class TPInferenceEngine:
         partial_ptrs = [e.d_pf_ffn_out for e in self.engines]
         hidden_ptrs = [e.d_pf_hidden for e in self.engines]
         
-        # Use appropriate allreduce based on configuration
-        if self._ring_allreduce and self._ring_ar is not None:
-            self._ring_ar.allreduce_residual(partial_ptrs, hidden_ptrs, seq_len * h)
-        elif self._fused_p2p_reduce and self._fused_p2p_ar is not None:
+        # Prefill allreduce uses FusedP2PReduce (no buffer size limitation)
+        # P2PAllreduce/RingAllreduce gather buffers are sized for single-token decode
+        if self._fused_p2p_ar is not None:
             self._fused_p2p_ar.allreduce_residual(partial_ptrs, hidden_ptrs, seq_len * h)
         else:
             self._p2p_ar.allreduce_residual(partial_ptrs, hidden_ptrs, seq_len * h)
